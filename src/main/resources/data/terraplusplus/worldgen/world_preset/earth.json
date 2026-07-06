@@ -1,0 +1,15 @@
+{
+  "dimensions": {
+    "minecraft:overworld": {
+      "type": "terraplusplus:earth_type",
+      "generator": {
+        "type": "terraplusplus:earth",
+        "projection": "bte",
+        "biome_source": {
+          "type": "minecraft:multi_noise",
+          "preset": "minecraft:overworld"
+        }
+      }
+    }
+  }
+}

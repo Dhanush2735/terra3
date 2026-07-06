@@ -1,0 +1,174 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+version = '2.0.0-alpha'
+group = 'net.buildtheearth'
+archivesBaseName = 'terraplusplus'
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+// ✅ Enable JarJar
+jarJar.enable()
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                terraplusplus {
+                    source sourceSets.main
+                }
+            }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                terraplusplus {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'DaPorkchop'
+        url = 'https://maven.daporkchop.net/'
+    }
+    maven {
+        name = 'DaPorkchop Release'
+        url = 'https://maven.daporkchop.net/release/'
+    }
+    maven {
+        name = 'DaPorkchop Snapshot'
+        url = 'https://maven.daporkchop.net/snapshot/'
+    }
+    maven { url = 'https://maven.minecraftforge.net' }
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+
+    // Lombok — must come FIRST
+    compileOnly 'org.projectlombok:lombok:1.18.30'
+    annotationProcessor 'org.projectlombok:lombok:1.18.30'
+    testCompileOnly 'org.projectlombok:lombok:1.18.30'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.30'
+
+    // Everything else stays the same...
+    compileOnly 'io.netty:netty-all:4.1.97.Final'
+    compileOnly 'org.jetbrains:annotations:24.0.1'
+
+    minecraftLibrary 'com.fasterxml.jackson.core:jackson-core:2.15.2'
+    minecraftLibrary 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    minecraftLibrary 'com.fasterxml.jackson.core:jackson-annotations:2.15.2'
+
+    jarJar(group: 'com.fasterxml.jackson.core', name: 'jackson-core',
+           version: '[2.15.0,2.16.0)') {
+        jarJar.pin(it, '2.15.2')
+    }
+    jarJar(group: 'com.fasterxml.jackson.core', name: 'jackson-databind',
+           version: '[2.15.0,2.16.0)') {
+        jarJar.pin(it, '2.15.2')
+    }
+    jarJar(group: 'com.fasterxml.jackson.core', name: 'jackson-annotations',
+           version: '[2.15.0,2.16.0)') {
+        jarJar.pin(it, '2.15.2')
+    }
+
+    minecraftLibrary('net.daporkchop.lib:common:0.5.7-SNAPSHOT') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+    minecraftLibrary('net.daporkchop.lib:binary:0.5.7-SNAPSHOT') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+
+    jarJar(group: 'net.daporkchop.lib', name: 'common',
+           version: '[0.5.7,0.6.0)') {
+        jarJar.pin(it, '0.5.7-SNAPSHOT')
+    }
+    jarJar(group: 'net.daporkchop.lib', name: 'binary',
+           version: '[0.5.7,0.6.0)') {
+        jarJar.pin(it, '0.5.7-SNAPSHOT')
+    }
+
+    minecraftLibrary('com.squareup.okhttp3:okhttp:4.12.0') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+    minecraftLibrary('com.squareup.okio:okio:3.6.0') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+    minecraftLibrary('com.squareup.okio:okio-jvm:3.6.0') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+    minecraftLibrary('org.jetbrains.kotlin:kotlin-stdlib:1.9.10') {
+        exclude group: 'org.jetbrains', module: 'annotations'
+    }
+
+    jarJar(group: 'com.squareup.okhttp3', name: 'okhttp',
+           version: '[4.12.0,4.13.0)') {
+        jarJar.pin(it, '4.12.0')
+    }
+    jarJar(group: 'com.squareup.okio', name: 'okio-jvm',
+           version: '[3.6.0,3.7.0)') {
+        jarJar.pin(it, '3.6.0')
+    }
+    jarJar(group: 'org.jetbrains.kotlin', name: 'kotlin-stdlib',
+           version: '[1.9.0,1.10.0)') {
+        jarJar.pin(it, '1.9.10')
+    }
+
+    minecraftLibrary 'org.apache.commons:commons-imaging:1.0.0-alpha5'
+
+    jarJar(group: 'org.apache.commons', name: 'commons-imaging',
+           version: '[1.0.0-alpha5,1.1.0)') {
+        jarJar.pin(it, '1.0.0-alpha5')
+    }
+
+    implementation 'com.google.code.gson:gson:2.10.1'
+}
+
+// ✅ Make the default jar task produce the jarJar output
+tasks.named('jar', Jar).configure {
+    archiveClassifier = 'slim'    // plain jar without deps
+    manifest {
+        attributes([
+            "Specification-Title"     : "terraplusplus",
+            "Specification-Vendor"    : "BuildTheEarth",
+            "Specification-Version"   : "1",
+            "Implementation-Title"    : project.name,
+            "Implementation-Version"  : project.jar.archiveVersion,
+            "Implementation-Vendor"   : "BuildTheEarth"
+        ])
+    }
+}
+
+// ✅ The jarJar task produces the distributable JAR
+tasks.named('jarJar', net.minecraftforge.gradle.userdev.tasks.JarJar).configure {
+    archiveClassifier = ''        // this becomes the main artifact
+}
+
+// ✅ Build should produce the jarJar
+tasks.named('build').configure {
+    dependsOn 'jarJar'
+}
+
+sourceSets {
+    main {
+        resources {
+            srcDirs = ["src/main/resources"]
+        }
+    }
+}

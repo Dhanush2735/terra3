@@ -1,0 +1,38 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+issueTrackerURL="https://github.com/BuildTheEarth/terraplusplus/issues"
+
+[[mods]]
+modId="terraplusplus"
+version="${file.jarVersion}"
+displayName="Terra++"
+displayURL="https://github.com/BuildTheEarth/terraplusplus"
+authors="BuildTheEarth Team"
+description='''
+Real-world terrain data for Minecraft.
+Provides Earth heightmaps, projections, and terrain sampling
+for use with CubicWorldGen and CubicChunks2.
+'''
+
+[[dependencies.terraplusplus]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.terraplusplus]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.terraplusplus]]
+modId="cubicworldgen"
+mandatory=false
+versionRange="[2.0.0-alpha,)"
+ordering="BEFORE"
+side="BOTH"
+
