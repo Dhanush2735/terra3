@@ -41,4 +41,25 @@ class Bounds2dImpl implements Bounds2d {
         this.minZ = minZ;
         this.maxZ = maxZ;
     }
+
+    @Override
+    public double minX() {
+        return this.minX;
+    }
+
+    @Override
+    public double maxX() {
+        return this.maxX;
+    }
+
+    @Override
+    public double minZ() {
+        return this.minZ;
+    }
+
+    @Override
+    public double maxZ() {
+        return this.maxZ;
+    }
+
 }

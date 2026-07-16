@@ -52,7 +52,7 @@ public final class PersistentChunkRefreshIndex {
     private static final Logger LOGGER =
         LogManager.getLogger("Terra++ChunkIndex");
 
-    // ── FILE FORMAT CONSTANTS ─────────────────────────────────
+    // --------------------------------------------------
     private static final int META_MAGIC   = 0x5450504D;
     private static final int REGION_MAGIC = 0x54505052;
     private static final int META_VERSION = 1;
@@ -60,7 +60,7 @@ public final class PersistentChunkRefreshIndex {
     private static final int REGION_VERSION_LEGACY = 1;
     private static final int REGION_VERSION        = 2;
 
-    // ── REGION LAYOUT ─────────────────────────────────────────
+    // --------------------------------------------------
     private static final int REGION_BITS  = 5;
     private static final int REGION_SIZE  = 1 << REGION_BITS;
     private static final int REGION_MASK  = REGION_SIZE - 1;
@@ -72,27 +72,27 @@ public final class PersistentChunkRefreshIndex {
     private static final short UNSET_YEAR =
         Short.MIN_VALUE;
 
-    // ── TIMING ────────────────────────────────────────────────
+    // --------------------------------------------------
     private static final int FLUSH_INTERVAL_TICKS      = 200;
     private static final int STALE_SCAN_INTERVAL_TICKS = 100;
     private static final int STALE_SCAN_MAX_PER_TICK   = 50;
 
-    // ── LOCK ──────────────────────────────────────────────────
+    // --------------------------------------------------
     private static final Object LOCK = new Object();
 
-    // ── PATHS ─────────────────────────────────────────────────
+    // --------------------------------------------------
     private static volatile boolean initialized = false;
     private static volatile Path worldRoot;
     private static volatile Path baseDir;
     private static volatile Path regionsDir;
     private static volatile Path metaFile;
 
-    // ── GLOBAL STATE ──────────────────────────────────────────
+    // --------------------------------------------------
     private static volatile int globalGeneration = 0;
     private static volatile int lastJumpYear =
         TerraTimeManager.BASE_YEAR;
 
-    // ── CACHES ────────────────────────────────────────────────
+    // --------------------------------------------------
     private static final ConcurrentHashMap<Long, RegionData>
         regionCache = new ConcurrentHashMap<>();
     private static final Set<Long> dirtyRegions =
@@ -100,16 +100,16 @@ public final class PersistentChunkRefreshIndex {
     private static final Set<Long> loadedChunks =
         ConcurrentHashMap.newKeySet();
 
-    // ── TICK COUNTER ──────────────────────────────────────────
+    // --------------------------------------------------
     private static int tickCounter = 0;
 
-    // ── DEBUG ─────────────────────────────────────────────────
+    // --------------------------------------------------
     private static int debugLogCount = 0;
     private static final int DEBUG_LOG_MAX = 20;
 
     private PersistentChunkRefreshIndex() {}
 
-    // ── REGION DATA ───────────────────────────────────────────
+    // --------------------------------------------------
     private static final class RegionData {
         final int rx;
         final int rz;
@@ -130,9 +130,9 @@ public final class PersistentChunkRefreshIndex {
         }
     }
 
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
     // PUBLIC API
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
 
     public static void ensureInitialized(
             ServerLevel level) {
@@ -406,9 +406,9 @@ public final class PersistentChunkRefreshIndex {
         }
     }
 
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
     // EVENT HOOKS
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
 
     @SubscribeEvent
     public static void onLevelLoad(
@@ -494,11 +494,11 @@ public final class PersistentChunkRefreshIndex {
         ServerLevel level = getOverworld();
         if (level == null) return;
 
-        // ── FLUSH DIRTY REGIONS ───────────────────
+        // --------------------------------------------------
         if (tickCounter % FLUSH_INTERVAL_TICKS == 0)
             flushDirtyRegionsInternal();
 
-        // ── POST JUMP RESCAN ──────────────────────
+        // --------------------------------------------------
         // When countdown reaches zero, scan ALL
         // in-memory chunks and:
         // 1. Call syncHistoricalWaterPublic on every
@@ -529,7 +529,7 @@ public final class PersistentChunkRefreshIndex {
                 int skipped      = 0;
                 boolean usedChunkMap = false;
 
-                // ── WATER SYNC VIA CHUNKMAP ───────
+                // --------------------------------------------------
                 // Reaches semi-loaded chunks that
                 // getChunk(x,z,false) misses.
                 // Must run regardless of needsRefresh
@@ -610,7 +610,7 @@ public final class PersistentChunkRefreshIndex {
                             e.getMessage());
                     }
 
-                    // ── FALLBACK ──────────────────
+                    // --------------------------------------------------
                     // If chunkMap did not work,
                     // fall back to snapshot.
                     if (!usedChunkMap
@@ -642,7 +642,7 @@ public final class PersistentChunkRefreshIndex {
                     }
                 }
 
-                // ── QUEUE STALE CHUNKS ────────────
+                // --------------------------------------------------
                 // Also queue chunks that still need
                 // vegetation and structure refresh.
                 for (ChunkPos pos :
@@ -683,7 +683,7 @@ public final class PersistentChunkRefreshIndex {
             }
         }
 
-        // ── STALE SCAN ────────────────────────────
+        // --------------------------------------------------
         if (tickCounter
                     % STALE_SCAN_INTERVAL_TICKS == 0
                 && TerraTimeManager.isTimeEnabled()) {
@@ -726,9 +726,9 @@ public final class PersistentChunkRefreshIndex {
             + "on shutdown");
     }
 
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
     // INTERNAL REGION LOGIC
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
 
     private static void markDirty(
             RegionData region) {
@@ -999,9 +999,9 @@ public final class PersistentChunkRefreshIndex {
         tickCounter = 0;
     }
 
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
     // HELPERS
-    // ═══════════════════════════════════════════════
+    // --------------------------------------------------
 
     private static short currentYearShort() {
         return clampYearToShort(

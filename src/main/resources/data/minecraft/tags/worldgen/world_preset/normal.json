@@ -1,6 +1,12 @@
 {
   "replace": false,
   "values": [
-    "terraplusplus:earth"
+    "minecraft:normal",
+    "minecraft:flat",
+    "minecraft:large_biomes",
+    "minecraft:amplified",
+    "minecraft:single_biome_surface",
+    "terraplusplus:earth",
+    "cubicworldgen:cubic_world"
   ]
 }

@@ -6,8 +6,6 @@ import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
-import net.buildtheearth.terraminusminus.dataset.osm.BlockStateParser;
-import net.buildtheearth.terraminusminus.substitutes.BlockState;
 import net.buildtheearth.terraminusminus.substitutes.Biome;
 import net.buildtheearth.terraminusminus.util.BiomeDeserializeMixin;
 
@@ -41,9 +39,11 @@ public class TerraConstants {
         LIB_VERSION = libVersion;
     }
 
-    public static final Gson GSON = new GsonBuilder()
-    		.registerTypeAdapter(BlockState.class, BlockStateParser.INSTANCE)
-            .create();
+    /**
+     * Minimal Gson retained for callers that expect the TerraMinusMinus constant.
+     * Legacy BlockState/OSM adapters were pruned with the unused vector pipeline.
+     */
+    public static final Gson GSON = new GsonBuilder().create();
 
     public static final JsonMapper JSON_MAPPER = JsonMapper.builder()
             .configure(DeserializationFeature.ACCEPT_SINGLE_VALUE_AS_ARRAY, true)
@@ -55,14 +55,10 @@ public class TerraConstants {
             .addMixIn(Biome.class, BiomeDeserializeMixin.class)
             .build();
 
-    /**
-     * Earth's circumference around the equator, in meters.
-     */
+    /** Earth's circumference around the equator, in meters. */
     public static final double EARTH_CIRCUMFERENCE = 40075017;
 
-    /**
-     * Earth's circumference around the poles, in meters.
-     */
+    /** Earth's circumference around the poles, in meters. */
     public static final double EARTH_POLAR_CIRCUMFERENCE = 40008000;
 
     public static final double[] EMPTY_DOUBLE_ARRAY = new double[0];

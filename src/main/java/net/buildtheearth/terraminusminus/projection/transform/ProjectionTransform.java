@@ -32,4 +32,9 @@ public abstract class ProjectionTransform implements GeographicProjection {
     public double metersPerUnit() {
         return this.delegate.metersPerUnit();
     }
+
+    public GeographicProjection delegate() {
+        return this.delegate;
+    }
+
 }

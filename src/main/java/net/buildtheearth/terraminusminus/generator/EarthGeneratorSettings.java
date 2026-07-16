@@ -19,12 +19,8 @@ import com.google.common.base.Strings;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
-import lombok.AccessLevel;
-import lombok.Getter;
 import lombok.NonNull;
-import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
-import lombok.With;
 import net.buildtheearth.terraminusminus.TerraConstants;
 import net.buildtheearth.terraminusminus.TerraMinusMinus;
 import net.buildtheearth.terraminusminus.config.GlobalParseRegistries;
@@ -35,88 +31,69 @@ import net.buildtheearth.terraminusminus.projection.transform.OffsetProjectionTr
 import net.buildtheearth.terraminusminus.projection.transform.ProjectionTransform;
 import net.buildtheearth.terraminusminus.projection.transform.ScaleProjectionTransform;
 import net.buildtheearth.terraminusminus.projection.transform.SwapAxesProjectionTransform;
-import net.daporkchop.lib.binary.oio.StreamUtil;
-import net.daporkchop.lib.common.reference.ReferenceStrength;
-import net.daporkchop.lib.common.reference.cache.Cached;
 
 @JsonInclude(JsonInclude.Include.NON_EMPTY)
-@RequiredArgsConstructor(access = AccessLevel.PRIVATE)
-@With
 public class EarthGeneratorSettings {
     public static final int CONFIG_VERSION = 2;
     public static final String DEFAULT_SETTINGS;
-    private static final LoadingCache<String, EarthGeneratorSettings> SETTINGS_PARSE_CACHE = CacheBuilder.newBuilder()
-            .weakKeys().weakValues()
-            .build(CacheLoader.from(EarthGeneratorSettings::parseUncached));
     public static final String BTE_DEFAULT_SETTINGS;
+
+    private static final LoadingCache<String, EarthGeneratorSettings> SETTINGS_PARSE_CACHE =
+        CacheBuilder.newBuilder().weakKeys().weakValues()
+            .build(CacheLoader.from(EarthGeneratorSettings::parseUncached));
 
     static {
         try {
-            try (InputStream in = EarthGeneratorSettings.class.getResourceAsStream("default_generator_settings.json5")) {
-                DEFAULT_SETTINGS = new String(StreamUtil.toByteArray(in));
+            try (InputStream in = EarthGeneratorSettings.class
+                    .getResourceAsStream("default_generator_settings.json5")) {
+                DEFAULT_SETTINGS = new String(in.readAllBytes());
             }
-            try (InputStream in = EarthGeneratorSettings.class.getResourceAsStream("bte_generator_settings.json5")) {
-                BTE_DEFAULT_SETTINGS = new String(StreamUtil.toByteArray(in));
+            try (InputStream in = EarthGeneratorSettings.class
+                    .getResourceAsStream("bte_generator_settings.json5")) {
+                BTE_DEFAULT_SETTINGS = new String(in.readAllBytes());
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    /**
-     * Parses the given generator settings.
-     *
-     * @param generatorSettings the settings string to parse
-     * @return the parsed settings
-     */
     public static EarthGeneratorSettings parse(String generatorSettings) {
         if (Strings.isNullOrEmpty(generatorSettings)) {
             generatorSettings = DEFAULT_SETTINGS;
         }
-
         return SETTINGS_PARSE_CACHE.getUnchecked(generatorSettings);
     }
 
-    /**
-     * Parses the given generator settings without caching.
-     *
-     * @param generatorSettings the settings string to parse
-     * @return the parsed settings
-     */
     @SneakyThrows(IOException.class)
     public static EarthGeneratorSettings parseUncached(String generatorSettings) {
         if (Strings.isNullOrEmpty(generatorSettings)) {
             generatorSettings = DEFAULT_SETTINGS;
         }
 
-        if (!generatorSettings.contains("version")) { //upgrade legacy config
+        if (!generatorSettings.contains("version")) {
             TerraMinusMinus.LOGGER.info("Parsing legacy config: {}", generatorSettings);
+            LegacyConfig legacy = TerraConstants.JSON_MAPPER
+                .readValue(generatorSettings, LegacyConfig.class);
 
-            LegacyConfig legacy = TerraConstants.JSON_MAPPER.readValue(generatorSettings, LegacyConfig.class);
-
-            GeographicProjection projection = TerraConstants.JSON_MAPPER.readValue("{\"" + LegacyConfig.upgradeLegacyProjectionName(legacy.projection) + "\":{}}", GeographicProjection.class);
+            GeographicProjection projection = TerraConstants.JSON_MAPPER
+                .readValue("{\"" + LegacyConfig.upgradeLegacyProjectionName(legacy.projection) + "\":{}}",
+                    GeographicProjection.class);
             projection = LegacyConfig.orientProjectionLegacy(projection, legacy.orentation);
             if (legacy.scaleX != 1.0d || legacy.scaleY != 1.0d) {
                 projection = new ScaleProjectionTransform(projection, legacy.scaleX, legacy.scaleY);
             }
-
-            return new EarthGeneratorSettings(projection, legacy.customcubic, true, true, CONFIG_VERSION);
+            return new EarthGeneratorSettings(projection, legacy.customcubic,
+                true, true, CONFIG_VERSION);
         }
 
-        return TerraConstants.JSON_MAPPER.readValue(generatorSettings, EarthGeneratorSettings.class);
+        return TerraConstants.JSON_MAPPER.readValue(generatorSettings,
+            EarthGeneratorSettings.class);
     }
 
     @NonNull
-    @Getter(onMethod_ = { @JsonGetter })
     protected final GeographicProjection projection;
-
-    @Getter(onMethod_ = { @JsonGetter })
     protected final boolean useDefaultHeights;
-    @Getter(onMethod_ = { @JsonGetter })
     protected final boolean useDefaultTreeCover;
-
-    protected transient final Cached<EarthBiomeProvider> biomeProvider = Cached.global(() -> new EarthBiomeProvider(this), ReferenceStrength.SOFT);
-    protected transient final Cached<GeneratorDatasets> datasets = Cached.global(() -> new GeneratorDatasets(this), ReferenceStrength.SOFT);
 
     @JsonCreator(mode = JsonCreator.Mode.PROPERTIES)
     public EarthGeneratorSettings(
@@ -126,10 +103,24 @@ public class EarthGeneratorSettings {
             @JsonProperty(value = "useDefaultTreeCover") @JsonAlias("useDefaultTrees") Boolean useDefaultTreeCover,
             @JsonProperty(value = "version", required = true) int version) {
         checkState(version == CONFIG_VERSION, "invalid version %d (expected: %d)", version, CONFIG_VERSION);
-
         this.projection = projection;
         this.useDefaultHeights = useDefaultHeights != null ? useDefaultHeights : true;
         this.useDefaultTreeCover = useDefaultTreeCover != null ? useDefaultTreeCover : true;
+    }
+
+    @JsonGetter
+    public GeographicProjection projection() {
+        return this.projection;
+    }
+
+    @JsonGetter
+    public boolean useDefaultHeights() {
+        return this.useDefaultHeights;
+    }
+
+    @JsonGetter
+    public boolean useDefaultTreeCover() {
+        return this.useDefaultTreeCover;
     }
 
     @Override
@@ -146,20 +137,6 @@ public class EarthGeneratorSettings {
         return CONFIG_VERSION;
     }
 
-    public EarthBiomeProvider biomeProvider() {
-        return this.biomeProvider.get();
-    }
-
-    public GeneratorDatasets datasets() {
-        return this.datasets.get();
-    }
-
-    /**
-     * Tries to convert this generator settings to a String Terra121 could understand.
-     *
-     * @return a valid String representing this settings for Terra121, or null if not possible (e.g. using Terra++ features like offsets)
-     * @author SmylerMC
-     */
     @JsonIgnore
     public String getLegacyGeneratorString() {
         LegacyConfig legacy = new LegacyConfig();
@@ -173,45 +150,38 @@ public class EarthGeneratorSettings {
             base = ((ProjectionTransform) base).delegate();
         }
 
-        legacy.projection = LegacyConfig.downgradeToLegacyProjectionName(GlobalParseRegistries.PROJECTIONS.inverse().get(base.getClass()));
+        legacy.projection = LegacyConfig.downgradeToLegacyProjectionName(
+            GlobalParseRegistries.PROJECTIONS.inverse().get(base.getClass()));
         if (legacy.projection == null) {
             return null;
         }
 
         while (proj instanceof ProjectionTransform) {
             ProjectionTransform trs = (ProjectionTransform) proj;
-            if (proj instanceof ScaleProjectionTransform) {
-                ScaleProjectionTransform scale = (ScaleProjectionTransform) proj;
+            if (proj instanceof ScaleProjectionTransform scale) {
                 legacy.scaleX *= scale.x();
                 legacy.scaleY *= scale.y();
-            } else if (proj instanceof FlipVerticalProjectionTransform || proj instanceof SwapAxesProjectionTransform) {
-                if (transform != null) {
-                    return null; // Terra121 does not support multiple transformations
-                }
+            } else if (proj instanceof FlipVerticalProjectionTransform
+                    || proj instanceof SwapAxesProjectionTransform) {
+                if (transform != null) return null;
                 transform = trs;
-            } else if (proj instanceof FlipHorizontalProjectionTransform || proj instanceof OffsetProjectionTransform) {
-                return null; // Terra121 does not support horizontal flips and offsets
+            } else if (proj instanceof FlipHorizontalProjectionTransform
+                    || proj instanceof OffsetProjectionTransform) {
+                return null;
             }
             proj = trs.delegate();
         }
 
         if (base.upright()) {
-            if (transform == null) {
-                legacy.orentation = LegacyConfig.Orientation.upright;
-            } else if (transform instanceof FlipVerticalProjectionTransform) {
-                legacy.orentation = LegacyConfig.Orientation.none; // Terra121 will flip it anyway because it's upright
-            } else if (transform instanceof SwapAxesProjectionTransform) {
-                return null; // There is one case we are not handling here, that of an upright, swapped and flipped vertically projection
-            }
+            if (transform == null) legacy.orentation = LegacyConfig.Orientation.upright;
+            else if (transform instanceof FlipVerticalProjectionTransform) legacy.orentation = LegacyConfig.Orientation.none;
+            else if (transform instanceof SwapAxesProjectionTransform) return null;
         } else {
-            if (transform == null) {
-                legacy.orentation = LegacyConfig.Orientation.none;
-            } else if (transform instanceof FlipVerticalProjectionTransform) {
-                legacy.orentation = LegacyConfig.Orientation.upright;
-            } else if (transform instanceof SwapAxesProjectionTransform) {
-                legacy.orentation = LegacyConfig.Orientation.swapped;
-            }
+            if (transform == null) legacy.orentation = LegacyConfig.Orientation.none;
+            else if (transform instanceof FlipVerticalProjectionTransform) legacy.orentation = LegacyConfig.Orientation.upright;
+            else if (transform instanceof SwapAxesProjectionTransform) legacy.orentation = LegacyConfig.Orientation.swapped;
         }
+
         try {
             return TerraConstants.JSON_MAPPER.writeValueAsString(legacy);
         } catch (JsonProcessingException e) {
@@ -222,56 +192,36 @@ public class EarthGeneratorSettings {
     @JsonDeserialize
     @JsonSerialize
     private static class LegacyConfig {
-        private static GeographicProjection orientProjectionLegacy(GeographicProjection base, Orientation orientation) {
+        private static GeographicProjection orientProjectionLegacy(GeographicProjection base,
+                Orientation orientation) {
             if (base.upright()) {
-                if (orientation == Orientation.upright) {
-                    return base;
-                }
+                if (orientation == Orientation.upright) return base;
                 base = new FlipVerticalProjectionTransform(base);
             }
-
-            if (orientation == Orientation.swapped) {
-                return new SwapAxesProjectionTransform(base);
-            } else if (orientation == Orientation.upright) {
-                base = new FlipVerticalProjectionTransform(base);
-            }
-
+            if (orientation == Orientation.swapped) return new SwapAxesProjectionTransform(base);
+            if (orientation == Orientation.upright) base = new FlipVerticalProjectionTransform(base);
             return base;
         }
 
         private static String upgradeLegacyProjectionName(String name) {
-            switch (name) {
-                case "web_mercator":
-                    return "centered_mercator";
-                case "airocean":
-                    return "dymaxion";
-                case "conformal":
-                    return "conformal_dymaxion";
-                case "bteairocean":
-                    return "bte_conformal_dymaxion";
-                default:
-                    return name;
-            }
+            return switch (name) {
+                case "web_mercator" -> "centered_mercator";
+                case "airocean" -> "dymaxion";
+                case "conformal" -> "conformal_dymaxion";
+                case "bteairocean" -> "bte_conformal_dymaxion";
+                default -> name;
+            };
         }
 
         private static String downgradeToLegacyProjectionName(String name) {
-            switch (name) {
-                case "centered_mercator":
-                    return "web_mercator";
-                case "dymaxion":
-                    return "airocean";
-                case "conformal_dymaxion":
-                    return "conformal";
-                case "bte_conformal_dymaxion":
-                    return "bteairocean";
-                case "equirectangular":
-                case "sinusoidal":
-                case "equal_earth":
-                case "transverse_mercator":
-                    return name;
-                default:
-                    return null;
-            }
+            return switch (name) {
+                case "centered_mercator" -> "web_mercator";
+                case "dymaxion" -> "airocean";
+                case "conformal_dymaxion" -> "conformal";
+                case "bte_conformal_dymaxion" -> "bteairocean";
+                case "equirectangular", "sinusoidal", "equal_earth", "transverse_mercator" -> name;
+                default -> null;
+            };
         }
 
         public String projection = "equirectangular";
@@ -285,8 +235,6 @@ public class EarthGeneratorSettings {
             TerraMinusMinus.LOGGER.warn("Ignoring unknown legacy config option: \"{}\": \"{}\"", key, value);
         }
 
-        private enum Orientation {
-            none, upright, swapped
-        }
+        private enum Orientation { none, upright, swapped }
     }
 }

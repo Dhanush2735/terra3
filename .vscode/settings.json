@@ -1,4 +1,4 @@
 {
-    "java.compile.nullAnalysis.mode": "automatic",
-    "java.configuration.updateBuildConfiguration": "interactive"
+  "java.jdt.ls.lombokSupport.enabled": true,
+  "java.configuration.updateBuildConfiguration": "automatic"
 }

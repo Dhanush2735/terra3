@@ -33,4 +33,10 @@ final class BiomeImplementation implements Biome {
         return this.identifier.toString();
     }
 
+
+    @Override
+    public Identifier identifier() {
+        return this.identifier;
+    }
+
 }

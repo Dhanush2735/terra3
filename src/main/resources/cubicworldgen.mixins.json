@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "io.github.opencubicchunks.cubicworldgen.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "cubicworldgen.refmap.json",
+  "mixins": [
+    "MixinNoiseBasedChunkGenerator",
+    "MixinChunkGenerator",
+    "MixinNoiseChunk"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

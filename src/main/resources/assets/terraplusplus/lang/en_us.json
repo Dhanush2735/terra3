@@ -1,5 +1,6 @@
 {
   "generator.terraplusplus.earth": "Planet Earth",
+  "generator.terraplusplus.earth.description": "Generate the real Earth with Terra++ terrain data.",
   "generator.terraplusplus.earth_type": "Planet Earth (Infinite)",
   "terraplusplus.configuration": "Terra++ Settings"
 }

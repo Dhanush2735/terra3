@@ -294,4 +294,30 @@ final class QuadtreeBVH<V extends Bounds2d> implements BVH<V> {
             }
         }
     }
+
+    @Override
+    public int size() {
+        return this.size;
+    }
+
+    @Override
+    public double minX() {
+        return this.minX;
+    }
+
+    @Override
+    public double maxX() {
+        return this.maxX;
+    }
+
+    @Override
+    public double minZ() {
+        return this.minZ;
+    }
+
+    @Override
+    public double maxZ() {
+        return this.maxZ;
+    }
+
 }

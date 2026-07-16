@@ -1,6 +1,6 @@
 modLoader="javafml"
 loaderVersion="[47,)"
-license="MIT"
+license="MIT / LGPL-2.1 components"
 issueTrackerURL="https://github.com/BuildTheEarth/terraplusplus/issues"
 
 [[mods]]
@@ -11,8 +11,26 @@ displayURL="https://github.com/BuildTheEarth/terraplusplus"
 authors="BuildTheEarth Team"
 description='''
 Real-world terrain data for Minecraft.
-Provides Earth heightmaps, projections, and terrain sampling
-for use with CubicWorldGen and CubicChunks2.
+Provides Earth heightmaps, projections, and terrain sampling.
+This build embeds TerraCubes/CubicWorldGen code into the same jar.
+'''
+
+[[mods]]
+modId="terracubes"
+version="${file.jarVersion}"
+displayName="TerraCubes Embedded"
+authors="Gamer2735, based on OpenCubicChunks"
+description='''
+Embedded cubic chunk support merged into the Terra++ jar.
+'''
+
+[[mods]]
+modId="cubicworldgen"
+version="${file.jarVersion}"
+displayName="Cubic World Gen Embedded"
+authors="OpenCubicChunks Team"
+description='''
+Embedded cube-aware world generation support merged into the Terra++ jar.
 '''
 
 [[dependencies.terraplusplus]]
@@ -36,3 +54,37 @@ versionRange="[2.0.0-alpha,)"
 ordering="BEFORE"
 side="BOTH"
 
+[[dependencies.terracubes]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.terracubes]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.cubicworldgen]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.cubicworldgen]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.cubicworldgen]]
+modId="terracubes"
+mandatory=false
+versionRange="[2.0.0-alpha,)"
+ordering="AFTER"
+side="BOTH"

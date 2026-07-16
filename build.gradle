@@ -3,6 +3,7 @@ plugins {
     id 'idea'
     id 'maven-publish'
     id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.spongepowered.mixin' version '0.7.+'
 }
 
 version = '2.0.0-alpha'
@@ -16,12 +17,15 @@ jarJar.enable()
 
 minecraft {
     mappings channel: 'official', version: '1.20.1'
+    accessTransformer = file('src/main/resources/META-INF/accesstransformer.cfg')
 
     runs {
         client {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
             mods {
                 terraplusplus {
                     source sourceSets.main
@@ -41,8 +45,16 @@ minecraft {
     }
 }
 
+mixin {
+    add sourceSets.main, "cubicchunks.refmap.json"
+    add sourceSets.main, "cubicworldgen.refmap.json"
+    config "cubicchunks.mixins.json"
+    config "cubicworldgen.mixins.json"
+}
+
 repositories {
     mavenCentral()
+    maven { url = 'https://repo.spongepowered.org/maven' }
     maven {
         name = 'DaPorkchop'
         url = 'https://maven.daporkchop.net/'
@@ -60,6 +72,7 @@ repositories {
 
 dependencies {
     minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
 
     // Lombok — must come FIRST
     compileOnly 'org.projectlombok:lombok:1.18.30'
@@ -150,7 +163,8 @@ tasks.named('jar', Jar).configure {
             "Specification-Version"   : "1",
             "Implementation-Title"    : project.name,
             "Implementation-Version"  : project.jar.archiveVersion,
-            "Implementation-Vendor"   : "BuildTheEarth"
+            "Implementation-Vendor"   : "BuildTheEarth",
+            "MixinConfigs"            : "cubicchunks.mixins.json,cubicworldgen.mixins.json"
         ])
     }
 }
@@ -165,10 +179,24 @@ tasks.named('build').configure {
     dependsOn 'jarJar'
 }
 
+
+// Force UTF-8 so Windows builds do not interpret Java comments as windows-1252.
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
 sourceSets {
     main {
         resources {
             srcDirs = ["src/main/resources"]
         }
+    }
+}
+
+// Include generated refmaps in the final single jar when present.
+processResources {
+    from(tasks.compileJava) {
+        include 'cubicchunks.refmap.json'
+        include 'cubicworldgen.refmap.json'
     }
 }

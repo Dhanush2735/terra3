@@ -75,4 +75,13 @@ public class ScaleProjectionTransform extends ProjectionTransform {
     public String toString() {
         return "Scale (" + super.delegate + ") by " + this.x + ", " + this.y;
     }
+
+    public double x() {
+        return this.x;
+    }
+
+    public double y() {
+        return this.y;
+    }
+
 }
