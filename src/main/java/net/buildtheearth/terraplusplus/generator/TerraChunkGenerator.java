@@ -155,6 +155,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private volatile OsmStructureGenerator
         structureGenerator;
     private volatile OvertureIndex overtureIndex;
+    private volatile SourceCooperativeIndex vidaIndex;
     private volatile AsyncStructureManager asyncManager;
     private volatile StructurePlacementQueue
         placementQueue;
@@ -212,6 +213,16 @@ public class TerraChunkGenerator extends ChunkGenerator {
         queuedStructRefresh=ConcurrentHashMap.newKeySet();
     public static volatile TerraChunkGenerator
         activeInstance=null;
+    /**
+     * Half-width of the OSM/Overture structure prefetch window, in degrees.
+     *
+     * OSM tiles are 0.01 deg, so 0.005 covers the chunk's own tile plus the
+     * immediate neighbours it will spill into - enough to hide latency without
+     * flooding Overpass. Larger values were rejected: the rate limiter is
+     * shared, and over-fetching starves the tile the player is standing on.
+     */
+    private static final double STRUCT_PREFETCH_DEG=0.005;
+
     private static final int REFRESH_PER_TICK=10;
     private static final int STRUCT_REFRESH_PER_TICK=2;
         public static volatile int
@@ -467,58 +478,37 @@ public class TerraChunkGenerator extends ChunkGenerator {
             LevelChunk chunk){
         try{
             chunk.setUnsaved(true);
-            int cmx=chunk.getPos().getMinBlockX();
-            int cmz=chunk.getPos().getMinBlockZ();
-            BlockPos.MutableBlockPos pos=
-                new BlockPos.MutableBlockPos();
 
-            // Find min/max Y range with actual content
-            int globalMinY=level.getMaxBuildHeight();
-            int globalMaxY=level.getMinBuildHeight();
+            // NOTE: the 16x16 WORLD_SURFACE scan that used to compute a
+            // globalMinY/globalMaxY window is gone with the per-block loop.
+            // The chunk packet carries every section, so there is nothing to
+            // bound.
 
-            for(int lx=0;lx<16;lx++){
-                for(int lz=0;lz<16;lz++){
-                    int sy;
-                    try{
-                        sy=chunk.getHeight(
-                            Heightmap.Types
-                                .WORLD_SURFACE,
-                            lx,lz);
-                    }catch(Exception e){continue;}
-                    if(sy-2<globalMinY)
-                        globalMinY=sy-2;
-                    if(sy+60>globalMaxY)
-                        globalMaxY=sy+60;
-                }
-            }
-
-            globalMinY=Math.max(globalMinY,
-                level.getMinBuildHeight());
-            globalMaxY=Math.min(globalMaxY,
-                level.getMaxBuildHeight()-1);
-
-            // Batch: send ALL non-air blocks in range
-            for(int lx=0;lx<16;lx++){
-                for(int lz=0;lz<16;lz++){
-                    int bx=cmx+lx;
-                    int bz=cmz+lz;
-                    for(int y=globalMinY;
-                            y<=globalMaxY;y++){
-                        pos.set(bx,y,bz);
-                        BlockState st=
-                            chunk.getBlockState(pos);
-                        if(st.isAir())continue;
-                        level.sendBlockUpdated(
-                            pos,st,st,3);
-                    }
-                }
-            }
-
-            // Also notify block entities
-            for(var be:chunk.getBlockEntities()
-                    .values()){
-                level.blockEntityChanged(
-                    be.getBlockPos());
+            // ONE packet for the whole chunk.
+            //
+            // This used to loop 16 x 16 x (span) and call
+            // level.sendBlockUpdated() for every non-air block. With the
+            // span of sy-2..sy+60 that is 15,872 block reads and up to
+            // ~15,000 individual packets PER CHUNK -- and at 2 chunks/tick,
+            // ~31,700 per tick, each also triggering lighting and neighbour
+            // shape updates on the server thread. It was one of the two main
+            // causes of "Can't keep up!".
+            //
+            // ClientboundLevelChunkWithLightPacket resends the entire chunk,
+            // including block entities and light, in a single packet. The
+            // file header claimed this was already being done; it was not.
+            var pkt=new net.minecraft.network.protocol.game
+                .ClientboundLevelChunkWithLightPacket(
+                    chunk,level.getLightEngine(),null,null);
+            int cx=chunk.getPos().x, cz=chunk.getPos().z;
+            for(ServerPlayer p:level.players()){
+                // Only players tracking this chunk. View distance is in
+                // chunks, so compare in chunk space.
+                int vd=level.getServer().getPlayerList()
+                    .getViewDistance()+1;
+                if(Math.abs((p.blockPosition().getX()>>4)-cx)<=vd
+                        &&Math.abs((p.blockPosition().getZ()>>4)-cz)<=vd)
+                    p.connection.send(pkt);
             }
         }catch(Exception e){
             LOGGER.debug(
@@ -529,6 +519,106 @@ public class TerraChunkGenerator extends ChunkGenerator {
     }
 
     // ── FETCH STRUCTURES SHARED HELPER ────────────────────────
+    /**
+     * NON-BLOCKING structure lookup for the server tick thread.
+     *
+     * ROOT CAUSE OF "Can't keep up!":
+     * drainRefreshQueue() runs inside ServerTickEvent, i.e. on the server main
+     * thread, and called fetchStructuresForChunk(..., 8000) which ends in
+     * CompletableFuture.get(8000 ms). A single cache miss therefore froze the
+     * whole server for up to 8 s = 160 ticks of debt. With the post-jump burst
+     * of 64 chunks/tick the theoretical worst case is 64 x 8 s = 512 s in ONE
+     * tick, and the log shows exactly this shape: a time jump queues 1,216
+     * chunks at 00:02:35 and by 00:02:56 the server is 2,933 ticks behind --
+     * 106 s of new debt in 21 s of wall clock.
+     *
+     * This variant never waits. If the data is already in memory it is
+     * returned; otherwise the tile is handed to AsyncStructureManager (which
+     * already exists and already works -- the log shows "OSM retry success"
+     * 2.3 s after a queued retry) and null is returned so the caller re-queues
+     * the chunk. The chunk fills in a second or two later instead of stalling
+     * the world.
+     *
+     * @return structures if cached, or null when not ready yet
+     */
+    private List<OsmStructureIndex.OsmStructure>
+            fetchStructuresCachedOnly(
+            net.minecraft.server.level.ServerLevel level,
+            LevelChunk ch){
+        try{
+            var d=getDf();
+            if(d==null||!d.isProjectionLoaded())return null;
+            double[] gc=d.toGeo(
+                ch.getPos().getMinBlockX()+8,
+                ch.getPos().getMinBlockZ()+8);
+            if(gc==null||Double.isNaN(gc[0])
+                    ||Double.isNaN(gc[1]))return List.of();
+
+            double mnLa=gc[1],mxLa=gc[1];
+            double mnLo=gc[0],mxLo=gc[0];
+            for(double[] g:new double[][]{
+                d.toGeo(ch.getPos().getMinBlockX(),
+                    ch.getPos().getMinBlockZ()),
+                d.toGeo(ch.getPos().getMinBlockX()+15,
+                    ch.getPos().getMinBlockZ()),
+                d.toGeo(ch.getPos().getMinBlockX(),
+                    ch.getPos().getMinBlockZ()+15),
+                d.toGeo(ch.getPos().getMinBlockX()+15,
+                    ch.getPos().getMinBlockZ()+15)})
+                if(g!=null&&!Double.isNaN(g[0])
+                        &&!Double.isNaN(g[1])){
+                    mnLa=Math.min(mnLa,g[1]);
+                    mxLa=Math.max(mxLa,g[1]);
+                    mnLo=Math.min(mnLo,g[0]);
+                    mxLo=Math.max(mxLo,g[0]);}
+
+            // Are the OSM tiles already resident? areTilesLoaded() is a pure
+            // map lookup and never touches the network.
+            if(!getStructureIndex().areTilesLoaded(
+                    mnLa,mxLa,mnLo,mxLo)){
+                getAsyncManager().queueRetry(
+                    (mnLa+mxLa)/2,(mnLo+mxLo)/2,
+                    ch.getPos().x,ch.getPos().z);
+                return null;
+            }
+
+            // Cache-resident path: getStructuresForChunk (no "Blocking")
+            // reads memory only.
+            List<OsmStructureIndex.OsmStructure> all=
+                new ArrayList<>();
+            var os=getStructureIndex()
+                .getStructuresForChunk(
+                    mnLa,mxLa,mnLo,mxLo,worldConfig);
+            if(os!=null&&!os.isEmpty())all.addAll(os);
+
+            // ── YEAR FILTER ──────────────────────────────────
+            // MUST mirror fetchStructuresForChunk, which routes through
+            // HistoricalStructureManager and therefore applies
+            // HistoricalDateParser.isVisibleAt() to every structure.
+            //
+            // This method reads the RAW OSM index, which is year-agnostic.
+            // Without the filter below every building rendered regardless of
+            // the current year, so teleporting at 3000 BCE produced a modern
+            // city in the surrounding chunks while the rest of the world was
+            // correctly empty. Regression introduced when this non-blocking
+            // path was added; the blocking path it replaced always had the
+            // timeEnabled branch.
+            if(worldConfig.timeEnabled&&!all.isEmpty()){
+                int year=TerraTimeManager.getCurrentYear();
+                List<OsmStructureIndex.OsmStructure> visible=
+                    new ArrayList<>(all.size());
+                for(var s:all)
+                    if(HistoricalDateParser.isVisibleAt(
+                            s.startYear,s.endYear,year,true))
+                        visible.add(s);
+                return visible;
+            }
+            return all;
+        }catch(Exception e){
+            return null;
+        }
+    }
+
     private List<OsmStructureIndex.OsmStructure>
             fetchStructuresForChunk(
             net.minecraft.server.level.ServerLevel level,
@@ -581,6 +671,45 @@ public class TerraChunkGenerator extends ChunkGenerator {
                     if(os==null)return null;
                     if(!os.isEmpty())all.addAll(os);
                 }
+                // ── TIER 3: VIDA (after OSM, before Microsoft) ──
+                List<SourceCooperativeIndex.VidaBuilding>
+                    vidaAccepted=new ArrayList<>();
+                if(("vida".equals(src)
+                        ||"both".equals(src))
+                        &&worldConfig.vidaBuildings)
+                    try{
+                        var vb=getVidaIndex()
+                            .getBuildingsForChunkBlocking(
+                                mnLa,mxLa,mnLo,mxLo,
+                                timeoutMs,null);
+                        if(vb!=null){
+                            // Remove this dataset's positional bias against
+                            // OSM before any comparison. Measured per region
+                            // at runtime; see SourceAlignment.
+                            var vPrints=new ArrayList<
+                                FootprintAlignment.Print>(vb.size());
+                            for(var b:vb)
+                                vPrints.add(FootprintAlignment.Print.of(b));
+                            var vShift=SourceAlignment.shiftFor(
+                                "vida",(mnLa+mxLa)/2,(mnLo+mxLo)/2,
+                                vPrints,all);
+                            for(var raw:vb){
+                                var b=raw.shifted(vShift.dLat,vShift.dLon);
+                                if(SourceCooperativeIndex
+                                        .overlapsExisting(b,all))
+                                    continue;
+                                // ML footprints sometimes land on the
+                                // carriageway; OSM has no building there to
+                                // compare against, so reject by road geometry.
+                                if(FootprintAlignment.sitsOnRoad(
+                                        FootprintAlignment.Print.of(b),all))
+                                    continue;
+                                vidaAccepted.add(b);
+                                all.add(b.toOsmStructure());}}
+                    }catch(Exception e){
+                        LOGGER.debug("VIDA fetch [{},{}]: {}",
+                            ch.getPos().x,ch.getPos().z,
+                            e.getMessage());}
                 if(("overture".equals(src)
                         ||"both".equals(src))
                         &&worldConfig.overtureBuildings)
@@ -591,10 +720,33 @@ public class TerraChunkGenerator extends ChunkGenerator {
                                 .getBuildingsForChunkBlocking(
                                     mnLa,mxLa,mnLo,mxLo,
                                     timeoutMs);
-                            if(ob!=null&&!ob.isEmpty())
+                            if(ob!=null&&!ob.isEmpty()){
+                                // Microsoft has its own, different bias.
+                                var mPrints=new ArrayList<
+                                    FootprintAlignment.Print>(ob.size());
                                 for(var b:ob)
+                                    mPrints.add(
+                                        FootprintAlignment.Print.of(b));
+                                var mShift=SourceAlignment.shiftFor(
+                                    "overture",(mnLa+mxLa)/2,(mnLo+mxLo)/2,
+                                    mPrints,all);
+                                for(var raw:ob){
+                                    var b=raw.shifted(
+                                        mShift.dLat,mShift.dLon);
+                                    // Lowest tier: yield to
+                                    // OSM and to VIDA.
+                                    if(overlaps(b,all))
+                                        continue;
+                                    if(SourceCooperativeIndex
+                                            .overlapsVida(
+                                                b,vidaAccepted))
+                                        continue;
+                                    if(FootprintAlignment.sitsOnRoad(
+                                            FootprintAlignment.Print.of(b),
+                                            all))
+                                        continue;
                                     all.add(
-                                        b.toOsmStructure());
+                                        b.toOsmStructure());}}
                         }
                     }catch(Exception e){
                         LOGGER.debug(
@@ -666,16 +818,26 @@ public class TerraChunkGenerator extends ChunkGenerator {
                     level.getChunk(pos.x,pos.z);
                 long k=ck(pos.x,pos.z);
 
-                // Fetch structures for tree clearing
-                // in footprints only — no road placement
+                // Fetch structures for tree clearing in footprints only.
+                //
+                // NON-BLOCKING. This runs on the server tick thread, so it
+                // must never wait on the network. On a cache miss the tile is
+                // queued for async fetch and the chunk is re-queued, which is
+                // what the two-pass refresh was designed for.
                 List<OsmStructureIndex.OsmStructure>
                     structs=null;
                 if(worldConfig.hasAnyStructures()){
-                    structs=fetchStructuresForChunk(
-                        level,ch,
-                        STRUCTURE_FETCH_TIMEOUT_MS);
-                    if(structs!=null
-                            &&!structs.isEmpty())
+                    structs=fetchStructuresCachedOnly(
+                        level,ch);
+                    if(structs==null){
+                        // Not resident yet. Put the chunk back and move on;
+                        // do NOT stall the tick waiting for it.
+                        if(queuedVegRefresh.add(
+                                rk(pos.x,pos.z)))
+                            refreshQueue.offer(pos);
+                        vp++;continue;
+                    }
+                    if(!structs.isEmpty())
                         refreshStructureCache.put(
                             k,structs);
                 }
@@ -1463,12 +1625,16 @@ private boolean refreshStructuresForChunk(
         if (d == null || !d.isProjectionLoaded())
             return false;
         long k = ck(ch.getPos().x, ch.getPos().z);
+        // PEEK, do not remove. If placement below fails the chunk is retried,
+        // and consuming the cache here meant the retry had to hit the network
+        // again for data we already had.
         List<OsmStructureIndex.OsmStructure> all =
-            refreshStructureCache.remove(k);
+            refreshStructureCache.get(k);
         if (all == null) {
-            all = fetchStructuresForChunk(
-                level, ch,
-                STRUCTURE_FETCH_TIMEOUT_MS);
+            // NON-BLOCKING: this runs on the server tick thread. A cache miss
+            // returns false so the chunk stays queued and is retried once the
+            // async fetch lands, instead of blocking the tick for 8 seconds.
+            all = fetchStructuresCachedOnly(level, ch);
             if (all == null) return false;
         }
         if (all.isEmpty()) return true;
@@ -1519,6 +1685,11 @@ for (int lx = 0; lx < 16; lx++) {
             .generateStructuresFromList(ch, all);
 
         if (!ok) return false;
+
+        // Placement succeeded, so the cached structures are no longer needed.
+        // (They are only released here; a failed placement keeps them so the
+        // retry does not have to re-fetch from the network.)
+        refreshStructureCache.remove(k);
 
         ch.setUnsaved(true);
         sendChunkToClients(level, ch);
@@ -1708,9 +1879,15 @@ for (int lx = 0; lx < 16; lx++) {
     private OvertureIndex getOvertureIndex(){
         if(overtureIndex==null)synchronized(this){
             if(overtureIndex==null){
-                overtureIndex=new OvertureIndex();
+                overtureIndex=OvertureIndex.getInstance();
                 LOGGER.info("OvertureIndex init");}}
         return overtureIndex;}
+    private SourceCooperativeIndex getVidaIndex(){
+        if(vidaIndex==null)synchronized(this){
+            if(vidaIndex==null){
+                vidaIndex=SourceCooperativeIndex.getInstance();
+                LOGGER.info("SourceCooperativeIndex (VIDA) init");}}
+        return vidaIndex;}
     private StructurePlacementQueue getPlacementQueue(){
         if(placementQueue==null)synchronized(this){
             if(placementQueue==null){
@@ -2022,6 +2199,44 @@ for (int lx = 0; lx < 16; lx++) {
                     LOGGER.debug("OSM [{},{}]: {}",
                         cx,cz,e.getMessage());
                     retry=true;}
+                // ── TIER 3: VIDA (Google/MS/OSM open buildings) ──
+                // Runs after OSM, before Microsoft. Gap-fill only:
+                // anything overlapping an OSM footprint is dropped.
+                List<SourceCooperativeIndex.VidaBuilding>
+                    vidaAccepted=new ArrayList<>();
+                if(("vida".equals(src)
+                        ||"both".equals(src))
+                        &&worldConfig.vidaBuildings)
+                    try{
+                        var vi=getVidaIndex();
+                        var vb=vi
+                            .getBuildingsForChunkBlocking(
+                                mnLa,mxLa,mnLo,mxLo,
+                                STRUCTURE_FETCH_TIMEOUT_MS,
+                                null);
+                        if(vb==null)
+                            retry=true;   // shard still downloading
+                        else{
+                            var vPrints=new ArrayList<
+                                FootprintAlignment.Print>(vb.size());
+                            for(var b:vb)
+                                vPrints.add(FootprintAlignment.Print.of(b));
+                            var vShift=SourceAlignment.shiftFor(
+                                "vida",(mnLa+mxLa)/2,(mnLo+mxLo)/2,
+                                vPrints,all);
+                            for(var raw:vb){
+                            var b=raw.shifted(vShift.dLat,vShift.dLon);
+                            if(SourceCooperativeIndex
+                                    .overlapsExisting(b,all))
+                                continue;
+                            if(FootprintAlignment.sitsOnRoad(
+                                    FootprintAlignment.Print.of(b),all))
+                                continue;
+                            vidaAccepted.add(b);
+                            all.add(b.toOsmStructure());}}
+                    }catch(Exception e){
+                        LOGGER.debug("VIDA [{},{}]: {}",
+                            cx,cz,e.getMessage());}
                 if(("overture".equals(src)
                         ||"both".equals(src))
                         &&worldConfig.overtureBuildings)
@@ -2072,10 +2287,30 @@ for (int lx = 0; lx < 16; lx++) {
                                         +": {}",
                                         cx,cz,
                                         e.getMessage());}
-                                for(var b:ob){
+                                var mPrints=new ArrayList<
+                                    FootprintAlignment.Print>(ob.size());
+                                for(var b:ob)
+                                    mPrints.add(
+                                        FootprintAlignment.Print.of(b));
+                                var mShift=SourceAlignment.shiftFor(
+                                    "overture",(mnLa+mxLa)/2,
+                                    (mnLo+mxLo)/2,mPrints,all);
+                                for(var raw:ob){
+                                    var b=raw.shifted(
+                                        mShift.dLat,mShift.dLon);
                                     if(!blk.isEmpty()
                                             &&overlaps(
                                                 b,blk))
+                                        continue;
+                                    // Microsoft is the lowest tier:
+                                    // also yield to VIDA placements.
+                                    if(SourceCooperativeIndex
+                                            .overlapsVida(
+                                                b,vidaAccepted))
+                                        continue;
+                                    if(FootprintAlignment.sitsOnRoad(
+                                            FootprintAlignment.Print.of(b),
+                                            all))
                                         continue;
                                     all.add(
                                         b.toOsmStructure());}
@@ -2140,6 +2375,23 @@ for (int lx = 0; lx < 16; lx++) {
                 cl/=o.nodes.length;
                 cn/=o.nodes.length;
                 if(pip(cl,cn,m.polygon))return true;
+                // Near-miss: ML footprints (Microsoft/Google) sit a few metres
+                // off the hand-mapped OSM position, so they do not overlap and
+                // used to be placed as a duplicate beside the real building.
+                if(FootprintAlignment.isSameBuilding(
+                        FootprintAlignment.Print.of(m),
+                        FootprintAlignment.Print.of(o)))
+                    return true;
+                // STRICT: OSM outranks Microsoft, so ANY shared area removes
+                // the Microsoft footprint, even for a different building.
+                var mn=new OsmStructureIndex.OsmNode[m.polygon.length];
+                for(int i=0;i<m.polygon.length;i++)
+                    mn[i]=new OsmStructureIndex.OsmNode(
+                        m.polygon[i][0],m.polygon[i][1]);
+                if(FootprintAlignment.footprintsIntersect(
+                        mn,m.minLat,m.maxLat,m.minLon,m.maxLon,
+                        o.nodes,o.minLat,o.maxLat,o.minLon,o.maxLon))
+                    return true;
             }else if(o.type==OsmStructureIndex
                     .StructureType.BRIDGE){
                 double t=0.00009;
@@ -3444,7 +3696,27 @@ for (int lx = 0; lx < 16; lx++) {
                     // OSM is fallback so not required.
                     waterDataAvailable=ohmLoaded;
                     r.prefetch(cLa,cLo);}
-                getWorldCover().prefetch(cLa,cLo);}
+                getWorldCover().prefetch(cLa,cLo);
+                // OSM/Overture structure tiles were NOT prefetched here, so
+                // every chunk discovered its tile cold in applyBiomeDecoration
+                // and paid a 4 s blocking timeout. The cold-start log shows 17
+                // of them = 68 s of stalled worker threads.
+                //
+                // Kicking the fetch off during terrain generation (stage 1)
+                // means the tile is usually resident by the time decoration
+                // (stage 2) needs it. Fire-and-forget: never blocks.
+                try{
+                    double m=STRUCT_PREFETCH_DEG;
+                    getStructureIndex().prefetchTiles(
+                        cLa-m,cLa+m,cLo-m,cLo+m);
+                    if(worldConfig.overtureBuildings){
+                        var ov=getOvertureIndex();
+                        if(ov.isEnabled())
+                            ov.prefetchTiles(
+                                cLa-m,cLa+m,cLo-m,cLo+m);
+                    }
+                }catch(Exception ignored){}
+            }
         }catch(Exception ig){
             LOGGER.debug("Prefetch [{},{}]: {}",
                 ch.getPos().x,ch.getPos().z,

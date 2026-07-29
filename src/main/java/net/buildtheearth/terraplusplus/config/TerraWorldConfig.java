@@ -181,6 +181,8 @@ public class TerraWorldConfig {
     public final double  roadWidthScale;
     public final boolean cleanupArtifacts;
     public final boolean overtureBuildings;
+    /** Enables VIDA / Source Cooperative buildings (tier between OSM and Microsoft). */
+    public final boolean vidaBuildings;
     public final boolean overtureSupplement;
     public final boolean timeEnabled;
     public final int     timeScale;
@@ -200,6 +202,37 @@ public class TerraWorldConfig {
             boolean overtureSupplement,
             boolean timeEnabled, int timeScale,
             int baseYear, boolean ohmEnabled) {
+        this(buildings, roads, railways, bridges, walls,
+                gardens, landuse, streetLights,
+                naturalFeatures, waterBodies,
+                buildingDetail, roadWidthScale,
+                cleanupArtifacts, overtureBuildings,
+                overtureSupplement, timeEnabled,
+                timeScale, baseYear, ohmEnabled,
+                true);
+    }
+
+    /**
+     * Full constructor including the VIDA (Source Cooperative) building toggle.
+     *
+     * VIDA sits between OSM and Microsoft in the source hierarchy:
+     * OHM -> OSM -> VIDA -> Microsoft. The 19-argument overload above defaults
+     * it to enabled so existing call sites keep working unchanged.
+     */
+    public TerraWorldConfig(
+            boolean buildings, boolean roads,
+            boolean railways, boolean bridges,
+            boolean walls, boolean gardens,
+            boolean landuse, boolean streetLights,
+            boolean naturalFeatures, boolean waterBodies,
+            int buildingDetail, double roadWidthScale,
+            boolean cleanupArtifacts,
+            boolean overtureBuildings,
+            boolean overtureSupplement,
+            boolean timeEnabled, int timeScale,
+            int baseYear, boolean ohmEnabled,
+            boolean vidaBuildings) {
+        this.vidaBuildings     = vidaBuildings;
         this.buildings         = buildings;
         this.roads             = roads;
         this.railways          = railways;

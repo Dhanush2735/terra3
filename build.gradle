@@ -150,6 +150,29 @@ dependencies {
         jarJar.pin(it, '1.0.0-alpha5')
     }
 
+    // VIDA Ultimate Dependencies (GIS Exclusions to prevent JAI/GeoTools build failures)
+    implementation('org.wololo:flatgeobuf:3.26.2') {
+        exclude group: 'org.geotools'
+        exclude group: 'javax.media'
+        exclude group: 'org.ejml'
+    }
+    implementation 'org.locationtech.jts:jts-core:1.19.0'
+    implementation 'com.google.flatbuffers:flatbuffers-java:2.0.3'
+    // PackedRTree.search touches Guava's LittleEndianDataInputStream.
+    // Minecraft already ships guava 31.1-jre, so compileOnly is enough and we
+    // must NOT jarJar it (that would shade a second copy into the classpath).
+    compileOnly 'com.google.guava:guava:31.1-jre'
+
+    jarJar(group: 'org.wololo', name: 'flatgeobuf', version: '[3.26.0,4.0.0)') {
+        jarJar.pin(it, '3.26.2')
+    }
+    jarJar(group: 'org.locationtech.jts', name: 'jts-core', version: '[1.19.0,1.20.0)') {
+        jarJar.pin(it, '1.19.0')
+    }
+    jarJar(group: 'com.google.flatbuffers', name: 'flatbuffers-java', version: '[2.0.0,3.0.0)') {
+        jarJar.pin(it, '2.0.3')
+    }
+
     implementation 'com.google.code.gson:gson:2.10.1'
 }
 

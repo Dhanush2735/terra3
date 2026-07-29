@@ -26,6 +26,7 @@ package net.buildtheearth.terraplusplus.generator.historical;
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.buildtheearth.terraplusplus.generator.osm.OsmStructureIndex;
 import net.buildtheearth.terraplusplus.generator.osm.OvertureIndex;
+import net.buildtheearth.terraplusplus.generator.osm.SourceCooperativeIndex;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -50,6 +51,7 @@ public class HistoricalStructureManager {
 
     private final OhmStructureIndex  ohmIndex;
     private final OsmStructureIndex  osmIndex;
+    private final SourceCooperativeIndex vidaIndex;
     private final OvertureIndex      overtureIndex;
     private final TerraWorldConfig   config;
     private final WikiDataLookup     wikiData;
@@ -62,13 +64,15 @@ public class HistoricalStructureManager {
         // pattern to avoid circular dependency
         this.ohmIndex      = ohmIndex;
         this.osmIndex      = osmIndex;
-        this.overtureIndex = new OvertureIndex();
+        this.vidaIndex     = SourceCooperativeIndex.getInstance();
+        this.overtureIndex = OvertureIndex.getInstance();
         this.config        = config;
         this.wikiData      = WikiDataLookup
             .getInstance();
         LOGGER.info(
             "HistoricalStructureManager init "
-            + "(ohm→osm→wiki→gravity→population)");
+            + "(ohm→osm→vida→microsoft, "
+            + "dates: wiki→gravity→population)");
     }
 
     // ── RESULT ────────────────────────────────────────────────
@@ -281,7 +285,75 @@ public class HistoricalStructureManager {
                 visible.size());
         }
 
-        // ── STEP 3: OVERTURE ──────────────────────
+        // ── STEP 3: VIDA (Google/MS/OSM open buildings) ──
+        // Sits below OSM, above Microsoft. Gap-fill only.
+        // Carries no dates, so it uses the same
+        // WikiData -> Gravity -> Population chain, minus
+        // WikiData (VIDA footprints are unnamed).
+        List<SourceCooperativeIndex.VidaBuilding>
+            vidaAccepted = new ArrayList<>();
+        if (config.vidaBuildings) {
+
+            List<SourceCooperativeIndex.VidaBuilding>
+                vidaAll = vidaIndex
+                .getBuildingsForChunkBlocking(
+                    minLat, maxLat,
+                    minLon, maxLon,
+                    timeoutMs / 4,
+                    null);
+
+            // null => shard still downloading; retry chunk
+            if (vidaAll == null) return null;
+
+            for (SourceCooperativeIndex.VidaBuilding b
+                    : vidaAll) {
+
+                // Skip if it collides with an OHM or
+                // OSM footprint already accepted.
+                if (SourceCooperativeIndex
+                        .overlapsExisting(b, visible))
+                    continue;
+
+                // Reject ML footprints sitting on a road. There is no
+                // building there to collide with, so nothing above
+                // catches them and they render in the carriageway.
+                if (net.buildtheearth.terraplusplus.generator.osm
+                        .FootprintAlignment.sitsOnRoad(
+                            net.buildtheearth.terraplusplus.generator.osm
+                                .FootprintAlignment.Print.of(b), visible))
+                    continue;
+
+                int effectiveStart =
+                    StructureDateEstimator
+                    .estimate(
+                        b.centerLat,
+                        b.centerLon,
+                        OsmStructureIndex
+                            .StructureType.BUILDING,
+                        null,
+                        ohmHasDataHere
+                            ? anchors
+                            : anchorsOsmOnly(anchors));
+
+                if (HistoricalDateParser.isVisibleAt(
+                        effectiveStart,
+                        HistoricalDateParser
+                            .UNKNOWN_YEAR,
+                        currentYear,
+                        false)) {
+                    vidaAccepted.add(b);
+                    visible.add(b.toOsmStructure());
+                }
+            }
+
+            LOGGER.debug(
+                "VIDA [{},{}] accepted={}",
+                String.format("%.4f", centreLat),
+                String.format("%.4f", centreLon),
+                vidaAccepted.size());
+        }
+
+        // ── STEP 4: OVERTURE (MICROSOFT) ──────────
         if (config.overtureBuildings
                 && overtureIndex.isEnabled()) {
 
@@ -309,6 +381,22 @@ public class HistoricalStructureManager {
                     // OHM or OSM footprint
                     if (overlapsExisting(
                             b, existingFootprints))
+                        continue;
+
+                    // Microsoft is the lowest tier:
+                    // also yield to accepted VIDA.
+                    if (SourceCooperativeIndex
+                            .overlapsVida(
+                                b, vidaAccepted))
+                        continue;
+
+                    // Reject footprints on the carriageway; see the
+                    // matching guard in the VIDA tier above.
+                    if (net.buildtheearth.terraplusplus.generator.osm
+                            .FootprintAlignment.sitsOnRoad(
+                                net.buildtheearth.terraplusplus.generator.osm
+                                    .FootprintAlignment.Print.of(b),
+                                existingFootprints))
                         continue;
 
                     // All Overture buildings have
@@ -429,6 +517,20 @@ public class HistoricalStructureManager {
                     sCentreLat, sCentreLon,
                     b.polygon))
                 return true;
+            // STRICT: OSM/OHM outrank Microsoft, so ANY shared area removes
+            // the Microsoft footprint even when it is a different building.
+            if (s.isArea && s.nodes != null && s.nodes.length >= 3) {
+                OsmStructureIndex.OsmNode[] mn =
+                        new OsmStructureIndex.OsmNode[b.polygon.length];
+                for (int i = 0; i < b.polygon.length; i++)
+                    mn[i] = new OsmStructureIndex.OsmNode(
+                            b.polygon[i][0], b.polygon[i][1]);
+                if (net.buildtheearth.terraplusplus.generator.osm
+                        .FootprintAlignment.footprintsIntersect(
+                            mn, b.minLat, b.maxLat, b.minLon, b.maxLon,
+                            s.nodes, s.minLat, s.maxLat, s.minLon, s.maxLon))
+                    return true;
+            }
         }
         return false;
     }

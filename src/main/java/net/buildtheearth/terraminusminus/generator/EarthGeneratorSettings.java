@@ -6,15 +6,11 @@ import java.io.IOException;
 import java.io.InputStream;
 
 import com.fasterxml.jackson.annotation.JsonAlias;
-import com.fasterxml.jackson.annotation.JsonAnySetter;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonGetter;
-import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
-import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import com.google.common.base.Strings;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
@@ -22,16 +18,27 @@ import com.google.common.cache.LoadingCache;
 import lombok.NonNull;
 import lombok.SneakyThrows;
 import net.buildtheearth.terraminusminus.TerraConstants;
-import net.buildtheearth.terraminusminus.TerraMinusMinus;
-import net.buildtheearth.terraminusminus.config.GlobalParseRegistries;
 import net.buildtheearth.terraminusminus.projection.GeographicProjection;
-import net.buildtheearth.terraminusminus.projection.transform.FlipHorizontalProjectionTransform;
-import net.buildtheearth.terraminusminus.projection.transform.FlipVerticalProjectionTransform;
-import net.buildtheearth.terraminusminus.projection.transform.OffsetProjectionTransform;
-import net.buildtheearth.terraminusminus.projection.transform.ProjectionTransform;
-import net.buildtheearth.terraminusminus.projection.transform.ScaleProjectionTransform;
-import net.buildtheearth.terraminusminus.projection.transform.SwapAxesProjectionTransform;
 
+/**
+ * Parsed form of a TerraMinusMinus generator settings document.
+ *
+ * <h2>Terra3 scope</h2>
+ * Terra3 only ever parses the two bundled, versioned configs
+ * ({@code bte_generator_settings.json5} and {@code default_generator_settings.json5}),
+ * always via the {@link #BTE_DEFAULT_SETTINGS} / {@link #DEFAULT_SETTINGS} constants.
+ *
+ * The upstream pre-v2 ("legacy") config upgrade path and the matching
+ * {@code getLegacyGeneratorString()} downgrade path were removed during pruning:
+ * both bundled configs declare {@code "version": 2}, so the legacy branch was
+ * unreachable, and nothing in either repo ever called the downgrade method. Those
+ * paths also pulled in five projection transforms that Terra3 does not ship
+ * (flip_horizontal, offset, swap_axes, clamp, rotate).
+ *
+ * A config without a {@code version} field is now an explicit error rather than a
+ * silent legacy-upgrade attempt, because Terra3 cannot express the legacy
+ * orientations any more.
+ */
 @JsonInclude(JsonInclude.Include.NON_EMPTY)
 public class EarthGeneratorSettings {
     public static final int CONFIG_VERSION = 2;
@@ -70,21 +77,9 @@ public class EarthGeneratorSettings {
             generatorSettings = DEFAULT_SETTINGS;
         }
 
-        if (!generatorSettings.contains("version")) {
-            TerraMinusMinus.LOGGER.info("Parsing legacy config: {}", generatorSettings);
-            LegacyConfig legacy = TerraConstants.JSON_MAPPER
-                .readValue(generatorSettings, LegacyConfig.class);
-
-            GeographicProjection projection = TerraConstants.JSON_MAPPER
-                .readValue("{\"" + LegacyConfig.upgradeLegacyProjectionName(legacy.projection) + "\":{}}",
-                    GeographicProjection.class);
-            projection = LegacyConfig.orientProjectionLegacy(projection, legacy.orentation);
-            if (legacy.scaleX != 1.0d || legacy.scaleY != 1.0d) {
-                projection = new ScaleProjectionTransform(projection, legacy.scaleX, legacy.scaleY);
-            }
-            return new EarthGeneratorSettings(projection, legacy.customcubic,
-                true, true, CONFIG_VERSION);
-        }
+        checkState(generatorSettings.contains("version"),
+            "generator settings must declare \"version\": %d "
+            + "(pre-v2 legacy configs are no longer supported)", CONFIG_VERSION);
 
         return TerraConstants.JSON_MAPPER.readValue(generatorSettings,
             EarthGeneratorSettings.class);
@@ -135,106 +130,5 @@ public class EarthGeneratorSettings {
     @JsonGetter("version")
     private int version() {
         return CONFIG_VERSION;
-    }
-
-    @JsonIgnore
-    public String getLegacyGeneratorString() {
-        LegacyConfig legacy = new LegacyConfig();
-        legacy.scaleX = 1;
-        legacy.scaleY = 1;
-        GeographicProjection proj = this.projection();
-        GeographicProjection base = proj;
-        ProjectionTransform transform = null;
-
-        while (base instanceof ProjectionTransform) {
-            base = ((ProjectionTransform) base).delegate();
-        }
-
-        legacy.projection = LegacyConfig.downgradeToLegacyProjectionName(
-            GlobalParseRegistries.PROJECTIONS.inverse().get(base.getClass()));
-        if (legacy.projection == null) {
-            return null;
-        }
-
-        while (proj instanceof ProjectionTransform) {
-            ProjectionTransform trs = (ProjectionTransform) proj;
-            if (proj instanceof ScaleProjectionTransform scale) {
-                legacy.scaleX *= scale.x();
-                legacy.scaleY *= scale.y();
-            } else if (proj instanceof FlipVerticalProjectionTransform
-                    || proj instanceof SwapAxesProjectionTransform) {
-                if (transform != null) return null;
-                transform = trs;
-            } else if (proj instanceof FlipHorizontalProjectionTransform
-                    || proj instanceof OffsetProjectionTransform) {
-                return null;
-            }
-            proj = trs.delegate();
-        }
-
-        if (base.upright()) {
-            if (transform == null) legacy.orentation = LegacyConfig.Orientation.upright;
-            else if (transform instanceof FlipVerticalProjectionTransform) legacy.orentation = LegacyConfig.Orientation.none;
-            else if (transform instanceof SwapAxesProjectionTransform) return null;
-        } else {
-            if (transform == null) legacy.orentation = LegacyConfig.Orientation.none;
-            else if (transform instanceof FlipVerticalProjectionTransform) legacy.orentation = LegacyConfig.Orientation.upright;
-            else if (transform instanceof SwapAxesProjectionTransform) legacy.orentation = LegacyConfig.Orientation.swapped;
-        }
-
-        try {
-            return TerraConstants.JSON_MAPPER.writeValueAsString(legacy);
-        } catch (JsonProcessingException e) {
-            return null;
-        }
-    }
-
-    @JsonDeserialize
-    @JsonSerialize
-    private static class LegacyConfig {
-        private static GeographicProjection orientProjectionLegacy(GeographicProjection base,
-                Orientation orientation) {
-            if (base.upright()) {
-                if (orientation == Orientation.upright) return base;
-                base = new FlipVerticalProjectionTransform(base);
-            }
-            if (orientation == Orientation.swapped) return new SwapAxesProjectionTransform(base);
-            if (orientation == Orientation.upright) base = new FlipVerticalProjectionTransform(base);
-            return base;
-        }
-
-        private static String upgradeLegacyProjectionName(String name) {
-            return switch (name) {
-                case "web_mercator" -> "centered_mercator";
-                case "airocean" -> "dymaxion";
-                case "conformal" -> "conformal_dymaxion";
-                case "bteairocean" -> "bte_conformal_dymaxion";
-                default -> name;
-            };
-        }
-
-        private static String downgradeToLegacyProjectionName(String name) {
-            return switch (name) {
-                case "centered_mercator" -> "web_mercator";
-                case "dymaxion" -> "airocean";
-                case "conformal_dymaxion" -> "conformal";
-                case "bte_conformal_dymaxion" -> "bteairocean";
-                case "equirectangular", "sinusoidal", "equal_earth", "transverse_mercator" -> name;
-                default -> null;
-            };
-        }
-
-        public String projection = "equirectangular";
-        public Orientation orentation = Orientation.none;
-        public double scaleX = 100000.0d;
-        public double scaleY = 100000.0d;
-        public String customcubic = "";
-
-        @JsonAnySetter
-        private void fallback(String key, String value) {
-            TerraMinusMinus.LOGGER.warn("Ignoring unknown legacy config option: \"{}\": \"{}\"", key, value);
-        }
-
-        private enum Orientation { none, upright, swapped }
     }
 }

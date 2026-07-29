@@ -6,9 +6,6 @@ import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
-import net.buildtheearth.terraminusminus.substitutes.Biome;
-import net.buildtheearth.terraminusminus.util.BiomeDeserializeMixin;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Properties;
@@ -52,7 +49,6 @@ public class TerraConstants {
             .configure(JsonReadFeature.ALLOW_LEADING_DECIMAL_POINT_FOR_NUMBERS, true)
             .configure(JsonReadFeature.ALLOW_NON_NUMERIC_NUMBERS, true)
             .configure(JsonReadFeature.ALLOW_TRAILING_COMMA, true)
-            .addMixIn(Biome.class, BiomeDeserializeMixin.class)
             .build();
 
     /** Earth's circumference around the equator, in meters. */

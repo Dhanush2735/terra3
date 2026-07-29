@@ -166,6 +166,19 @@ public class EsaWorldCoverIndex {
     // ================================================================
 
     /** Cache of parsed COG headers — keyed by tile key e.g. "N15E078" */
+    /**
+     * Tiles the S3 bucket answered 404 for.
+     *
+     * ESA WorldCover has no coverage over open ocean, so tiles like S03W009 will
+     * never exist. Without recording that, every subsequent chunk re-issues the
+     * same request: a single session logged the identical
+     * "tile [N12E081] not found" warning several hundred times, each one a real
+     * HTTP round-trip on the WorldCover thread. Negative results are permanent
+     * for a given tile key, so caching them is safe.
+     */
+    private final java.util.Set<String> missingTiles =
+        java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+
     private final ConcurrentHashMap<String, CogHeader> headerCache =
             new ConcurrentHashMap<>(64);
     private final ConcurrentHashMap<String, CompletableFuture<CogHeader>> pendingHeaders =
@@ -446,6 +459,10 @@ public class EsaWorldCoverIndex {
     private CompletableFuture<CogHeader> triggerHeaderFetch(String tileKey,
                                                              double lat,
                                                              double lon) {
+        // Known-absent upstream: never re-request. Without this the same tile
+        // is fetched once per chunk query, forever.
+        if (missingTiles.contains(tileKey))
+            return CompletableFuture.completedFuture(null);
         return pendingHeaders.computeIfAbsent(tileKey, k ->
             CompletableFuture.supplyAsync(() -> {
                 CogHeader h = loadHeader(tileKey);
@@ -525,8 +542,10 @@ public class EsaWorldCoverIndex {
                         return h;
                     }
                 } else if (code == 404) {
-                    LOGGER.warn("WorldCover tile [{}] not found on S3 (404)",
-                            tileKey);
+                    // Record permanently; this tile does not exist upstream.
+                    if (missingTiles.add(tileKey))
+                        LOGGER.warn("WorldCover tile [{}] not found on S3 (404)"
+                                + " - suppressing further requests", tileKey);
                     return null;
                 } else {
                     LOGGER.warn("WorldCover header [{}] HTTP {}", tileKey, code);

@@ -460,6 +460,9 @@ public class OsmWaterIndex {
     private final Path diskDir;
     private final boolean diskOk;
     private volatile boolean enabled = true;
+    /** Ensures the "disabling OSM water" banner is emitted once, not per queued task. */
+    private final java.util.concurrent.atomic.AtomicBoolean disableLogged =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile int consecutiveFailures = 0;
 
     // ── CONSTRUCTOR ───────────────────────────────────────────
@@ -916,9 +919,12 @@ public class OsmWaterIndex {
             double minLat, double minLon) {
         if (consecutiveFailures
                 >= MAX_CONSECUTIVE_FAILURES) {
-            LOGGER.warn("Disabling OSM water after "
-                + "{} failures",
-                consecutiveFailures);
+            // Log once. Every already-queued task reaches this branch, so an
+            // unguarded warn emitted ~75 identical lines in a single
+            // millisecond in a real session.
+            if (disableLogged.compareAndSet(false, true))
+                LOGGER.warn("Disabling OSM water after "
+                    + "{} failures", consecutiveFailures);
             enabled = false;
             pending.remove(key);
             return storeFailed(key);
