@@ -5,6 +5,11 @@ package net.buildtheearth.terraplusplus.generator.osm;
 
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.buildtheearth.terraplusplus.generator.TerraDensityFunctions;
+import net.buildtheearth.terraplusplus.generator.historical.OhmStructureIndex;
+import net.buildtheearth.terraplusplus.generator.historical.HistoricalDateParser;
+import net.buildtheearth.terraplusplus.generator.historical.StructureDateEstimator;
+import net.buildtheearth.terraplusplus.generator.historical.TerraTimeManager;
+import net.buildtheearth.terraplusplus.generator.historical.WikiDataLookup;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -29,6 +34,7 @@ public class AsyncStructureManager {
     private static final int  MAX_RETRIES        = 10;
     private static final int  MAX_PENDING        = 500;
 
+    private final OhmStructureIndex       ohmIndex;
     private final OsmStructureIndex       osmIndex;
     private final SourceCooperativeIndex  vidaIndex = SourceCooperativeIndex.getInstance();
     private final OvertureIndex           overtureIndex;
@@ -36,11 +42,22 @@ public class AsyncStructureManager {
     private final TerraDensityFunctions   tdf;
     private final TerraWorldConfig        config;
     private final StructurePlacementQueue placementQueue;
+    private final WikiDataLookup wikiData = WikiDataLookup.getInstance();
 
     private final ExecutorService retryPool;
     private final ConcurrentHashMap<Long, RetryTask> pendingRetries =
             new ConcurrentHashMap<>();
     private final Set<Long>     completedTiles = ConcurrentHashMap.newKeySet();
+    /** Accepted hierarchy result reusable by historical refresh passes. */
+    private static final class CompletedResult {
+        final int year;
+        final List<OsmStructureIndex.OsmStructure> structures;
+        CompletedResult(int year, List<OsmStructureIndex.OsmStructure> structures) {
+            this.year = year;
+            this.structures = List.copyOf(structures);
+        }
+    }
+    private final ConcurrentHashMap<Long, CompletedResult> completedResults = new ConcurrentHashMap<>();
     private final AtomicInteger totalRetries   = new AtomicInteger(0);
     private final AtomicInteger totalSuccesses = new AtomicInteger(0);
     private final AtomicInteger dbgCount       = new AtomicInteger(0);
@@ -55,9 +72,13 @@ public class AsyncStructureManager {
         int     attempts;
         long    nextRetryMs;
         long    backoffMs;
+        boolean ohmDone;
         boolean osmDone;
+        boolean vidaDone;
         boolean overtureDone;
+        OhmStructureIndex.OhmTile          ohmResult;
         OsmStructureIndex.StructureTile   osmResult;
+        List<SourceCooperativeIndex.VidaBuilding> vidaResult;
         OvertureIndex.BuildingTile        overtureResult;
 
         RetryTask(long tileKey, double tileLat, double tileLon,
@@ -70,17 +91,21 @@ public class AsyncStructureManager {
             this.attempts      = 0;
             this.nextRetryMs   = System.currentTimeMillis() + INITIAL_BACKOFF_MS;
             this.backoffMs     = INITIAL_BACKOFF_MS;
+            this.ohmDone       = false;
             this.osmDone       = false;
+            this.vidaDone      = false;
             this.overtureDone  = false;
         }
     }
 
-    public AsyncStructureManager(OsmStructureIndex osmIndex,
+    public AsyncStructureManager(OhmStructureIndex ohmIndex,
+                                  OsmStructureIndex osmIndex,
                                   OvertureIndex overtureIndex,
                                   OsmStructureGenerator structureGen,
                                   TerraDensityFunctions tdf,
                                   TerraWorldConfig config,
                                   StructurePlacementQueue placementQueue) {
+        this.ohmIndex       = ohmIndex;
         this.osmIndex       = osmIndex;
         this.overtureIndex  = overtureIndex;
         this.structureGen   = structureGen;
@@ -108,7 +133,14 @@ public class AsyncStructureManager {
         if (pendingRetries.size() >= MAX_PENDING) evictOldest();
 
         long key = tileKey(lat, lon);
-        if (completedTiles.contains(key)) return;
+        CompletedResult completed = completedResults.get(key);
+        if (completed != null && completed.year == TerraTimeManager.getCurrentYear()) return;
+        // A time jump changes visibility. Discard only this tile's prior
+        // accepted result and let the normal hierarchy resolve it again.
+        if (completed != null) {
+            completedResults.remove(key, completed);
+            completedTiles.remove(key);
+        }
 
         pendingRetries.compute(key, (k, existing) -> {
             if (existing != null) {
@@ -153,6 +185,24 @@ public class AsyncStructureManager {
     public int getTotalRetries()   { return totalRetries.get(); }
     public int getTotalSuccesses() { return totalSuccesses.get(); }
 
+    /**
+     * Return the accepted current-year hierarchy result for one chunk bounds,
+     * or null while the source tile is pending/retryable.
+     */
+    public List<OsmStructureIndex.OsmStructure> getCompletedStructures(
+            double lat, double lon, double minLat, double maxLat,
+            double minLon, double maxLon) {
+        CompletedResult result = completedResults.get(tileKey(lat, lon));
+        if (result == null || result.year != TerraTimeManager.getCurrentYear()) return null;
+        List<OsmStructureIndex.OsmStructure> out = new ArrayList<>();
+        final double margin = 0.00025;
+        for (OsmStructureIndex.OsmStructure s : result.structures)
+            if (!(s.maxLat < minLat - margin || s.minLat > maxLat + margin
+                    || s.maxLon < minLon - margin || s.minLon > maxLon + margin))
+                out.add(s);
+        return out;
+    }
+
     // ================================================================
     // RETRY LOOP
     // ================================================================
@@ -168,15 +218,16 @@ public class AsyncStructureManager {
                 for (Map.Entry<Long, RetryTask> entry :
                         pendingRetries.entrySet()) {
                     RetryTask task = entry.getValue();
-                    if (now >= task.nextRetryMs && task.attempts < MAX_RETRIES)
+                    if (now >= task.nextRetryMs)
                         readyTasks.add(task);
                 }
                 for (RetryTask task : readyTasks) {
                     if (!running) break;
                     processRetry(task);
                 }
-                pendingRetries.entrySet().removeIf(
-                        e -> e.getValue().attempts >= MAX_RETRIES);
+                // Do not discard a tile merely because public source data was
+                // unavailable ten times. defer() backs it off to a bounded
+                // interval, preserving eventual correctness after an outage.
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -192,7 +243,24 @@ public class AsyncStructureManager {
         totalRetries.incrementAndGet();
         boolean anySuccess = false;
 
-        // Try OSM
+        // Tier 1: date-aware OHM. It must reach a terminal result before
+        // OSM is considered, otherwise an OHM outage becomes an OSM duplicate.
+        if (!task.ohmDone && config.ohmEnabled && ohmIndex != null && ohmIndex.isEnabled()) {
+            try {
+                OhmStructureIndex.OhmTile tile = ohmIndex.query(task.tileLat, task.tileLon);
+                if (tile != null && tile.valid) {
+                    task.ohmResult = tile;
+                    task.ohmDone = true;
+                }
+            } catch (Exception e) {
+                LOGGER.debug("OHM retry failed: {}", e.getMessage());
+            }
+        } else if (!config.ohmEnabled || ohmIndex == null || !ohmIndex.isEnabled()) {
+            task.ohmDone = true;
+        }
+        if (!task.ohmDone) { defer(task); return; }
+
+        // Tier 2: OSM
         if (!task.osmDone && config.hasAnyStructures()) {
             try {
                 OsmStructureIndex.StructureTile osmTile =
@@ -214,14 +282,60 @@ public class AsyncStructureManager {
             }
         }
 
-        // Try Overture (Microsoft buildings)
-        if (!task.overtureDone && overtureIndex != null
-                && overtureIndex.isEnabled() && config.overtureBuildings) {
+        // Strict hierarchy: lower tiers cannot run until the OSM state is
+        // terminal. A retryable OSM failure must never look like an OSM gap.
+        if (!task.osmDone) {
+            defer(task);
+            return;
+        }
+
+        // Google/VIDA is tier 3. It is requested only after OSM has produced
+        // terminal data (which may legitimately be empty).
+        if (config.vidaBuildings && !task.vidaDone) {
+            // VIDA is an expensive gap-fill source. In a tile already covered
+            // by dense OHM/OSM building geometry, fetching tens of thousands
+            // of ML footprints provides little value and dominates cold start.
+            if (!needsVidaGapFill(task)) {
+                task.vidaResult = List.of();
+                task.vidaDone = true;
+                LOGGER.debug("VIDA skipped [{},{}]: OHM/OSM building coverage is dense",
+                        String.format("%.4f", task.tileLat),
+                        String.format("%.4f", task.tileLon));
+            } else try {
+                List<SourceCooperativeIndex.VidaBuilding> vb =
+                        vidaIndex.getBuildingsForChunk(
+                                task.tileLat - 0.005, task.tileLat + 0.005,
+                                task.tileLon - 0.005, task.tileLon + 0.005);
+                if (vb == null) {
+                    defer(task);
+                    return;
+                }
+                task.vidaResult = vb;
+                task.vidaDone = true;
+            } catch (Exception e) {
+                LOGGER.debug("VIDA stage failed: {}", e.getMessage());
+                defer(task);
+                return;
+            }
+        } else if (!config.vidaBuildings) {
+            task.vidaDone = true;
+        }
+
+        // Microsoft/Ovt is tier 4. It starts only after the VIDA result is
+        // terminal, preventing cold-start OSM + VIDA + MSFT fan-out.
+        if (!task.vidaDone) {
+            defer(task);
+            return;
+        }
+        boolean overtureRequired = overtureIndex != null
+                && overtureIndex.isEnabled() && config.overtureBuildings;
+        if (!task.overtureDone && overtureRequired) {
             try {
                 OvertureIndex.BuildingTile overtureTile =
                         overtureIndex.query(task.tileLat, task.tileLon);
-                if (overtureTile != null && overtureTile.valid
-                        && overtureTile.buildings.length > 0) {
+                // A valid empty response is terminal data, not a failed
+                // request. Retrying it forever caused needless cold/warm work.
+                if (overtureTile != null && overtureTile.valid) {
                     task.overtureResult = overtureTile;
                     task.overtureDone   = true;
                     anySuccess          = true;
@@ -238,14 +352,39 @@ public class AsyncStructureManager {
             }
         }
 
-        if (anySuccess) {
+        if (!overtureRequired) task.overtureDone = true;
+        if (!task.overtureDone) {
+            defer(task);
+            return;
+        }
+
+        // All enabled tiers have now reached terminal source states. Completion
+        // must not depend on whether a response happened in this retry pass.
+        if (task.ohmDone && task.osmDone && task.vidaDone && task.overtureDone) {
             totalSuccesses.incrementAndGet();
             List<OsmStructureIndex.OsmStructure> combined = new ArrayList<>();
-
+            java.util.Set<Long> ohmIds = new java.util.HashSet<>();
+            List<StructureDateEstimator.AnchorPoint> dateAnchors = new ArrayList<>();
+            int year = TerraTimeManager.getCurrentYear();
+            if (task.ohmResult != null) {
+                for (OhmStructureIndex.OhmStructure s : task.ohmResult.structures) {
+                    if (!s.isVisibleAt(year)) continue;
+                    combined.add(s.base);
+                    if (s.startYear != HistoricalDateParser.UNKNOWN_YEAR)
+                        dateAnchors.add(StructureDateEstimator.AnchorPoint.fromOhm(s));
+                    if (s.base.osmId != 0) ohmIds.add(s.base.osmId);
+                }
+            }
             if (task.osmResult != null) {
-                for (OsmStructureIndex.OsmStructure s :
-                        task.osmResult.structures)
+                for (OsmStructureIndex.OsmStructure s : task.osmResult.structures) {
+                    // OHM shares OSM IDs where it represents the same feature.
+                    if (s.osmId != 0 && ohmIds.contains(s.osmId)) continue;
+                    if (s.startYear != HistoricalDateParser.UNKNOWN_YEAR)
+                        dateAnchors.add(StructureDateEstimator.AnchorPoint.fromOsm(s));
+                    if (config.timeEnabled && !HistoricalDateParser.isVisibleAt(
+                            s.startYear, s.endYear, year, true)) continue;
                     combined.add(s);
+                }
             }
 
             // ── VIDA tier: after OSM, before Microsoft ──
@@ -253,13 +392,9 @@ public class AsyncStructureManager {
             // footprints carry no OSM IDs.
             List<SourceCooperativeIndex.VidaBuilding> vidaAccepted =
                     new ArrayList<>();
-            if (config.vidaBuildings) {
-                try {
-                    List<SourceCooperativeIndex.VidaBuilding> vb =
-                            vidaIndex.getBuildingsForChunk(
-                                    task.tileLat - 0.005, task.tileLat + 0.005,
-                                    task.tileLon - 0.005, task.tileLon + 0.005);
-                    if (vb != null) {
+            if (config.vidaBuildings && task.vidaResult != null) {
+                    List<SourceCooperativeIndex.VidaBuilding> vb = task.vidaResult;
+                    {
                         // Remove this dataset's positional bias against OSM
                         // before comparing. Measured per region at runtime.
                         List<FootprintAlignment.Print> vPrints =
@@ -275,6 +410,16 @@ public class AsyncStructureManager {
                             vbShifted.add(b.shifted(vShift.dLat, vShift.dLon));
                         vb = vbShifted;
                         for (SourceCooperativeIndex.VidaBuilding b : vb) {
+                            if (config.timeEnabled) {
+                                int start = StructureDateEstimator.estimate(
+                                        b.centerLat, b.centerLon,
+                                        OsmStructureIndex.StructureType.BUILDING,
+                                        null, dateAnchors);
+                                if (!HistoricalDateParser.isVisibleAt(start,
+                                        HistoricalDateParser.UNKNOWN_YEAR,
+                                        TerraTimeManager.getCurrentYear(), false))
+                                    continue;
+                            }
                             if (SourceCooperativeIndex
                                     .overlapsExisting(b, combined))
                                 continue;
@@ -296,9 +441,6 @@ public class AsyncStructureManager {
                             combined.add(b.toOsmStructure());
                         }
                     }
-                } catch (Exception e) {
-                    LOGGER.debug("VIDA retry failed: {}", e.getMessage());
-                }
             }
 
             if (task.overtureResult != null) {
@@ -320,6 +462,24 @@ public class AsyncStructureManager {
                         task.overtureResult.buildings) {
                     OvertureIndex.OvertureBuilding ob =
                             raw.shifted(mShift.dLat, mShift.dLon);
+                    if (config.timeEnabled) {
+                        int start = StructureDateEstimator.estimate(
+                                ob.centerLat, ob.centerLon,
+                                OsmStructureIndex.StructureType.BUILDING,
+                                ob.subtype, dateAnchors);
+                        // Never block the retry workers on Wikidata. Named
+                        // landmarks are prefetched; later retries use the
+                        // cached answer when it has arrived.
+                        if (ob.name != null && !ob.name.isBlank()) {
+                            wikiData.prefetch(ob.name, ob.centerLat, ob.centerLon);
+                            WikiDataLookup.WikiResult wiki = wikiData.lookupCached(ob.name);
+                            if (wiki.found()) start = wiki.year;
+                        }
+                        if (!HistoricalDateParser.isVisibleAt(start,
+                                HistoricalDateParser.UNKNOWN_YEAR,
+                                TerraTimeManager.getCurrentYear(), false))
+                            continue;
+                    }
                     if (overlapsAnyStructure(ob, combined))
                         continue;
                     if (SourceCooperativeIndex.overlapsVida(ob, vidaAccepted))
@@ -333,24 +493,123 @@ public class AsyncStructureManager {
                 }
             }
 
+            completedResults.put(task.tileKey, new CompletedResult(
+                    TerraTimeManager.getCurrentYear(), combined));
             if (!combined.isEmpty()) {
                 List<long[]> chunks;
                 synchronized (task.waitingChunks) {
                     chunks = new ArrayList<>(task.waitingChunks);
                 }
+                int queuedChunks = 0;
+                int skippedChunks = 0;
+                int localReferences = 0;
                 for (long[] chunkCoord : chunks) {
-                    placementQueue.enqueue(
-                            (int) chunkCoord[0], (int) chunkCoord[1],
-                            combined, task.tileLat, task.tileLon);
+                    int chunkX = (int) chunkCoord[0];
+                    int chunkZ = (int) chunkCoord[1];
+                    List<OsmStructureIndex.OsmStructure> local =
+                            filterStructuresForChunk(combined, chunkX, chunkZ);
+                    if (local.isEmpty()) {
+                        skippedChunks++;
+                        continue;
+                    }
+                    localReferences += local.size();
+                    queuedChunks++;
+                    placementQueue.enqueue(chunkX, chunkZ, local,
+                            task.tileLat, task.tileLon);
                 }
+                LOGGER.info("AsyncStruct tile [{},{}]: combined={} waiting={} queued={} "
+                                + "skipped={} localRefs={}",
+                        String.format("%.4f", task.tileLat),
+                        String.format("%.4f", task.tileLon),
+                        combined.size(), chunks.size(), queuedChunks,
+                        skippedChunks, localReferences);
             }
 
             completedTiles.add(task.tileKey);
             pendingRetries.remove(task.tileKey);
         } else {
-            task.backoffMs   = Math.min(task.backoffMs * 2, MAX_BACKOFF_MS);
-            task.nextRetryMs = System.currentTimeMillis() + task.backoffMs;
+            defer(task);
         }
+    }
+
+    /**
+     * Decide whether tier-3 VIDA can add useful coverage. A 4x4 grid over the
+     * 0.01-degree async tile is marked by expanded OHM/OSM building bounds.
+     * If at least 14 cells are covered, use the authoritative mapped geometry
+     * already available and avoid an expensive VIDA cold fetch.
+     */
+    private boolean needsVidaGapFill(RetryTask task) {
+        final int grid = 4;
+        final double cell = 0.01 / grid;
+        final double margin = 0.00045; // ~50 m building service radius
+        boolean[][] covered = new boolean[grid][grid];
+        int count = 0;
+        List<OsmStructureIndex.OsmStructure> candidates = new ArrayList<>();
+        if (task.ohmResult != null) {
+            int year = TerraTimeManager.getCurrentYear();
+            for (OhmStructureIndex.OhmStructure s : task.ohmResult.structures)
+                if (s.isVisibleAt(year)) candidates.add(s.base);
+        }
+        if (task.osmResult != null)
+            for (OsmStructureIndex.OsmStructure s : task.osmResult.structures)
+                candidates.add(s);
+        for (OsmStructureIndex.OsmStructure s : candidates) {
+            if (s.type != OsmStructureIndex.StructureType.BUILDING
+                    && s.type != OsmStructureIndex.StructureType.BUILDING_PART)
+                continue;
+            int minX = Math.max(0, Math.min(grid - 1,
+                    (int) Math.floor((s.minLat - margin - task.tileLat) / cell)));
+            int maxX = Math.max(0, Math.min(grid - 1,
+                    (int) Math.floor((s.maxLat + margin - task.tileLat) / cell)));
+            int minZ = Math.max(0, Math.min(grid - 1,
+                    (int) Math.floor((s.minLon - margin - task.tileLon) / cell)));
+            int maxZ = Math.max(0, Math.min(grid - 1,
+                    (int) Math.floor((s.maxLon + margin - task.tileLon) / cell)));
+            for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++)
+                if (!covered[x][z]) { covered[x][z] = true; count++; }
+        }
+        return count < 14;
+    }
+
+    /**
+     * Restrict a source-tile result to the structures which can affect one
+     * Minecraft chunk. This prevents a dense 0.01-degree tile from handing the
+     * same thousands of structures to every subscribed chunk.
+     */
+    private List<OsmStructureIndex.OsmStructure> filterStructuresForChunk(
+            List<OsmStructureIndex.OsmStructure> all, int chunkX, int chunkZ) {
+        if (all == null || all.isEmpty() || tdf == null) return List.of();
+        int minX = chunkX << 4, minZ = chunkZ << 4;
+        double minLat = Double.POSITIVE_INFINITY, maxLat = Double.NEGATIVE_INFINITY;
+        double minLon = Double.POSITIVE_INFINITY, maxLon = Double.NEGATIVE_INFINITY;
+        int[][] corners = {{minX, minZ}, {minX + 15, minZ},
+                {minX, minZ + 15}, {minX + 15, minZ + 15}};
+        for (int[] corner : corners) {
+            double[] geo = tdf.toGeo(corner[0], corner[1]);
+            if (geo == null || !Double.isFinite(geo[0]) || !Double.isFinite(geo[1]))
+                return List.of();
+            // TerraDensityFunctions returns {longitude, latitude}.
+            minLon = Math.min(minLon, geo[0]); maxLon = Math.max(maxLon, geo[0]);
+            minLat = Math.min(minLat, geo[1]); maxLat = Math.max(maxLat, geo[1]);
+        }
+        // Include wide roads/bridges that can place just beyond the nominal
+        // geometry bounds while keeping the filter strongly chunk-local.
+        final double margin = 0.00025; // roughly 28 metres latitude-wise
+        List<OsmStructureIndex.OsmStructure> local = new ArrayList<>();
+        for (OsmStructureIndex.OsmStructure structure : all) {
+            if (structure == null) continue;
+            if (structure.maxLat < minLat - margin || structure.minLat > maxLat + margin
+                    || structure.maxLon < minLon - margin || structure.minLon > maxLon + margin)
+                continue;
+            local.add(structure);
+        }
+        return local;
+    }
+
+    /** Requeue a source tile with bounded exponential backoff. */
+    private void defer(RetryTask task) {
+        task.backoffMs = Math.min(task.backoffMs * 2, MAX_BACKOFF_MS);
+        task.nextRetryMs = System.currentTimeMillis() + task.backoffMs;
     }
 
     // ================================================================

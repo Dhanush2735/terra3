@@ -58,6 +58,12 @@ public class OsmWaterIndex {
     private static final long   TILE_WAIT_MS    = 500;
     private static final int    DL_THREADS      = 4; // increased from 2
     private static final int    MAX_CONSECUTIVE_FAILURES = 5;
+    // Source-wide pause is temporary: public Overpass outages must never
+    // permanently disable OSM water for the rest of a play session.
+    private static final long   PAUSE_ON_FAILURES_MS = 60_000L;
+    // A 4xx response generally means this particular mirror rejects our query.
+    // Quarantine only that mirror and continue with the other endpoints.
+    private static final long   ENDPOINT_4XX_PAUSE_MS = 5 * 60_000L;
     private static final double COASTLINE_BAND_M = 5.0;
 
     private static final String[] OVERPASS_ENDPOINTS = {
@@ -460,10 +466,12 @@ public class OsmWaterIndex {
     private final Path diskDir;
     private final boolean diskOk;
     private volatile boolean enabled = true;
-    /** Ensures the "disabling OSM water" banner is emitted once, not per queued task. */
-    private final java.util.concurrent.atomic.AtomicBoolean disableLogged =
+    /** Ensures the temporary-pause banner is emitted once per outage. */
+    private final java.util.concurrent.atomic.AtomicBoolean pauseLogged =
         new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final long[] endpointPauseUntil;
     private volatile int consecutiveFailures = 0;
+    private volatile long pauseUntilMs = 0;
 
     // ── CONSTRUCTOR ───────────────────────────────────────────
 
@@ -473,6 +481,7 @@ public class OsmWaterIndex {
         this.endpointLimiters =
             new OverpassRateLimiter[
                 OVERPASS_ENDPOINTS.length];
+        this.endpointPauseUntil = new long[OVERPASS_ENDPOINTS.length];
         for (int i = 0;
                 i < OVERPASS_ENDPOINTS.length; i++) {
             String epName = epName(
@@ -714,6 +723,8 @@ public class OsmWaterIndex {
         this.enabled = e;
         if (e) {
             consecutiveFailures = 0;
+            pauseUntilMs = 0;
+            pauseLogged.set(false);
             // Reset all endpoint limiters so burst
             // capacity is restored after a pause
             for (OverpassRateLimiter lim :
@@ -917,17 +928,21 @@ public class OsmWaterIndex {
      */
     private WaterTile fetchTile(long key,
             double minLat, double minLon) {
-        if (consecutiveFailures
-                >= MAX_CONSECUTIVE_FAILURES) {
-            // Log once. Every already-queued task reaches this branch, so an
-            // unguarded warn emitted ~75 identical lines in a single
-            // millisecond in a real session.
-            if (disableLogged.compareAndSet(false, true))
-                LOGGER.warn("Disabling OSM water after "
-                    + "{} failures", consecutiveFailures);
-            enabled = false;
+        long now = System.currentTimeMillis();
+        if (now < pauseUntilMs) {
+            // Temporary outage/backoff. Do not cache a failed tile: it must be
+            // eligible to retry when the pause expires.
             pending.remove(key);
-            return storeFailed(key);
+            return WaterTile.FAILED;
+        }
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            if (pauseLogged.compareAndSet(false, true))
+                LOGGER.warn("Pausing OSM water for {}s after {} failures; will retry",
+                    PAUSE_ON_FAILURES_MS / 1000, consecutiveFailures);
+            pauseUntilMs = now + PAUSE_ON_FAILURES_MS;
+            consecutiveFailures = 0;
+            pending.remove(key);
+            return WaterTile.FAILED;
         }
 
         double expand = TILE_DEG * 0.1;
@@ -942,23 +957,35 @@ public class OsmWaterIndex {
             + "way[\"waterway\"~"
             + "\"river|stream|canal\"]"
             + "(" + bbox + ");"
-            + "way[\"waterway\"]="
+            + "way[\"waterway\"="
             + "\"riverbank\"](" + bbox + ");"
-            + "way[\"natural\"]=\"water\"]"
+            + "way[\"natural\"=\"water\"]"
             + "(" + bbox + ");"
-            + "relation[\"natural\"]=\"water\"]"
+            + "relation[\"natural\"=\"water\"]"
+            + "(" + bbox + ");"
+            + "relation[\"waterway\"=\"riverbank\"]"
+            + "(" + bbox + ");"
+            + "relation[\"water\"~\"lake|reservoir|pond"
+            + "|oxbow|basin|drain|river|canal"
+            + "|ditch|moat\"](" + bbox + ");"
+            + "relation[\"landuse\"=\"reservoir\"]"
+            + "(" + bbox + ");"
+            + "relation[\"natural\"=\"wetland\"]"
+            + "(" + bbox + ");"
+            + "relation[\"wetland\"~"
+            + "\"swamp|marsh|bog|fen\"]"
             + "(" + bbox + ");"
             + "way[\"water\"~\"lake|reservoir|pond"
             + "|oxbow|basin|drain|river|canal"
             + "|ditch|moat\"](" + bbox + ");"
-            + "way[\"landuse\"]=\"reservoir\"]"
+            + "way[\"landuse\"=\"reservoir\"]"
             + "(" + bbox + ");"
-            + "way[\"natural\"]=\"wetland\"]"
+            + "way[\"natural\"=\"wetland\"]"
             + "(" + bbox + ");"
             + "way[\"wetland\"~"
             + "\"swamp|marsh|bog|fen\"]"
             + "(" + bbox + ");"
-            + "way[\"natural\"]=\"coastline\"]"
+            + "way[\"natural\"=\"coastline\"]"
             + "(" + bbox + ");"
             + ");out body geom;";
 
@@ -967,21 +994,28 @@ public class OsmWaterIndex {
         int startIdx =
             endpointIdx.get() % OVERPASS_ENDPOINTS.length;
 
+        boolean attemptedEndpoint = false;
         for (int attempt = 0;
                 attempt < OVERPASS_ENDPOINTS.length;
                 attempt++) {
             int idx = (startIdx + attempt)
                 % OVERPASS_ENDPOINTS.length;
+            if (System.currentTimeMillis() < endpointPauseUntil[idx])
+                continue;
+            attemptedEndpoint = true;
             String ep = OVERPASS_ENDPOINTS[idx];
             OverpassRateLimiter limiter =
                 endpointLimiters[idx];
 
             HttpURLConnection conn = null;
+        boolean endpointInFlight = false;
             try {
                 // Acquire token for THIS endpoint only.
                 // Other threads fetching from a different
                 // endpoint are not blocked here at all.
                 limiter.acquire();
+                limiter.acquireInFlight();
+                endpointInFlight = true;
 
                 conn = (HttpURLConnection)
                     new URL(ep).openConnection();
@@ -1007,6 +1041,8 @@ public class OsmWaterIndex {
                     WaterTile wt = parseResponse(json);
                     endpointIdx.set(idx);
                     consecutiveFailures = 0;
+                    pauseUntilMs = 0;
+                    pauseLogged.set(false);
                     memCache.put(key, wt);
                     pending.remove(key);
                     evictIfNeeded();
@@ -1025,11 +1061,17 @@ public class OsmWaterIndex {
                     // Rate limited by server —
                     // reset this endpoint's limiter
                     // to back off before retrying
-                    limiter.reset();
+                    limiter.penalize(code == 429 ? 30_000L : 10_000L);
                     continue;
                 } else {
-                    LOGGER.warn("{} returned {}",
-                        epName(ep), code);
+                    if (code >= 400 && code < 500) {
+                        endpointPauseUntil[idx] = System.currentTimeMillis()
+                                + ENDPOINT_4XX_PAUSE_MS;
+                        LOGGER.warn("{} returned {}; pausing this endpoint for {}s",
+                                epName(ep), code, ENDPOINT_4XX_PAUSE_MS / 1000);
+                    } else {
+                        LOGGER.warn("{} returned {}", epName(ep), code);
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1040,16 +1082,14 @@ public class OsmWaterIndex {
                     epName(ep), e.getMessage());
             } finally {
                 if (conn != null) conn.disconnect();
+                if (endpointInFlight) limiter.releaseInFlight();
             }
         }
 
-        consecutiveFailures++;
-        pending.remove(key);
-        return storeFailed(key);
-    }
-
-    private WaterTile storeFailed(long key) {
-        memCache.put(key, WaterTile.FAILED);
+        // Only count a round that actually contacted at least one endpoint.
+        // If all mirrors are in their own cooldown windows, retry later without
+        // escalating to a source-wide outage.
+        if (attemptedEndpoint) consecutiveFailures++;
         pending.remove(key);
         return WaterTile.FAILED;
     }

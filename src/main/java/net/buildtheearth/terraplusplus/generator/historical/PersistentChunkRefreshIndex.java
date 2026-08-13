@@ -37,7 +37,10 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -76,12 +79,20 @@ public final class PersistentChunkRefreshIndex {
     private static final int FLUSH_INTERVAL_TICKS      = 200;
     private static final int STALE_SCAN_INTERVAL_TICKS = 100;
     private static final int STALE_SCAN_MAX_PER_TICK   = 50;
+    // Existing .mca chunks can predate/circumvent the Terra index. Reconcile
+    // their presence gradually so a later time jump never treats real terrain
+    // as "never generated".
+    private static final int RECONCILE_CHUNKS_PER_TICK = 64;
+    private static final int POST_JUMP_RESCAN_MAX_QUEUE = 128;
 
     // --------------------------------------------------
     private static final Object LOCK = new Object();
 
     // --------------------------------------------------
     private static volatile boolean initialized = false;
+    // Background generation tasks may outlive the integrated server shutdown.
+    // Never let one re-create index files while the world is closing.
+    private static volatile boolean stopping = false;
     private static volatile Path worldRoot;
     private static volatile Path baseDir;
     private static volatile Path regionsDir;
@@ -99,6 +110,10 @@ public final class PersistentChunkRefreshIndex {
         ConcurrentHashMap.newKeySet();
     private static final Set<Long> loadedChunks =
         ConcurrentHashMap.newKeySet();
+    private static final ArrayDeque<Long> reconciliationQueue = new ArrayDeque<>();
+    private static volatile boolean reconciliationQueued = false;
+    private static int reconciliationFound = 0;
+    private static int reconciliationAdded = 0;
 
     // --------------------------------------------------
     private static int tickCounter = 0;
@@ -106,6 +121,24 @@ public final class PersistentChunkRefreshIndex {
     // --------------------------------------------------
     private static int debugLogCount = 0;
     private static final int DEBUG_LOG_MAX = 20;
+
+    /** Runtime lifecycle for diagnostic and duplicate-refresh control. The
+     * durable truth remains visited + chunkYear; after restart stale chunks are
+     * recomputed from those persistent values. */
+    public enum RefreshState {
+        DISCOVERED, STALE, QUEUED, REFRESHING, COMPLETE, DEFERRED
+    }
+    private static final ConcurrentHashMap<Long, RefreshState> refreshStates =
+        new ConcurrentHashMap<>();
+
+    // Runtime-only time-jump test harness. It intentionally records chunks,
+    // not guessed block types: a chunk is considered updated only after the
+    // normal transaction reaches markChunkRefreshed().
+    private static final Set<Long> auditTargets = ConcurrentHashMap.newKeySet();
+    private static volatile int auditGeneration = -1;
+    private static volatile int auditYear = Integer.MIN_VALUE;
+    private static int auditLastReportTick = 0;
+    private static final int AUDIT_REPORT_INTERVAL_TICKS = 200;
 
     private PersistentChunkRefreshIndex() {}
 
@@ -136,7 +169,7 @@ public final class PersistentChunkRefreshIndex {
 
     public static void ensureInitialized(
             ServerLevel level) {
-        if (level == null) return;
+        if (level == null || stopping) return;
         if (level.dimension() != Level.OVERWORLD)
             return;
 
@@ -169,6 +202,7 @@ public final class PersistentChunkRefreshIndex {
 
                 initialized   = true;
                 debugLogCount = 0;
+                queueRegionReconciliation();
 
                 LOGGER.info(
                     "PersistentChunkRefreshIndex "
@@ -187,7 +221,9 @@ public final class PersistentChunkRefreshIndex {
 
     public static boolean recordChunkSeen(
             ServerLevel level, int cx, int cz) {
+        if (stopping) return false;
         ensureInitialized(level);
+        if (!initialized) return false;
         loadedChunks.add(chunkKey(cx, cz));
 
         synchronized (LOCK) {
@@ -200,6 +236,7 @@ public final class PersistentChunkRefreshIndex {
 
             region.visited.set(idx);
             markDirty(region);
+            refreshStates.put(chunkKey(cx, cz), RefreshState.DISCOVERED);
 
             if (debugLogCount < DEBUG_LOG_MAX) {
                 debugLogCount++;
@@ -215,9 +252,129 @@ public final class PersistentChunkRefreshIndex {
         }
     }
 
+    /** Mark a chunk found in an on-disk MCA region without claiming it is loaded. */
+    private static void recordPersistedChunk(int cx, int cz) {
+        synchronized (LOCK) {
+            RegionData region = getRegionInternal(regionX(cx), regionZ(cz));
+            int idx = localIndex(cx, cz);
+            if (!region.visited.get(idx)) {
+                region.visited.set(idx);
+                markDirty(region);
+                reconciliationAdded++;
+            }
+        }
+    }
+
+    /** Read MCA location tables once on world load; no chunk NBT is decoded. */
+    private static void queueRegionReconciliation() {
+        if (worldRoot == null || reconciliationQueued) return;
+        reconciliationQueued = true;
+        Path regionDir = worldRoot.resolve("region");
+        if (!Files.isDirectory(regionDir)) return;
+        try (var files = Files.list(regionDir)) {
+            files.filter(path -> path.getFileName().toString().matches("r\\.-?\\d+\\.-?\\d+\\.mca"))
+                .forEach(path -> enqueueRegionLocations(path));
+            LOGGER.info("Chunk index reconciliation queued {} persisted chunks", reconciliationFound);
+        } catch (Exception e) {
+            LOGGER.debug("Chunk index reconciliation scan: {}", e.getMessage());
+        }
+    }
+
+    private static void enqueueRegionLocations(Path file) {
+        String[] parts = file.getFileName().toString().split("\\.");
+        if (parts.length != 4) return;
+        try {
+            int rx = Integer.parseInt(parts[1]);
+            int rz = Integer.parseInt(parts[2]);
+            if (Files.size(file) < 4096) return;
+            byte[] header = new byte[4096];
+            try (var input = Files.newInputStream(file)) {
+                int read = input.read(header);
+                if (read < 4096) return;
+            }
+            ByteBuffer locations = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN);
+            for (int i = 0; i < REGION_CELLS; i++) {
+                if (locations.getInt(i * 4) == 0) continue;
+                int cx = (rx << REGION_BITS) + (i & REGION_MASK);
+                int cz = (rz << REGION_BITS) + (i >> REGION_BITS);
+                reconciliationQueue.add(chunkKey(cx, cz));
+                reconciliationFound++;
+            }
+        } catch (Exception e) {
+            LOGGER.debug("Chunk index region {}: {}", file.getFileName(), e.getMessage());
+        }
+    }
+
+    private static void drainReconciliation() {
+        int processed = 0;
+        while (processed++ < RECONCILE_CHUNKS_PER_TICK) {
+            Long key = reconciliationQueue.poll();
+            if (key == null) break;
+            recordPersistedChunk((int) (key >> 32), (int) (long) key);
+        }
+        if (reconciliationQueued && reconciliationQueue.isEmpty() && reconciliationFound > 0) {
+            LOGGER.info("Chunk index reconciliation complete: persisted={} newlyIndexed={}",
+                    reconciliationFound, reconciliationAdded);
+            reconciliationFound = 0;
+            reconciliationAdded = 0;
+        }
+    }
+
+    public static void markChunkRefreshQueued(int cx, int cz) {
+        long key = chunkKey(cx, cz);
+        refreshStates.put(key, RefreshState.QUEUED);
+        if (auditGeneration == globalGeneration) auditTargets.add(key);
+    }
+
+    /** Begins a bounded runtime audit for one /terra timejump. */
+    public static void beginTimeJumpAudit(int generation, int year) {
+        auditTargets.clear();
+        auditGeneration = generation;
+        auditYear = year;
+        auditLastReportTick = tickCounter;
+        LOGGER.info("TIMEJUMP_UPDATE_AUDIT start generation={} year={}", generation, year);
+    }
+
+    public static void markChunkRefreshing(int cx, int cz) {
+        refreshStates.put(chunkKey(cx, cz), RefreshState.REFRESHING);
+    }
+
+    public static void markChunkDeferred(int cx, int cz) {
+        refreshStates.put(chunkKey(cx, cz), RefreshState.DEFERRED);
+    }
+
+    /** A failed runtime pass must never be represented as complete. The
+     * durable chunk year is intentionally unchanged, so restart/load retries
+     * it as well. */
+    public static void markChunkRefreshFailed(int cx, int cz) {
+        refreshStates.put(chunkKey(cx, cz), RefreshState.STALE);
+    }
+
+    /** A persisted neighbour operation requires the target to execute its own
+     * ownership transaction even when it was current before the boundary work. */
+    public static void invalidateChunk(ServerLevel level, int cx, int cz) {
+        if (stopping) return;
+        ensureInitialized(level);
+        if (!initialized) return;
+        synchronized (LOCK) {
+            RegionData region = getRegionInternal(regionX(cx), regionZ(cz));
+            int idx = localIndex(cx, cz);
+            region.visited.set(idx);
+            region.chunkYears[idx] = UNSET_YEAR;
+            markDirty(region);
+            refreshStates.put(chunkKey(cx, cz), RefreshState.STALE);
+        }
+    }
+
+    public static RefreshState getRefreshState(int cx, int cz) {
+        return refreshStates.get(chunkKey(cx, cz));
+    }
+
     public static boolean needsRefresh(
             ServerLevel level, int cx, int cz) {
+        if (stopping) return false;
         ensureInitialized(level);
+        if (!initialized) return false;
 
         synchronized (LOCK) {
             RegionData region = getRegionInternal(
@@ -228,44 +385,60 @@ public final class PersistentChunkRefreshIndex {
                 return false;
 
             short stored = region.chunkYears[idx];
-            if (stored == UNSET_YEAR) return true;
-
-            return stored != currentYearShort();
+            boolean stale = stored == UNSET_YEAR || stored != currentYearShort();
+            if (stale) {
+                long key = chunkKey(cx, cz);
+                // needsRefresh() is also used as a guard while a queued pass
+                // runs. Do not erase its QUEUED/REFRESHING diagnostic state.
+                refreshStates.compute(key, (ignored, previous) ->
+                    previous == RefreshState.QUEUED
+                        || previous == RefreshState.REFRESHING
+                        || previous == RefreshState.DEFERRED
+                    ? previous : RefreshState.STALE);
+            }
+            return stale;
         }
     }
 
     public static void markChunkRefreshed(
             ServerLevel level, int cx, int cz) {
+        if (stopping) return;
         ensureInitialized(level);
+        if (!initialized) return;
 
         synchronized (LOCK) {
             RegionData region = getRegionInternal(
                 regionX(cx), regionZ(cz));
             int idx = localIndex(cx, cz);
 
+            boolean wasVisited = region.visited.get(idx);
             region.visited.set(idx);
 
             short current = currentYearShort();
-            if (region.chunkYears[idx] != current) {
+            if (!wasVisited || region.chunkYears[idx] != current) {
                 region.chunkYears[idx] = current;
                 markDirty(region);
             }
+            refreshStates.put(chunkKey(cx, cz), RefreshState.COMPLETE);
         }
     }
 
     public static void markChunkYear(
             ServerLevel level, int cx, int cz,
             int year) {
+        if (stopping) return;
         ensureInitialized(level);
+        if (!initialized) return;
 
         synchronized (LOCK) {
             RegionData region = getRegionInternal(
                 regionX(cx), regionZ(cz));
             int idx = localIndex(cx, cz);
 
+            boolean wasVisited = region.visited.get(idx);
             region.visited.set(idx);
             short y = clampYearToShort(year);
-            if (region.chunkYears[idx] != y) {
+            if (!wasVisited || region.chunkYears[idx] != y) {
                 region.chunkYears[idx] = y;
                 markDirty(region);
             }
@@ -274,7 +447,9 @@ public final class PersistentChunkRefreshIndex {
 
     public static int getChunkYear(
             ServerLevel level, int cx, int cz) {
+        if (stopping) return Integer.MIN_VALUE;
         ensureInitialized(level);
+        if (!initialized) return Integer.MIN_VALUE;
 
         synchronized (LOCK) {
             RegionData region = getRegionInternal(
@@ -288,7 +463,9 @@ public final class PersistentChunkRefreshIndex {
 
     public static void advanceRefreshGeneration(
             ServerLevel level, int year) {
+        if (stopping) return;
         ensureInitialized(level);
+        if (!initialized) return;
 
         synchronized (LOCK) {
             globalGeneration++;
@@ -370,8 +547,39 @@ public final class PersistentChunkRefreshIndex {
             ServerLevel level,
             int centerX, int centerZ,
             int radius) {
-        return getVisitedChunksNearPlayers(
-            level, radius);
+        ensureInitialized(level);
+        List<ChunkPos> out = new ArrayList<>();
+        synchronized (LOCK) {
+            for (RegionData region : regionCache.values()) {
+                int rMinX = region.rx << REGION_BITS;
+                int rMinZ = region.rz << REGION_BITS;
+                int rMaxX = rMinX + REGION_SIZE - 1;
+                int rMaxZ = rMinZ + REGION_SIZE - 1;
+                if (rMaxX < centerX - radius || rMinX > centerX + radius
+                        || rMaxZ < centerZ - radius || rMinZ > centerZ + radius)
+                    continue;
+                for (int i = 0; i < REGION_CELLS; i++) {
+                    if (!region.visited.get(i)) continue;
+                    int cx = rMinX + (i & REGION_MASK);
+                    int cz = rMinZ + (i >> REGION_BITS);
+                    if (Math.abs(cx - centerX) <= radius
+                            && Math.abs(cz - centerZ) <= radius)
+                        out.add(new ChunkPos(cx, cz));
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean isNearAnyPlayer(ServerLevel level, ChunkPos pos, int radius) {
+        if (level.players().isEmpty()) return true;
+        long limit = (long) radius * radius;
+        for (var player : level.players()) {
+            long dx = (long) pos.x - player.chunkPosition().x;
+            long dz = (long) pos.z - player.chunkPosition().z;
+            if (dx * dx + dz * dz <= limit) return true;
+        }
+        return false;
     }
 
     public static int getRegionGeneration(
@@ -406,6 +614,25 @@ public final class PersistentChunkRefreshIndex {
         }
     }
 
+    private static void reportTimeJumpAudit(ServerLevel level) {
+        if (auditGeneration != globalGeneration || auditTargets.isEmpty()) return;
+        int complete = 0, queued = 0, refreshing = 0, stale = 0, deferred = 0;
+        List<String> pendingSamples = new ArrayList<>();
+        for (long key : auditTargets) {
+            RefreshState state = refreshStates.get(key);
+            if (state == RefreshState.COMPLETE) { complete++; continue; }
+            if (state == RefreshState.QUEUED) queued++;
+            else if (state == RefreshState.REFRESHING) refreshing++;
+            else if (state == RefreshState.DEFERRED) deferred++;
+            else stale++;
+            if (pendingSamples.size() < 8) pendingSamples.add("[" + (int)(key >> 32) + "," + (int)key + "]=" + state);
+        }
+        String samples = pendingSamples.isEmpty() ? "none" : String.join(" ", pendingSamples);
+        LOGGER.info("TIMEJUMP_UPDATE_AUDIT generation={} year={} tracked={} complete={} queued={} refreshing={} stale={} deferred={} pending={}",
+                auditGeneration, auditYear, auditTargets.size(), complete, queued,
+                refreshing, stale, deferred, samples);
+    }
+
     // --------------------------------------------------
     // EVENT HOOKS
     // --------------------------------------------------
@@ -416,8 +643,10 @@ public final class PersistentChunkRefreshIndex {
         if (event.getLevel()
                 instanceof ServerLevel level
                 && level.dimension()
-                == Level.OVERWORLD)
+                == Level.OVERWORLD) {
+            stopping = false;
             ensureInitialized(level);
+        }
     }
 
     @SubscribeEvent
@@ -427,8 +656,13 @@ public final class PersistentChunkRefreshIndex {
                 instanceof ServerLevel level
                 && level.dimension()
                 == Level.OVERWORLD) {
+            // Level unload can precede ServerStopping on an integrated server.
+            // Block late async callbacks from reopening the just-closed index.
+            stopping = true;
             synchronized (LOCK) {
                 flushAllInternal();
+                GeneratedBlockOwnershipIndex.flush();
+                DeferredChunkRefreshLedger.flush();
                 clearRuntimeOnly();
                 initialized = false;
             }
@@ -444,20 +678,24 @@ public final class PersistentChunkRefreshIndex {
         if (!(event.getLevel()
                 instanceof ServerLevel level))
             return;
-        if (level.dimension() != Level.OVERWORLD)
+        if (level.dimension() != Level.OVERWORLD || stopping)
             return;
 
         int cx = event.getChunk().getPos().x;
         int cz = event.getChunk().getPos().z;
 
         recordChunkSeen(level, cx, cz);
+        // Deferred boundary ownership work is intentionally disabled until
+        // feature ownership is complete; do not let stale experimental queue
+        // files fan out refreshes merely because a chunk loads.
+        boolean deferredBoundaryRefresh = false;
 
         if (!TerraTimeManager.isTimeEnabled())
             return;
 
         // Queue only — no inline block modification
         // to avoid chunk load deadlock
-        if (needsRefresh(level, cx, cz)) {
+        if (deferredBoundaryRefresh || needsRefresh(level, cx, cz)) {
             TerraChunkGenerator
                 .scheduleSingleChunkRefresh(
                     level, new ChunkPos(cx, cz));
@@ -487,12 +725,18 @@ public final class PersistentChunkRefreshIndex {
             TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END)
             return;
-        if (!initialized) return;
+        if (stopping || !initialized) return;
 
         tickCounter++;
+        drainReconciliation();
 
         ServerLevel level = getOverworld();
         if (level == null) return;
+
+        if (tickCounter - auditLastReportTick >= AUDIT_REPORT_INTERVAL_TICKS) {
+            auditLastReportTick = tickCounter;
+            reportTimeJumpAudit(level);
+        }
 
         // --------------------------------------------------
         if (tickCounter % FLUSH_INTERVAL_TICKS == 0)
@@ -501,11 +745,8 @@ public final class PersistentChunkRefreshIndex {
         // --------------------------------------------------
         // When countdown reaches zero, scan ALL
         // in-memory chunks and:
-        // 1. Call syncHistoricalWaterPublic on every
-        //    chunk found in memory regardless of
-        //    needsRefresh result. This is the fix for
-        //    semi-loaded chunks that were marked as
-        //    already refreshed before water sync ran.
+        // 1. Queue every observed chunk through the normal ownership
+        //    transaction. Water must never mutate outside that transaction.
         // 2. Queue stale chunks for vegetation and
         //    structure refresh via normal queue.
         if (TerraChunkGenerator
@@ -527,130 +768,42 @@ public final class PersistentChunkRefreshIndex {
                 int totalScanned = 0;
                 int queued       = 0;
                 int skipped      = 0;
-                boolean usedChunkMap = false;
-
-                // --------------------------------------------------
-                // Reaches semi-loaded chunks that
-                // getChunk(x,z,false) misses.
-                // Must run regardless of needsRefresh
-                // so chunks marked stale=false but
-                // still containing water get fixed.
-                if (gen != null) {
-                    try {
-                        var chunkSource =
-                            level.getChunkSource();
-                        var chunkMap =
-                            chunkSource.chunkMap;
-
-                        java.lang.reflect.Method
-                            getChunks =
-                            chunkMap.getClass()
-                            .getDeclaredMethod(
-                                "getChunks");
-                        getChunks.setAccessible(true);
-
-                        @SuppressWarnings("unchecked")
-                        Iterable<net.minecraft
-                            .server.level.ChunkHolder>
-                            holders =
-                            (Iterable<net.minecraft
-                            .server.level.ChunkHolder>)
-                            getChunks.invoke(chunkMap);
-
-                        if (holders != null) {
-                            usedChunkMap = true;
-                            for (var holder : holders) {
-                                totalScanned++;
-                                LevelChunk lc = null;
-                                try {
-                                    lc = holder
-                                        .getTickingChunk();
-                                    if (lc == null) {
-                                        var fut =
-                                            holder
-                                            .getFullChunkFuture();
-                                        if (fut != null
-                                            && fut
-                                            .isDone()){
-                                            var res =
-                                                fut.getNow(
-                                                    null);
-                                            if (res
-                                                != null){
-                                                var opt =
-                                                    res
-                                                    .left();
-                                                if (opt
-                                                    != null
-                                                    && opt
-                                                    .isPresent())
-                                                    lc =
-                                                    opt
-                                                    .get();
-                                            }
-                                        }
-                                    }
-                                    if (lc == null)
-                                        continue;
-                                    gen
-                                    .syncHistoricalWaterPublic(
-                                        level, lc);
-                                    waterSynced++;
-                                } catch (Exception e) {
-                                    waterFailed++;
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        LOGGER.warn(
-                            "POST_JUMP_RESCAN "
-                            + "chunkMap failed: {} "
-                            + "— using snapshot "
-                            + "fallback",
-                            e.getMessage());
+                int deferred     = 0;
+                // ChunkMap#getChunks has no stable official runtime name and
+                // reflection therefore failed every jump. The event-maintained
+                // snapshot is deterministic, mapping-safe, and contains every
+                // chunk observed through Forge ChunkEvent.Load.
+                final String scanMethod = "eventSnapshot";
+                // Water is applied only by the normal pass-1 transaction.
+                // This rescan must not enqueue an arbitrary snapshot first,
+                // otherwise it defeats the nearby-player ordering and cap.
+                List<ChunkPos> rescanSnapshot = getLoadedChunkSnapshot(level);
+                rescanSnapshot.sort(java.util.Comparator.comparingLong(pos -> {
+                    long best = Long.MAX_VALUE;
+                    for (var player : level.players()) {
+                        long dx = (long) pos.x - player.chunkPosition().x;
+                        long dz = (long) pos.z - player.chunkPosition().z;
+                        best = Math.min(best, dx * dx + dz * dz);
                     }
-
-                    // --------------------------------------------------
-                    // If chunkMap did not work,
-                    // fall back to snapshot.
-                    if (!usedChunkMap
-                            || totalScanned == 0) {
-                        totalScanned = 0;
-                        waterSynced  = 0;
-                        waterFailed  = 0;
-                        for (ChunkPos pos :
-                                getLoadedChunkSnapshot(
-                                    level)) {
-                            totalScanned++;
-                            try {
-                                if (!level.hasChunk(
-                                    pos.x, pos.z))
-                                    continue;
-                                LevelChunk lc =
-                                    level.getChunk(
-                                        pos.x, pos.z);
-                                if (lc == null)
-                                    continue;
-                                gen
-                                .syncHistoricalWaterPublic(
-                                    level, lc);
-                                waterSynced++;
-                            } catch (Exception e) {
-                                waterFailed++;
-                            }
-                        }
-                    }
+                    return best;
+                }));
+                for (ChunkPos pos : rescanSnapshot) {
+                    if (level.hasChunk(pos.x, pos.z)) totalScanned++;
                 }
 
                 // --------------------------------------------------
-                // Also queue chunks that still need
-                // vegetation and structure refresh.
-                for (ChunkPos pos :
-                        getLoadedChunkSnapshot(
-                            level)) {
+                // Queue newly loaded stale chunks nearest to players first.
+                for (ChunkPos pos : rescanSnapshot) {
+                    if (queued >= POST_JUMP_RESCAN_MAX_QUEUE)
+                        break;
                     if (!level.hasChunk(
                             pos.x, pos.z))
                         continue;
+                    if (!isNearAnyPlayer(level, pos, 20)) {
+                        markChunkDeferred(pos.x, pos.z);
+                        deferred++;
+                        continue;
+                    }
                     if (needsRefresh(
                             level,
                             pos.x, pos.z)) {
@@ -667,17 +820,17 @@ public final class PersistentChunkRefreshIndex {
                     "POST_JUMP_RESCAN: "
                     + "method={} "
                     + "waterScanned={} "
-                    + "waterSynced={} "
+                    + "waterRefreshQueued={} "
                     + "waterFailed={} "
-                    + "queued={} skipped={} "
+                    + "queued={} skipped={} deferred={} "
                     + "year={}",
-                    usedChunkMap
-                        ? "chunkMap" : "fallback",
+                    scanMethod,
                     totalScanned,
                     waterSynced,
                     waterFailed,
                     queued,
                     skipped,
+                    deferred,
                     TerraTimeManager
                         .getCurrentYear());
             }
@@ -695,6 +848,10 @@ public final class PersistentChunkRefreshIndex {
                     break;
                 if (!level.hasChunk(pos.x, pos.z))
                     continue;
+                if (!isNearAnyPlayer(level, pos, 20)) {
+                    markChunkDeferred(pos.x, pos.z);
+                    continue;
+                }
                 if (needsRefresh(
                         level, pos.x, pos.z)) {
                     TerraChunkGenerator
@@ -716,8 +873,11 @@ public final class PersistentChunkRefreshIndex {
     @SubscribeEvent
     public static void onServerStopping(
             ServerStoppingEvent event) {
+        stopping = true;
         synchronized (LOCK) {
             flushAllInternal();
+            GeneratedBlockOwnershipIndex.flush();
+                DeferredChunkRefreshLedger.flush();
             clearRuntimeOnly();
             initialized = false;
         }
@@ -773,7 +933,7 @@ public final class PersistentChunkRefreshIndex {
                 LOGGER.warn(
                     "Bad region file {}, rebuilding",
                     file.getFileName());
-                return new RegionData(rx, rz);
+                return rebuiltRegion(rx, rz);
             }
 
             if (version == REGION_VERSION) {
@@ -799,14 +959,21 @@ public final class PersistentChunkRefreshIndex {
                 "Unknown region version {} "
                 + "in {}, rebuilding",
                 version, file.getFileName());
-            return new RegionData(rx, rz);
+            return rebuiltRegion(rx, rz);
 
         } catch (Exception e) {
             LOGGER.warn(
                 "Failed loading region [{},{}]: {}",
                 rx, rz, e.getMessage());
-            return new RegionData(rx, rz);
+            return rebuiltRegion(rx, rz);
         }
+    }
+
+    private static RegionData rebuiltRegion(int rx, int rz) {
+        RegionData region = new RegionData(rx, rz);
+        // getRegionInternal() registers dirty rebuilt data for rewrite.
+        region.dirty = true;
+        return region;
     }
 
     private static RegionData loadLegacyRegionV1(
@@ -994,6 +1161,14 @@ public final class PersistentChunkRefreshIndex {
 
     private static void clearRuntimeOnly() {
         loadedChunks.clear();
+        refreshStates.clear();
+        auditTargets.clear();
+        auditGeneration = -1;
+        auditYear = Integer.MIN_VALUE;
+        reconciliationQueue.clear();
+        reconciliationQueued = false;
+        reconciliationFound = 0;
+        reconciliationAdded = 0;
         regionCache.clear();
         dirtyRegions.clear();
         tickCounter = 0;

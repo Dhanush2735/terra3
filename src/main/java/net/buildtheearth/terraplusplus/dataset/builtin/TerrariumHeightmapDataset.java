@@ -9,10 +9,14 @@ import java.util.concurrent.ExecutorService;
 
 public class TerrariumHeightmapDataset extends HeightmapDataset {
     
-    private final String baseUrl = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium";
+    private final String baseUrl;
 
-    public TerrariumHeightmapDataset(String ignoredUrl, int cacheSize, ExecutorService executor) {
+    public TerrariumHeightmapDataset(String baseUrl, int cacheSize, ExecutorService executor) {
         super(cacheSize, executor);
+        String configured = (baseUrl == null || baseUrl.isBlank())
+                ? "https://s3.amazonaws.com/elevation-tiles-prod/terrarium" : baseUrl;
+        this.baseUrl = configured.endsWith("/")
+                ? configured.substring(0, configured.length() - 1) : configured;
     }
 
     @Override

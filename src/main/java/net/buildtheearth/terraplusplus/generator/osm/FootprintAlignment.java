@@ -355,9 +355,31 @@ public final class FootprintAlignment {
                     && s.type != OsmStructureIndex.StructureType.BUILDING_PART)
                 continue;
             if (!s.isArea || s.nodes == null || s.nodes.length < 3) continue;
+            // A lower-tier footprint wholly inside an OSM courtyard/hole does
+            // not overlap the building shell. The old outer-ring-only test
+            // incorrectly discarded legitimate courtyard structures.
+            if (isWhollyInsideInnerRing(cand, s.innerRings)) continue;
             if (footprintsIntersect(cand, mnLat, mxLat, mnLon, mxLon,
                     s.nodes, s.minLat, s.maxLat, s.minLon, s.maxLon))
                 return true;
+        }
+        return false;
+    }
+
+    private static boolean isWhollyInsideInnerRing(
+            OsmStructureIndex.OsmNode[] candidate,
+            OsmStructureIndex.OsmNode[][] innerRings) {
+        if (candidate == null || candidate.length == 0 || innerRings == null)
+            return false;
+        for (OsmStructureIndex.OsmNode[] ring : innerRings) {
+            if (ring == null || ring.length < 3) continue;
+            boolean allInside = true;
+            for (OsmStructureIndex.OsmNode node : candidate)
+                if (!pointInRing(node.lat, node.lon, ring)) {
+                    allInside = false;
+                    break;
+                }
+            if (allInside) return true;
         }
         return false;
     }

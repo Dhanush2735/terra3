@@ -175,20 +175,14 @@ public class RiverLakeEngine {
                     return result;
                 }
 
-                // OHM tile loaded but no match —
-                // do NOT fall back to OSM for
-                // man-made features (canals,
-                // reservoirs) as they may not
-                // exist yet at currentYear.
-                // Only fall back for natural
-                // large rivers/streams.
+                // OHM tile loaded but has no matching feature. OSM may still
+                // contain a valid current-year feature (for example a mapped
+                // pond absent from OHM). Apply the same year plausibility
+                // rules used by the normal OSM fallback instead of treating
+                // OHM's absence as proof that the feature cannot exist.
                 if (ohmResult != null) {
-                    // OHM returned NONE — check if
-                    // OSM has a natural water body
-                    // (river/stream) that predates
-                    // human modification
                     WaterBodyInfo osmFallback =
-                        tryOsmNaturalOnly(
+                        tryOsmPlausibleFallback(
                             lat, lon, elevMeters,
                             currentYear);
                     if (osmFallback != null
@@ -275,11 +269,10 @@ public class RiverLakeEngine {
         return WaterBodyInfo.NONE;
     }
 
-    // ── OSM NATURAL-ONLY FALLBACK ─────────────────────────────
-    // Only returns rivers/streams — not canals,
-    // reservoirs, or ponds (those are man-made
-    // and should come from OHM with dates)
-    private WaterBodyInfo tryOsmNaturalOnly(
+    // ── OSM YEAR-PLAUSIBLE FALLBACK ──────────────────────────
+    // Used when OHM has no matching feature. OSM remains valid for any
+    // water type that is plausible in the selected year, including ponds.
+    private WaterBodyInfo tryOsmPlausibleFallback(
             double lat, double lon,
             double elevMeters,
             int currentYear) {
@@ -296,16 +289,8 @@ public class RiverLakeEngine {
                     || (!r.isWater && !r.isBank()))
                 return null;
 
-            // Only allow rivers and streams
-            // as natural fallback
-            if (r.type != WaterBodyInfo
-                        .WaterType.RIVER
-                    && r.type != WaterBodyInfo
-                        .WaterType.STREAM)
+            if (!isPlausibleAtYear(r, currentYear))
                 return null;
-
-            // Rivers existed before recorded history
-            // so no year cutoff for them
             return r;
 
         } catch (Exception e) {
@@ -314,7 +299,7 @@ public class RiverLakeEngine {
     }
 
     // ── YEAR PLAUSIBILITY (OSM FALLBACK) ─────────────────────
-    // Applied when OHM tile not loaded.
+    // Applied whenever OSM is used as a fallback.
     // Prevents obviously anachronistic water bodies.
     private static boolean isPlausibleAtYear(
             WaterBodyInfo wb, int year) {

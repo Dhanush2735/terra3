@@ -195,6 +195,22 @@ public class WikiDataLookup {
         }
     }
 
+    /** Return only already-cached data; never starts or waits for network work. */
+    public WikiResult lookupCached(String name) {
+        if (name == null || name.length() < MIN_NAME_LEN) return WikiResult.NOT_FOUND;
+        String key = normalizeKey(name);
+        WikiResult cached = memCache.get(key);
+        if (cached != null) return cached;
+        if (diskOk) {
+            WikiResult disk = loadDisk(key);
+            if (disk != null) {
+                memCache.put(key, disk);
+                return disk;
+            }
+        }
+        return WikiResult.NOT_FOUND;
+    }
+
     /**
      * Non-blocking prefetch — fires and forgets.
      * Result will be in cache when lookup() is called.

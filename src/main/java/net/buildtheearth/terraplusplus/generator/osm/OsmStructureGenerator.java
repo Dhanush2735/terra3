@@ -12,9 +12,11 @@ package net.buildtheearth.terraplusplus.generator.osm;
 
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.buildtheearth.terraplusplus.generator.TerraDensityFunctions;
+import net.buildtheearth.terraplusplus.generator.historical.GeneratedBlockOwnershipIndex;
 import net.buildtheearth.terraplusplus.generator.osm.OsmStructureIndex.BridgeStructure;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -37,6 +39,30 @@ public class OsmStructureGenerator {
     private final TerraWorldConfig config;
     private final AtomicInteger dbgCount =
         new AtomicInteger(0);
+
+    // Structure generation happens on one chunk at a time. The capture is
+    // enabled only by the historical refresh path; normal terrain generation
+    // deliberately has no ownership side effects.
+    private final ThreadLocal<List<GeneratedBlockOwnershipIndex.OwnedBlock>> ownershipCapture =
+        new ThreadLocal<>();
+
+    public void beginOwnershipCapture() {
+        ownershipCapture.set(new ArrayList<>());
+    }
+
+    public List<GeneratedBlockOwnershipIndex.OwnedBlock> endOwnershipCapture() {
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> result = ownershipCapture.get();
+        ownershipCapture.remove();
+        return result == null ? List.of() : result;
+    }
+
+    private void setOwned(ChunkAccess chunk, BlockPos pos, BlockState state, boolean moved) {
+        chunk.setBlockState(pos, state, moved);
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> captured = ownershipCapture.get();
+        if (captured != null)
+            captured.add(new GeneratedBlockOwnershipIndex.OwnedBlock(
+                pos.asLong(), Block.getId(state)));
+    }
 
     private static final int FLOOR_HEIGHT = 5;
     private static final double WALL_THICKNESS_M = 1.2;
@@ -986,14 +1012,14 @@ public boolean generateStructuresFromList(
                 if(isRoadBlock(
                         chunk.getBlockState(pos)))
                     continue;
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     edgeD<WALL_THICKNESS_M
                     ?(cornerD<CORNER_PILLAR_M
                         ?style.cornerPillar():AIR)
                     :AIR,false);}}
         if(baseY-1>=minBuild){
             pos.set(bx,baseY-1,bz);
-            chunk.setBlockState(pos,
+            setOwned(chunk, pos,
                 style.foundation(),false);}
 
         double edgeDist=edgeDistMeters(lat,lon,s);
@@ -1020,7 +1046,7 @@ public boolean generateStructuresFromList(
             if(baseY+y>maxY)break;
             pos.set(bx,baseY+y,bz);
             if(!chunk.getBlockState(pos).isAir())
-                chunk.setBlockState(pos,AIR,false);}}
+                setOwned(chunk, pos,AIR,false);}}
 
     private void placeBuildingPart(ChunkAccess chunk,
             BlockPos.MutableBlockPos pos,
@@ -1064,7 +1090,7 @@ public boolean generateStructuresFromList(
                     y<baseY;y++){
                 if(y>maxY)break;
                 pos.set(bx,y,bz);
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     style.wall(),false);}
 
         placeWallColumn(chunk,pos,bx,bz,baseY,
@@ -1091,7 +1117,7 @@ public boolean generateStructuresFromList(
             for(int y=0;y<wallHeight
                     &&baseY+y<=maxY;y++){
                 pos.set(bx,baseY+y,bz);
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     style.cornerPillar(),false);}
         }else if(isWall){
             int closestEdge=
@@ -1111,28 +1137,28 @@ public boolean generateStructuresFromList(
                 int yf=y%FLOOR_HEIGHT;
                 if(isDoorBlock&&fl==0){
                     if(yf==1){
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             style.doorLower(),false);
                         continue;}
                     if(yf==2){
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             style.doorUpper(),false);
                         continue;}}
                 if(hasWindow&&yf==2){
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         style.windowBlock(),false);
                     continue;}
                 if(hasWindow&&yf==3){
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         style.windowBlock(),false);
                     continue;}
                 if(yf==FLOOR_HEIGHT-1
                         &&config.buildingDetail>=2
                         &&fl<levels-1){
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         style.wallAccent(),false);
                     continue;}
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     style.wall(),false);}
         }else if(isInterior){
             double len=edgeLengthMeters(s,stairEdge);
@@ -1163,24 +1189,24 @@ public boolean generateStructuresFromList(
                     int fl=y/FLOOR_HEIGHT;
                     int yf=y%FLOOR_HEIGHT;
                     if(fl>=levels){
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             AIR,false);continue;}
                     if(yf==0){
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             fl==0?style.floor():AIR,
                             false);
                     }else if(yf==stepIndex
                             &&fl<levels-1){
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             style.stepBlock(),false);
                     }else{
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             AIR,false);}}
             }else{
                 for(int y=0;y<wallHeight
                         &&baseY+y<=maxY;y++){
                     pos.set(bx,baseY+y,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         (y%FLOOR_HEIGHT==0)
                         ?style.floor():AIR,false);}
                 if(config.buildingDetail>=2
@@ -1195,7 +1221,7 @@ public boolean generateStructuresFromList(
                             pos.set(bx,lightY,bz);
                             if(chunk.getBlockState(pos)
                                     .isAir())
-                                chunk.setBlockState(pos,
+                                setOwned(chunk, pos,
                                     style.interiorLight(),
                                     false);}}}}}
 
@@ -1235,15 +1261,15 @@ public boolean generateStructuresFromList(
             default->{
                 if(roofBaseY<=maxY){
                     pos.set(bx,roofBaseY,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         style.roof(),false);}}}}
 
-    private void placeRoofPyramidal(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double ed=edgeDistMeters(lat,lon,s);double mi=Math.max(1,maxInsetMeters(s));int rise=(int)Math.round(Math.min(1.0,ed/mi)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
-    private void placeRoofGabled(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0;double ls=(s.maxLat-s.minLat)*111320.0;double ls2=(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl));double hw,pd;if(ls>=ls2){hw=ls2/2.0;pd=Math.abs(lon-(s.minLon+s.maxLon)/2.0)*111320.0*Math.cos(Math.toRadians(lat));}else{hw=ls/2.0;pd=Math.abs(lat-(s.minLat+s.maxLat)/2.0)*111320.0;}hw=Math.max(1,hw);int rise=(int)Math.round((1.0-Math.min(1.0,pd/hw))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
-    private void placeRoofHipped(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double hlt=Math.max(1,(s.maxLat-s.minLat)*111320.0/2.0);double hln=Math.max(1,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl))/2.0);double flt=Math.min(1,Math.abs(lat-cl)*111320.0/hlt);double fln=Math.min(1,Math.abs(lon-cln)*111320.0*Math.cos(Math.toRadians(lat))/hln);int rise=(int)Math.round((1.0-Math.min(flt,fln))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
-    private void placeRoofDome(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double R=Math.max(1,Math.min((s.maxLat-s.minLat)*111320.0,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl)))/2.0);double dL=(lat-cl)*111320.0,dN=(lon-cln)*111320.0*Math.cos(Math.toRadians(lat));double r=Math.sqrt(dL*dL+dN*dN);if(r>R)return;int rise=(int)Math.round(Math.sqrt(Math.max(0,1.0-(r*r)/(R*R)))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
-    private void placeRoofOnion(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double R=Math.max(1,Math.min((s.maxLat-s.minLat)*111320.0,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl)))/2.0);double dL=(lat-cl)*111320.0,dN=(lon-cln)*111320.0*Math.cos(Math.toRadians(lat));double r=Math.sqrt(dL*dL+dN*dN);if(r>R)return;int rise=(int)Math.round(Math.sin((r/R)*Math.PI)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
-    private void placeRoofMansard(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double ed=edgeDistMeters(lat,lon,s);double mi=Math.max(1,maxInsetMeters(s));double fr=ed/mi;int rise=fr>=0.4?rh:(int)Math.round((fr/0.4)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);c.setBlockState(p,st.roof(),false);}}
+    private void placeRoofPyramidal(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double ed=edgeDistMeters(lat,lon,s);double mi=Math.max(1,maxInsetMeters(s));int rise=(int)Math.round(Math.min(1.0,ed/mi)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
+    private void placeRoofGabled(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0;double ls=(s.maxLat-s.minLat)*111320.0;double ls2=(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl));double hw,pd;if(ls>=ls2){hw=ls2/2.0;pd=Math.abs(lon-(s.minLon+s.maxLon)/2.0)*111320.0*Math.cos(Math.toRadians(lat));}else{hw=ls/2.0;pd=Math.abs(lat-(s.minLat+s.maxLat)/2.0)*111320.0;}hw=Math.max(1,hw);int rise=(int)Math.round((1.0-Math.min(1.0,pd/hw))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
+    private void placeRoofHipped(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double hlt=Math.max(1,(s.maxLat-s.minLat)*111320.0/2.0);double hln=Math.max(1,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl))/2.0);double flt=Math.min(1,Math.abs(lat-cl)*111320.0/hlt);double fln=Math.min(1,Math.abs(lon-cln)*111320.0*Math.cos(Math.toRadians(lat))/hln);int rise=(int)Math.round((1.0-Math.min(flt,fln))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
+    private void placeRoofDome(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double R=Math.max(1,Math.min((s.maxLat-s.minLat)*111320.0,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl)))/2.0);double dL=(lat-cl)*111320.0,dN=(lon-cln)*111320.0*Math.cos(Math.toRadians(lat));double r=Math.sqrt(dL*dL+dN*dN);if(r>R)return;int rise=(int)Math.round(Math.sqrt(Math.max(0,1.0-(r*r)/(R*R)))*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
+    private void placeRoofOnion(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double cl=(s.minLat+s.maxLat)/2.0,cln=(s.minLon+s.maxLon)/2.0;double R=Math.max(1,Math.min((s.maxLat-s.minLat)*111320.0,(s.maxLon-s.minLon)*111320.0*Math.cos(Math.toRadians(cl)))/2.0);double dL=(lat-cl)*111320.0,dN=(lon-cln)*111320.0*Math.cos(Math.toRadians(lat));double r=Math.sqrt(dL*dL+dN*dN);if(r>R)return;int rise=(int)Math.round(Math.sin((r/R)*Math.PI)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
+    private void placeRoofMansard(ChunkAccess c,BlockPos.MutableBlockPos p,int bx,int bz,int rb,int rh,int my,OsmStructureIndex.OsmStructure s,double lat,double lon,BuildingStyle st){double ed=edgeDistMeters(lat,lon,s);double mi=Math.max(1,maxInsetMeters(s));double fr=ed/mi;int rise=fr>=0.4?rh:(int)Math.round((fr/0.4)*rh);int ry=rb+rise;if(ry<=my){p.set(bx,ry,bz);setOwned(c, p,st.roof(),false);}}
 
     // ================================================================
     // BRIDGE DISPATCHER
@@ -1288,9 +1314,9 @@ public boolean generateStructuresFromList(
                 BlockState existing=
                     chunk.getBlockState(pos);
                 if(isBuildingBlock(existing))
-                    chunk.setBlockState(pos,AIR,false);
+                    setOwned(chunk, pos,AIR,false);
                 else if(isRoadBlock(existing))
-                    chunk.setBlockState(pos,AIR,false);}
+                    setOwned(chunk, pos,AIR,false);}
 
         int towerH=dynamicTowerHeight(totalLen);
         int pillarSpacing=
@@ -1323,37 +1349,37 @@ public boolean generateStructuresFromList(
     // BRIDGE COMMON HELPERS
     // ================================================================
 
-    private void placeDeckSurface(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,OsmStructureIndex.OsmStructure s,double dist,double hw){if(deckY>maxY)return;pos.set(bx,deckY,bz);if(s.isRailBridge){chunk.setBlockState(pos,ROAD_GRAVEL,false);if(dist<0.8&&deckY+1<=maxY){pos.set(bx,deckY+1,bz);chunk.setBlockState(pos,RAIL,false);}}else{chunk.setBlockState(pos,roadSurf(s.subType,s.surface),false);if(config.buildingDetail>=2&&isMain(s.subType)){if(dist<0.3){pos.set(bx,deckY,bz);chunk.setBlockState(pos,ROAD_MARKING_YELLOW,false);}else if(Math.abs(dist-hw)<0.4){pos.set(bx,deckY,bz);chunk.setBlockState(pos,ROAD_MARKING_WHITE,false);}}}}
-    private void clearAboveDeck(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,boolean isRail,int clearHeight){int from=isRail?deckY+2:deckY+1;for(int h=from;h<=deckY+clearHeight;h++){if(h>maxY)break;pos.set(bx,h,bz);if(!chunk.getBlockState(pos).isAir())chunk.setBlockState(pos,AIR,false);}}
-    private void fillRampSolid(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int deckRise,int maxRise){if(deckRise>0&&deckRise<maxRise)for(int y=sy;y<deckBase;y++){pos.set(bx,y,bz);BlockState e=chunk.getBlockState(pos);if(e.isAir())chunk.setBlockState(pos,y<=0?Blocks.DEEPSLATE.defaultBlockState():Blocks.STONE.defaultBlockState(),false);}}
-    private void placeStandardRailing(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,int maxY,int deckRise,BlockState railingBlock,BlockState deckBlock){if(deckRise>=2){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,deckBlock,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,deckBlock,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);chunk.setBlockState(pos,railingBlock,false);}}else{pos.set(bx,sy,bz);chunk.setBlockState(pos,SIDEWALK,false);clearSafe(chunk,pos,bx,bz,sy,1);}}
+    private void placeDeckSurface(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,OsmStructureIndex.OsmStructure s,double dist,double hw){if(deckY>maxY)return;pos.set(bx,deckY,bz);if(s.isRailBridge){setOwned(chunk, pos,ROAD_GRAVEL,false);if(dist<0.8&&deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,RAIL,false);}}else{setOwned(chunk, pos,roadSurf(s.subType,s.surface),false);if(config.buildingDetail>=2&&isMain(s.subType)){if(dist<0.3){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_YELLOW,false);}else if(Math.abs(dist-hw)<0.4){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_WHITE,false);}}}}
+    private void clearAboveDeck(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,boolean isRail,int clearHeight){int from=isRail?deckY+2:deckY+1;for(int h=from;h<=deckY+clearHeight;h++){if(h>maxY)break;pos.set(bx,h,bz);if(!chunk.getBlockState(pos).isAir())setOwned(chunk, pos,AIR,false);}}
+    private void fillRampSolid(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int deckRise,int maxRise){if(deckRise>0&&deckRise<maxRise)for(int y=sy;y<deckBase;y++){pos.set(bx,y,bz);BlockState e=chunk.getBlockState(pos);if(e.isAir())setOwned(chunk, pos,y<=0?Blocks.DEEPSLATE.defaultBlockState():Blocks.STONE.defaultBlockState(),false);}}
+    private void placeStandardRailing(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,int maxY,int deckRise,BlockState railingBlock,BlockState deckBlock){if(deckRise>=2){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,deckBlock,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,deckBlock,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,railingBlock,false);}}else{pos.set(bx,sy,bz);setOwned(chunk, pos,SIDEWALK,false);clearSafe(chunk,pos,bx,bz,sy,1);}}
     private boolean isPillarBlocked(double lat,double lon,OsmStructureIndex.OsmStructure s,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways){for(OsmStructureIndex.OsmStructure road:roads){if(road.osmId==s.osmId)continue;if(road.distanceToLine(lat,lon)<=roadHW(road.subType,road.lanes)*config.roadWidthScale)return true;}for(OsmStructureIndex.OsmStructure rail:railways){if(rail.osmId==s.osmId)continue;if(rail.distanceToLine(lat,lon)<=2.5)return true;}return false;}
-    private void placeThickPillar(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int maxY,BlockState pillarBlock,boolean isMajor){for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,pillarBlock,false);}if(isMajor){int cx2=chunk.getPos().getMinBlockX(),cz2=chunk.getPos().getMinBlockZ();for(int dx=-1;dx<=0;dx++)for(int dz=-1;dz<=0;dz++){if(dx==0&&dz==0)continue;int nx=bx+dx,nz=bz+dz;int lx=nx-cx2,lz=nz-cz2;if(lx<0||lx>=16||lz<0||lz>=16)continue;for(int y=sy;y<=deckBase;y++){pos.set(nx,y,nz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,pillarBlock,false);}}}}
+    private void placeThickPillar(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int maxY,BlockState pillarBlock,boolean isMajor){for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,pillarBlock,false);}if(isMajor){int cx2=chunk.getPos().getMinBlockX(),cz2=chunk.getPos().getMinBlockZ();for(int dx=-1;dx<=0;dx++)for(int dz=-1;dz<=0;dz++){if(dx==0&&dz==0)continue;int nx=bx+dx,nz=bz+dz;int lx=nx-cx2,lz=nz-cz2;if(lx<0||lx>=16||lz<0||lz>=16)continue;for(int y=sy;y<=deckBase;y++){pos.set(nx,y,nz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,pillarBlock,false);}}}}
     private void placeStandardPillars(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int maxY,double dist,double totalLen,int deckRise,int maxRise,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing,BlockState pillarBlock){if(deckRise!=maxRise||totalLen<=10.0||dist>0.8)return;double along=distAlongLine(lat,lon,s,true);if((along%pillarSpacing)>=1.5)return;if(isPillarBlocked(lat,lon,s,roads,railways))return;int pilH=deckBase-sy;if(pilH<dynamicMinPillarHeight(deckBase,sy))return;boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,pillarBlock,isMajor);}
 
     // ================================================================
     // ALL BRIDGE TYPES
     // ================================================================
 
-    private void placeBridgeBeam(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}if(Math.abs(dist-hw)<0.6&&deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,BRIDGE_PILLAR);}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
-    private void placeBridgeArch(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,double archSpan,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double posInSpan=along%archSpan;double t=posInSpan/archSpan;double archFrac=4.0*t*(1.0-t);int maxArchDepth=Math.min(deckBase-sy,8);int archRise=(int)Math.round(archFrac*maxArchDepth);if(dist<hw*0.7)for(int ay=0;ay<archRise;ay++){int archY=deckBase-1-ay;if(archY<sy||archY>maxY)continue;pos.set(bx,archY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_ARCH,false);}if(posInSpan<1.5&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways)){int pilH=deckBase-sy;if(pilH>=dynamicMinPillarHeight(deckBase,sy)){boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,BRIDGE_PILLAR,isMajor);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
-    private void placeBridgeTruss(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,7);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&Math.abs(dist-hw)<1.0){int trussH=5;double along=distAlongLine(lat,lon,s,true);int ab=(int)along;for(int ty=1;ty<=trussH;ty++){int trY=deckY+ty;if(trY>maxY)break;pos.set(bx,trY,bz);if(ab%2==0){chunk.setBlockState(pos,BRIDGE_TRUSS,false);continue;}if(ty==((ab/2)%trussH)+1)chunk.setBlockState(pos,BRIDGE_TRUSS,false);}int topY=deckY+trussH;if(topY<=maxY){pos.set(bx,topY,bz);chunk.setBlockState(pos,BRIDGE_TRUSS,false);}}placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,BRIDGE_PILLAR);}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_TRUSS,BRIDGE_DECK);}}
-    private void placeBridgeSuspension(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,towerH+2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);double q1=totalLen*0.25,q3=totalLen*0.75;if((Math.abs(along-q1)<5.0||Math.abs(along-q3)<5.0)&&dist<hw*0.6){for(int ty=0;ty<=towerH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);chunk.setBlockState(pos,BRIDGE_TOWER,false);}if(deckY+towerH<=maxY){pos.set(bx,deckY+towerH,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}}if(Math.abs(dist-hw)<1.0){double nt=Math.abs(along-q1)<Math.abs(along-q3)?q1:q3;double hs=Math.max(1,totalLen*0.25);double t=Math.min(1.0,Math.abs(along-nt)/hs);double sf=Math.cosh(2.0*t-1.0)/Math.cosh(1.0);int sag=(int)Math.round((1.0-sf)*(towerH-2));int cableY=Math.max(deckY+1,deckY+towerH-sag);if(cableY<=maxY){pos.set(bx,cableY,bz);chunk.setBlockState(pos,BRIDGE_CABLE,false);}for(int hy=deckY+1;hy<cableY;hy++){if(hy>maxY)break;pos.set(bx,hy,bz);if(chunk.getBlockState(pos).isAir())chunk.setBlockState(pos,BRIDGE_CABLE,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_CABLE,BRIDGE_DECK);}}
-    private void placeBridgeCableStayed(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,towerH+2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);double[]pp=totalLen>180?new double[]{totalLen*0.33,totalLen*0.67}:new double[]{totalLen*0.5};for(double pylonPos:pp)if(Math.abs(along-pylonPos)<5.0&&dist<hw*0.5){for(int ty=0;ty<=towerH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);chunk.setBlockState(pos,BRIDGE_TOWER,false);}if(deckY+towerH<=maxY){pos.set(bx,deckY+towerH,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}}if(Math.abs(dist-hw)<1.0){double np=pp[0];for(double p:pp)if(Math.abs(along-p)<Math.abs(along-np))np=p;double mcr=totalLen/(pp.length+1);double t=Math.min(1.0,Math.abs(along-np)/Math.max(1,mcr));int cableY=Math.max(deckY+1,Math.min(deckY+towerH,deckY+(int)Math.round((1.0-t)*(towerH-1))+1));if(cableY<=maxY){pos.set(bx,cableY,bz);chunk.setBlockState(pos,BRIDGE_CABLE,false);}if(((int)along)%2==0)for(int hy=deckY+1;hy<cableY;hy++){if(hy>maxY)break;pos.set(bx,hy,bz);if(chunk.getBlockState(pos).isAir())chunk.setBlockState(pos,BRIDGE_CABLE,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_CABLE,BRIDGE_DECK);}}
-    private void placeBridgeViaduct(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){double spanLen=Math.max(6,pillarSpacing/2.0);if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double pis=along%spanLen;if(pis<1.5&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways))for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_STONE,false);}if(pis>1.0&&pis<spanLen-1.0&&dist<0.8){double t=Math.sin(((pis-1.0)/(spanLen-2.0))*Math.PI);int ar=(int)Math.round(t*Math.min(4,deckBase-sy));for(int ay=0;ay<ar;ay++){int aY=deckBase-1-ay;if(aY<sy||aY>maxY)continue;pos.set(bx,aY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_ARCH,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,STONE_WALL,BRIDGE_STONE);}}
-    private void placeBridgePedestrian(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double phw=Math.max(hw,1.5);if(dist>phw+0.6)return;if(dist<=phw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,false,3);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&dist<0.5){double along=distAlongLine(lat,lon,s,true);if((int)along%4<1){int pilH=deckBase-sy;if(pilH>=1)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,OAK_LOG,false);}}}}else{if(deckRise>=2){if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);chunk.setBlockState(pos,OAK_FENCE,false);}}}}
-    private void placeBridgeRope(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double rhw=Math.max(hw,1.0);if(dist>rhw+0.6)return;int sagOff=0;if(deckRise==maxRise&&totalLen>0){double along=distAlongLine(lat,lon,s,true);sagOff=-(int)Math.round(Math.sin((along/totalLen)*Math.PI)*2.0);}int sdY=Math.max(sy,deckY+sagOff);if(dist<=rhw){if(sdY<=maxY){pos.set(bx,sdY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,sdY,maxY,false,3);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);if(along<3.0||along>totalLen-3.0)for(int ty=1;ty<=3;ty++){int tY=sdY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);chunk.setBlockState(pos,OAK_LOG,false);}}}else{if(sdY<=maxY){pos.set(bx,sdY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(sdY+1<=maxY){pos.set(bx,sdY+1,bz);chunk.setBlockState(pos,BRIDGE_ROPE,false);}}}
-    private void placeBridgeAqueduct(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,int pillarSpacing){double spanLen=Math.max(6,pillarSpacing/2.0);if(dist>hw+1.0)return;if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);if(dist<hw*0.6)chunk.setBlockState(pos,BRIDGE_WATER,false);else if(Math.abs(dist-hw)<0.5)chunk.setBlockState(pos,BRIDGE_STONE,false);}clearAboveDeck(chunk,pos,bx,bz,deckY+1,maxY,false,2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double pis=along%spanLen;if(pis<1.5&&dist<0.8)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_STONE,false);}if(pis>1.0&&pis<spanLen-1.0){double t=Math.sin(((pis-1.0)/(spanLen-2.0))*Math.PI);int ar=(int)Math.round(t*Math.min(4,deckBase-sy));for(int ay=0;ay<ar;ay++){int aY=deckBase-1-ay;if(aY<sy||aY>maxY)continue;pos.set(bx,aY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_STONE,false);}}}}else{if(deckRise>=2){if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);chunk.setBlockState(pos,STONE_WALL,false);}}}}
-    private void placeBridgeMovable(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}double along=distAlongLine(lat,lon,s,true);boolean isCentre=along>totalLen*0.35&&along<totalLen*0.65;if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,isCentre?YELLOW_CONCRETE:roadSurf(s.subType,s.surface),false);}int mH=Math.min(towerH,10);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,mH);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){boolean nT1=Math.abs(along-totalLen*0.33)<5.0,nT2=Math.abs(along-totalLen*0.67)<5.0;if((nT1||nT2)&&dist<hw*0.5){for(int ty=0;ty<=mH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}for(int arm=mH-1;arm<=mH;arm++){int aY=deckY+arm;if(aY>maxY)break;pos.set(bx,aY,bz);chunk.setBlockState(pos,BRIDGE_TRUSS,false);}}if(isCentre&&dist<hw*0.3)for(int ty=1;ty<=3;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);chunk.setBlockState(pos,GRAY_CONCRETE,false);}if(isCentre&&Math.abs(dist-hw)<0.5&&deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,((int)along)%2==0?BLACK_CONCRETE:YELLOW_CONCRETE,false);}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
-    private void placeBridgeBoardwalk(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double bwHw=Math.max(hw,1.5);if(dist>bwHw+0.3)return;int bwDY=sy+1;if(bwDY>maxY)return;if(dist<=bwHw){pos.set(bx,bwDY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);clearAboveDeck(chunk,pos,bx,bz,bwDY,maxY,false,3);double along=distAlongLine(lat,lon,s,true);if((int)along%3==0&&dist<0.6){pos.set(bx,sy,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,OAK_FENCE,false);}}}
-    private void placeBridgeCantilever(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,6);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double p1=totalLen*0.25,p2=totalLen*0.75;double np=Math.abs(along-p1)<Math.abs(along-p2)?p1:p2;double dtp=Math.abs(along-np);double hs=totalLen*0.25;double taper=1.0-Math.min(1.0,dtp/hs);int sd=(int)Math.round(taper*Math.min(6,deckBase-sy));if(dtp<2.0&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways)){boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,BRIDGE_PILLAR,isMajor);}if(dist<hw*0.8&&sd>0)for(int dy=0;dy<sd;dy++){int uY=deckBase-1-dy;if(uY<sy||uY>maxY)continue;pos.set(bx,uY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_TRUSS,false);}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
-    private void placeBridgeCovered(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist>hw+1.0)return;if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,OAK_LOG);if(deckRise==maxRise){boolean isEdge=Math.abs(dist-hw)<1.0;double along=distAlongLine(lat,lon,s,true);int ab=(int)along;if(isEdge){for(int wy=1;wy<=3;wy++){int wY=deckY+wy;if(wY>maxY)break;pos.set(bx,wY,bz);if(wy==2&&ab%4>=1&&ab%4<=2)chunk.setBlockState(pos,AIR,false);else chunk.setBlockState(pos,BRIDGE_WOOD,false);}}else{for(int wy=1;wy<=4;wy++){int aY=deckY+wy;if(aY>maxY)break;pos.set(bx,aY,bz);chunk.setBlockState(pos,AIR,false);}}int roofRise=(int)Math.round((1.0-dist/hw)*2);int roofY=deckY+4+roofRise;if(roofY<=maxY){pos.set(bx,roofY,bz);chunk.setBlockState(pos,DARK_OAK_PLANKS,false);}}}}
-    private void placeBridgeLowWaterCrossing(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,double dist,double hw,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double lwcHw=Math.max(hw,2.0);if(dist>lwcHw)return;if(sy<=maxY){pos.set(bx,sy,bz);chunk.setBlockState(pos,SMOOTH_STONE,false);}for(int cy=1;cy<=2;cy++){if(sy+cy>maxY)break;pos.set(bx,sy+cy,bz);BlockState e=chunk.getBlockState(pos);if(!e.isAir()&&!isWaterBlock(e))chunk.setBlockState(pos,AIR,false);}}
-    private void placeBridgeTrestle(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,4);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);int bs2=Math.max(4,pillarSpacing/3);double pis=along%bs2;if(pis<1.5){int bH=deckBase-sy;for(int by=0;by<bH;by++){int bY=sy+by;if(bY>maxY)break;double wah=(1.0-(double)by/bH)*hw;if(dist<wah||by==bH-1){pos.set(bx,bY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,OAK_FENCE,false);}}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,OAK_FENCE,BRIDGE_WOOD);}}
-    private void placeBridgeFloating(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,double dist,double hw,double totalLen,double dfn,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double fhw=Math.max(hw,2.0);if(dist>fhw+0.5)return;if(dist<=fhw){if(sy<=maxY){pos.set(bx,sy,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(Math.abs(dist-fhw)<1.0&&sy-1>=chunk.getMinBuildHeight()){pos.set(bx,sy-1,bz);if(isWaterBlock(chunk.getBlockState(pos)))chunk.setBlockState(pos,BRIDGE_PONTOON,false);}clearAboveDeck(chunk,pos,bx,bz,sy,maxY,false,3);}else{if(sy<=maxY){pos.set(bx,sy,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(sy+1<=maxY){pos.set(bx,sy+1,bz);chunk.setBlockState(pos,BRIDGE_ROPE,false);}}}
-    private void placeBridgeSimpleSuspension(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,int towerH){double rhw=Math.max(hw,1.5);if(dist>rhw+0.6)return;int sagOff=0;if(totalLen>0){double along=distAlongLine(lat,lon,s,true);sagOff=-(int)Math.round(Math.sin((along/totalLen)*Math.PI)*Math.min(4,towerH/4));}int sdY=Math.max(sy,deckY+sagOff);if(dist<=rhw){if(sdY<=maxY){pos.set(bx,sdY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,sdY,maxY,false,4);double along=distAlongLine(lat,lon,s,true);if(along<4.0||along>totalLen-4.0){int pH=Math.min(6,towerH/3);for(int ty=1;ty<=pH;ty++){int tY=sdY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);if(dist<0.6)chunk.setBlockState(pos,OAK_LOG,false);}}if(Math.abs(dist-rhw)<0.6){int rY=sdY+2;if(rY<=maxY){pos.set(bx,rY,bz);chunk.setBlockState(pos,BRIDGE_ROPE,false);}}}else{if(sdY<=maxY){pos.set(bx,sdY,bz);chunk.setBlockState(pos,BRIDGE_WOOD,false);}if(sdY+1<=maxY){pos.set(bx,sdY+1,bz);chunk.setBlockState(pos,BRIDGE_ROPE,false);}}}
-    private void placeBridgeHumpback(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist>hw+1.5)return;double along=distAlongLine(lat,lon,s,true);double af=Math.sin((along/Math.max(1,totalLen))*Math.PI);int ar=(int)Math.round(af*Math.min(6,maxRise+2));int hdY=sy+ar;if(hdY>maxY)return;if(dist<=hw){pos.set(bx,hdY,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);for(int fy=sy;fy<hdY;fy++){if(fy>maxY)break;pos.set(bx,fy,bz);BlockState e=chunk.getBlockState(pos);if(isWaterOrAir(e)){double ff=1.0-af;if(fy<sy+(int)(ff*(hdY-sy))+1)chunk.setBlockState(pos,BRIDGE_ARCH,false);}}clearAboveDeck(chunk,pos,bx,bz,hdY,maxY,s.isRailBridge,3);}else{if(hdY<=maxY){pos.set(bx,hdY,bz);chunk.setBlockState(pos,BRIDGE_STONE,false);}if(hdY+1<=maxY){pos.set(bx,hdY+1,bz);chunk.setBlockState(pos,STONE_WALL,false);}}}
-    private void placeBridgeClapper(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double chw=Math.max(hw,2.0);if(dist>chw+0.3)return;if(dist<=chw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);chunk.setBlockState(pos,SMOOTH_STONE,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);chunk.setBlockState(pos,SMOOTH_STONE,false);}clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,false,3);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);if((int)along%4<2)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))chunk.setBlockState(pos,COBBLESTONE,false);}}}}
+    private void placeBridgeBeam(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}if(Math.abs(dist-hw)<0.6&&deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,BRIDGE_PILLAR);}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
+    private void placeBridgeArch(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,double archSpan,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double posInSpan=along%archSpan;double t=posInSpan/archSpan;double archFrac=4.0*t*(1.0-t);int maxArchDepth=Math.min(deckBase-sy,8);int archRise=(int)Math.round(archFrac*maxArchDepth);if(dist<hw*0.7)for(int ay=0;ay<archRise;ay++){int archY=deckBase-1-ay;if(archY<sy||archY>maxY)continue;pos.set(bx,archY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_ARCH,false);}if(posInSpan<1.5&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways)){int pilH=deckBase-sy;if(pilH>=dynamicMinPillarHeight(deckBase,sy)){boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,BRIDGE_PILLAR,isMajor);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
+    private void placeBridgeTruss(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,7);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&Math.abs(dist-hw)<1.0){int trussH=5;double along=distAlongLine(lat,lon,s,true);int ab=(int)along;for(int ty=1;ty<=trussH;ty++){int trY=deckY+ty;if(trY>maxY)break;pos.set(bx,trY,bz);if(ab%2==0){setOwned(chunk, pos,BRIDGE_TRUSS,false);continue;}if(ty==((ab/2)%trussH)+1)setOwned(chunk, pos,BRIDGE_TRUSS,false);}int topY=deckY+trussH;if(topY<=maxY){pos.set(bx,topY,bz);setOwned(chunk, pos,BRIDGE_TRUSS,false);}}placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,BRIDGE_PILLAR);}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_TRUSS,BRIDGE_DECK);}}
+    private void placeBridgeSuspension(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,towerH+2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);double q1=totalLen*0.25,q3=totalLen*0.75;if((Math.abs(along-q1)<5.0||Math.abs(along-q3)<5.0)&&dist<hw*0.6){for(int ty=0;ty<=towerH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);setOwned(chunk, pos,BRIDGE_TOWER,false);}if(deckY+towerH<=maxY){pos.set(bx,deckY+towerH,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}}if(Math.abs(dist-hw)<1.0){double nt=Math.abs(along-q1)<Math.abs(along-q3)?q1:q3;double hs=Math.max(1,totalLen*0.25);double t=Math.min(1.0,Math.abs(along-nt)/hs);double sf=Math.cosh(2.0*t-1.0)/Math.cosh(1.0);int sag=(int)Math.round((1.0-sf)*(towerH-2));int cableY=Math.max(deckY+1,deckY+towerH-sag);if(cableY<=maxY){pos.set(bx,cableY,bz);setOwned(chunk, pos,BRIDGE_CABLE,false);}for(int hy=deckY+1;hy<cableY;hy++){if(hy>maxY)break;pos.set(bx,hy,bz);if(chunk.getBlockState(pos).isAir())setOwned(chunk, pos,BRIDGE_CABLE,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_CABLE,BRIDGE_DECK);}}
+    private void placeBridgeCableStayed(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,towerH+2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);double[]pp=totalLen>180?new double[]{totalLen*0.33,totalLen*0.67}:new double[]{totalLen*0.5};for(double pylonPos:pp)if(Math.abs(along-pylonPos)<5.0&&dist<hw*0.5){for(int ty=0;ty<=towerH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);setOwned(chunk, pos,BRIDGE_TOWER,false);}if(deckY+towerH<=maxY){pos.set(bx,deckY+towerH,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}}if(Math.abs(dist-hw)<1.0){double np=pp[0];for(double p:pp)if(Math.abs(along-p)<Math.abs(along-np))np=p;double mcr=totalLen/(pp.length+1);double t=Math.min(1.0,Math.abs(along-np)/Math.max(1,mcr));int cableY=Math.max(deckY+1,Math.min(deckY+towerH,deckY+(int)Math.round((1.0-t)*(towerH-1))+1));if(cableY<=maxY){pos.set(bx,cableY,bz);setOwned(chunk, pos,BRIDGE_CABLE,false);}if(((int)along)%2==0)for(int hy=deckY+1;hy<cableY;hy++){if(hy>maxY)break;pos.set(bx,hy,bz);if(chunk.getBlockState(pos).isAir())setOwned(chunk, pos,BRIDGE_CABLE,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_CABLE,BRIDGE_DECK);}}
+    private void placeBridgeViaduct(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){double spanLen=Math.max(6,pillarSpacing/2.0);if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,5);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double pis=along%spanLen;if(pis<1.5&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways))for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_STONE,false);}if(pis>1.0&&pis<spanLen-1.0&&dist<0.8){double t=Math.sin(((pis-1.0)/(spanLen-2.0))*Math.PI);int ar=(int)Math.round(t*Math.min(4,deckBase-sy));for(int ay=0;ay<ar;ay++){int aY=deckBase-1-ay;if(aY<sy||aY>maxY)continue;pos.set(bx,aY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_ARCH,false);}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,STONE_WALL,BRIDGE_STONE);}}
+    private void placeBridgePedestrian(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double phw=Math.max(hw,1.5);if(dist>phw+0.6)return;if(dist<=phw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,false,3);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&dist<0.5){double along=distAlongLine(lat,lon,s,true);if((int)along%4<1){int pilH=deckBase-sy;if(pilH>=1)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,OAK_LOG,false);}}}}else{if(deckRise>=2){if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,OAK_FENCE,false);}}}}
+    private void placeBridgeRope(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double rhw=Math.max(hw,1.0);if(dist>rhw+0.6)return;int sagOff=0;if(deckRise==maxRise&&totalLen>0){double along=distAlongLine(lat,lon,s,true);sagOff=-(int)Math.round(Math.sin((along/totalLen)*Math.PI)*2.0);}int sdY=Math.max(sy,deckY+sagOff);if(dist<=rhw){if(sdY<=maxY){pos.set(bx,sdY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,sdY,maxY,false,3);if(deckRise==maxRise){double along=distAlongLine(lat,lon,s,true);if(along<3.0||along>totalLen-3.0)for(int ty=1;ty<=3;ty++){int tY=sdY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);setOwned(chunk, pos,OAK_LOG,false);}}}else{if(sdY<=maxY){pos.set(bx,sdY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(sdY+1<=maxY){pos.set(bx,sdY+1,bz);setOwned(chunk, pos,BRIDGE_ROPE,false);}}}
+    private void placeBridgeAqueduct(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,int pillarSpacing){double spanLen=Math.max(6,pillarSpacing/2.0);if(dist>hw+1.0)return;if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);if(dist<hw*0.6)setOwned(chunk, pos,BRIDGE_WATER,false);else if(Math.abs(dist-hw)<0.5)setOwned(chunk, pos,BRIDGE_STONE,false);}clearAboveDeck(chunk,pos,bx,bz,deckY+1,maxY,false,2);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double pis=along%spanLen;if(pis<1.5&&dist<0.8)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_STONE,false);}if(pis>1.0&&pis<spanLen-1.0){double t=Math.sin(((pis-1.0)/(spanLen-2.0))*Math.PI);int ar=(int)Math.round(t*Math.min(4,deckBase-sy));for(int ay=0;ay<ar;ay++){int aY=deckBase-1-ay;if(aY<sy||aY>maxY)continue;pos.set(bx,aY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_STONE,false);}}}}else{if(deckRise>=2){if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,STONE_WALL,false);}}}}
+    private void placeBridgeMovable(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int towerH){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}double along=distAlongLine(lat,lon,s,true);boolean isCentre=along>totalLen*0.35&&along<totalLen*0.65;if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,isCentre?YELLOW_CONCRETE:roadSurf(s.subType,s.surface),false);}int mH=Math.min(towerH,10);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,mH);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise){boolean nT1=Math.abs(along-totalLen*0.33)<5.0,nT2=Math.abs(along-totalLen*0.67)<5.0;if((nT1||nT2)&&dist<hw*0.5){for(int ty=0;ty<=mH;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}for(int arm=mH-1;arm<=mH;arm++){int aY=deckY+arm;if(aY>maxY)break;pos.set(bx,aY,bz);setOwned(chunk, pos,BRIDGE_TRUSS,false);}}if(isCentre&&dist<hw*0.3)for(int ty=1;ty<=3;ty++){int tY=deckY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);setOwned(chunk, pos,GRAY_CONCRETE,false);}if(isCentre&&Math.abs(dist-hw)<0.5&&deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,((int)along)%2==0?BLACK_CONCRETE:YELLOW_CONCRETE,false);}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
+    private void placeBridgeBoardwalk(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double bwHw=Math.max(hw,1.5);if(dist>bwHw+0.3)return;int bwDY=sy+1;if(bwDY>maxY)return;if(dist<=bwHw){pos.set(bx,bwDY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);clearAboveDeck(chunk,pos,bx,bz,bwDY,maxY,false,3);double along=distAlongLine(lat,lon,s,true);if((int)along%3==0&&dist<0.6){pos.set(bx,sy,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,OAK_FENCE,false);}}}
+    private void placeBridgeCantilever(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_DECK,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,6);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);double p1=totalLen*0.25,p2=totalLen*0.75;double np=Math.abs(along-p1)<Math.abs(along-p2)?p1:p2;double dtp=Math.abs(along-np);double hs=totalLen*0.25;double taper=1.0-Math.min(1.0,dtp/hs);int sd=(int)Math.round(taper*Math.min(6,deckBase-sy));if(dtp<2.0&&dist<0.8&&!isPillarBlocked(lat,lon,s,roads,railways)){boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,BRIDGE_PILLAR,isMajor);}if(dist<hw*0.8&&sd>0)for(int dy=0;dy<sd;dy++){int uY=deckBase-1-dy;if(uY<sy||uY>maxY)continue;pos.set(bx,uY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_TRUSS,false);}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,BRIDGE_RAILING,BRIDGE_DECK);}}
+    private void placeBridgeCovered(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist>hw+1.0)return;if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);placeStandardPillars(chunk,pos,bx,bz,sy,deckBase,maxY,dist,totalLen,deckRise,maxRise,s,lat,lon,roads,railways,pillarSpacing,OAK_LOG);if(deckRise==maxRise){boolean isEdge=Math.abs(dist-hw)<1.0;double along=distAlongLine(lat,lon,s,true);int ab=(int)along;if(isEdge){for(int wy=1;wy<=3;wy++){int wY=deckY+wy;if(wY>maxY)break;pos.set(bx,wY,bz);if(wy==2&&ab%4>=1&&ab%4<=2)setOwned(chunk, pos,AIR,false);else setOwned(chunk, pos,BRIDGE_WOOD,false);}}else{for(int wy=1;wy<=4;wy++){int aY=deckY+wy;if(aY>maxY)break;pos.set(bx,aY,bz);setOwned(chunk, pos,AIR,false);}}int roofRise=(int)Math.round((1.0-dist/hw)*2);int roofY=deckY+4+roofRise;if(roofY<=maxY){pos.set(bx,roofY,bz);setOwned(chunk, pos,DARK_OAK_PLANKS,false);}}}}
+    private void placeBridgeLowWaterCrossing(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,double dist,double hw,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double lwcHw=Math.max(hw,2.0);if(dist>lwcHw)return;if(sy<=maxY){pos.set(bx,sy,bz);setOwned(chunk, pos,SMOOTH_STONE,false);}for(int cy=1;cy<=2;cy++){if(sy+cy>maxY)break;pos.set(bx,sy+cy,bz);BlockState e=chunk.getBlockState(pos);if(!e.isAir()&&!isWaterBlock(e))setOwned(chunk, pos,AIR,false);}}
+    private void placeBridgeTrestle(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist<=hw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}placeDeckSurface(chunk,pos,bx,bz,deckY,maxY,s,dist,hw);clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,s.isRailBridge,4);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);int bs2=Math.max(4,pillarSpacing/3);double pis=along%bs2;if(pis<1.5){int bH=deckBase-sy;for(int by=0;by<bH;by++){int bY=sy+by;if(bY>maxY)break;double wah=(1.0-(double)by/bH)*hw;if(dist<wah||by==bH-1){pos.set(bx,bY,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,OAK_FENCE,false);}}}}}else if(dist<=hw+1.5){placeStandardRailing(chunk,pos,bx,bz,sy,deckY,deckBase,maxY,deckRise,OAK_FENCE,BRIDGE_WOOD);}}
+    private void placeBridgeFloating(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,double dist,double hw,double totalLen,double dfn,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double fhw=Math.max(hw,2.0);if(dist>fhw+0.5)return;if(dist<=fhw){if(sy<=maxY){pos.set(bx,sy,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(Math.abs(dist-fhw)<1.0&&sy-1>=chunk.getMinBuildHeight()){pos.set(bx,sy-1,bz);if(isWaterBlock(chunk.getBlockState(pos)))setOwned(chunk, pos,BRIDGE_PONTOON,false);}clearAboveDeck(chunk,pos,bx,bz,sy,maxY,false,3);}else{if(sy<=maxY){pos.set(bx,sy,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(sy+1<=maxY){pos.set(bx,sy+1,bz);setOwned(chunk, pos,BRIDGE_ROPE,false);}}}
+    private void placeBridgeSimpleSuspension(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,int towerH){double rhw=Math.max(hw,1.5);if(dist>rhw+0.6)return;int sagOff=0;if(totalLen>0){double along=distAlongLine(lat,lon,s,true);sagOff=-(int)Math.round(Math.sin((along/totalLen)*Math.PI)*Math.min(4,towerH/4));}int sdY=Math.max(sy,deckY+sagOff);if(dist<=rhw){if(sdY<=maxY){pos.set(bx,sdY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}clearAboveDeck(chunk,pos,bx,bz,sdY,maxY,false,4);double along=distAlongLine(lat,lon,s,true);if(along<4.0||along>totalLen-4.0){int pH=Math.min(6,towerH/3);for(int ty=1;ty<=pH;ty++){int tY=sdY+ty;if(tY>maxY)break;pos.set(bx,tY,bz);if(dist<0.6)setOwned(chunk, pos,OAK_LOG,false);}}if(Math.abs(dist-rhw)<0.6){int rY=sdY+2;if(rY<=maxY){pos.set(bx,rY,bz);setOwned(chunk, pos,BRIDGE_ROPE,false);}}}else{if(sdY<=maxY){pos.set(bx,sdY,bz);setOwned(chunk, pos,BRIDGE_WOOD,false);}if(sdY+1<=maxY){pos.set(bx,sdY+1,bz);setOwned(chunk, pos,BRIDGE_ROPE,false);}}}
+    private void placeBridgeHumpback(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing){if(dist>hw+1.5)return;double along=distAlongLine(lat,lon,s,true);double af=Math.sin((along/Math.max(1,totalLen))*Math.PI);int ar=(int)Math.round(af*Math.min(6,maxRise+2));int hdY=sy+ar;if(hdY>maxY)return;if(dist<=hw){pos.set(bx,hdY,bz);setOwned(chunk, pos,BRIDGE_STONE,false);for(int fy=sy;fy<hdY;fy++){if(fy>maxY)break;pos.set(bx,fy,bz);BlockState e=chunk.getBlockState(pos);if(isWaterOrAir(e)){double ff=1.0-af;if(fy<sy+(int)(ff*(hdY-sy))+1)setOwned(chunk, pos,BRIDGE_ARCH,false);}}clearAboveDeck(chunk,pos,bx,bz,hdY,maxY,s.isRailBridge,3);}else{if(hdY<=maxY){pos.set(bx,hdY,bz);setOwned(chunk, pos,BRIDGE_STONE,false);}if(hdY+1<=maxY){pos.set(bx,hdY+1,bz);setOwned(chunk, pos,STONE_WALL,false);}}}
+    private void placeBridgeClapper(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,double dist,double hw,double totalLen,double dfn,int maxRise,int deckRise,int maxY,OsmStructureIndex.OsmStructure s,double lat,double lon){double chw=Math.max(hw,2.0);if(dist>chw+0.3)return;if(dist<=chw){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,SMOOTH_STONE,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,SMOOTH_STONE,false);}clearAboveDeck(chunk,pos,bx,bz,deckY,maxY,false,3);fillRampSolid(chunk,pos,bx,bz,sy,deckBase,deckRise,maxRise);if(deckRise==maxRise&&deckBase>sy){double along=distAlongLine(lat,lon,s,true);if((int)along%4<2)for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,COBBLESTONE,false);}}}}
 
     // ================================================================
     // BRIDGE INFLUENCE
@@ -1536,7 +1562,7 @@ public boolean generateStructuresFromList(
         if(nearestDist>hw+1.5)return;
         if(nearestDist<=hw){
             pos.set(bx,sy,bz);
-            chunk.setBlockState(pos,
+            setOwned(chunk, pos,
                 roadSurf(nearest.subType,
                     nearest.surface),false);
             clearSafe(chunk,pos,bx,bz,sy,1);
@@ -1544,16 +1570,16 @@ public boolean generateStructuresFromList(
                     &&isMain(nearest.subType)){
                 if(nearestDist<0.3){
                     pos.set(bx,sy,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         ROAD_MARKING_YELLOW,false);}
                 else if(Math.abs(nearestDist-hw)<0.4){
                     pos.set(bx,sy,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         ROAD_MARKING_WHITE,false);}}}
         else if(hasSW(nearest.subType)
                 &&!underBridge){
             pos.set(bx,sy,bz);
-            chunk.setBlockState(pos,SIDEWALK,false);
+            setOwned(chunk, pos,SIDEWALK,false);
             clearSafe(chunk,pos,bx,bz,sy,1);}}
 
     private void placeRailway(ChunkAccess chunk,
@@ -1577,10 +1603,10 @@ public boolean generateStructuresFromList(
                 case OWN_WAY,RAMP->{return;}
                 default->{}}}
         pos.set(bx,sy,bz);
-        chunk.setBlockState(pos,ROAD_GRAVEL,false);
+        setOwned(chunk, pos,ROAD_GRAVEL,false);
         if(dist<0.8){
             pos.set(bx,sy+1,bz);
-            chunk.setBlockState(pos,RAIL,false);}
+            setOwned(chunk, pos,RAIL,false);}
         else clearSafe(chunk,pos,bx,bz,sy,1);}
 
     private void placeTunnel(ChunkAccess chunk,
@@ -1599,30 +1625,30 @@ public boolean generateStructuresFromList(
             for(int y=tBotY;y<=tTopY;y++){
                 if(y<minBuild||y>maxY)continue;
                 pos.set(bx,y,bz);
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     TUNNEL_WALL,false);}
         }else{
             if(tTopY>=minBuild&&tTopY<=maxY){
                 pos.set(bx,tTopY,bz);
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     TUNNEL_CEILING,false);}
             if(tBotY>=minBuild&&tBotY<=maxY){
                 pos.set(bx,tBotY,bz);
-                chunk.setBlockState(pos,
+                setOwned(chunk, pos,
                     TUNNEL_FLOOR,false);}
             for(int y=tBotY+1;y<tTopY;y++){
                 if(y<minBuild||y>maxY)continue;
                 pos.set(bx,y,bz);
-                chunk.setBlockState(pos,AIR,false);}
+                setOwned(chunk, pos,AIR,false);}
             if(dist<0.8){
                 int rY=tBotY+1;
                 if(rY>=minBuild&&rY<=maxY){
                     pos.set(bx,rY,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         ROAD_GRAVEL,false);rY++;}
                 if(rY<=maxY){
                     pos.set(bx,rY,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         RAIL,false);}}
             int bh=TerraDensityFunctions
                 .blockHash(bx,bz);
@@ -1631,14 +1657,14 @@ public boolean generateStructuresFromList(
                 if(lY>=minBuild&&lY<=maxY){
                     pos.set(bx,lY,bz);
                     if(chunk.getBlockState(pos).isAir())
-                        chunk.setBlockState(pos,
+                        setOwned(chunk, pos,
                             TUNNEL_LIGHT,false);}}
             if(bh%6==0&&dist>0.8
                     &&dist<TUNNEL_HALF_WIDTH-0.5)
                 for(int y=tBotY+1;y<tTopY;y++){
                     if(y<minBuild||y>maxY)continue;
                     pos.set(bx,y,bz);
-                    chunk.setBlockState(pos,
+                    setOwned(chunk, pos,
                         TUNNEL_SUPPORT,false);}}}
 
     // ================================================================
@@ -2040,7 +2066,7 @@ public boolean generateStructuresFromList(
                 default->ROAD_DIRT;};
         else sf=ROAD_DIRT;
         pos.set(bx,sy,bz);
-        chunk.setBlockState(pos,sf,false);
+        setOwned(chunk, pos,sf,false);
         clearSafe(chunk,pos,bx,bz,sy,1);}
 
     private void placeLinearBarrier(ChunkAccess chunk,
@@ -2053,7 +2079,7 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(chunk,pos,bx,bz,sy))return;
         for(int y=1;y<=h;y++){
             pos.set(bx,sy+y,bz);
-            chunk.setBlockState(pos,blk,false);}}
+            setOwned(chunk, pos,blk,false);}}
 
     // ================================================================
     // LAND USE + TREE CORRIDOR PROTECTION
@@ -2227,14 +2253,14 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int h=TerraDensityFunctions.blockHash(bx,bz);
         p.set(bx,sy,bz);
-        c.setBlockState(p,GRASS_BLOCK,false);
+        setOwned(c, p,GRASS_BLOCK,false);
         int pk=h%40;
         if(pk<3){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,pickF(h),false);}
+            setOwned(c, p,pickF(h),false);}
         else if(pk<8){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,SHORT_GRASS,false);}
+            setOwned(c, p,SHORT_GRASS,false);}
         else if(pk==8)
             placeTree(c,p,bx,bz,sy,h,lat,lon,
                 roads,bridges);}
@@ -2245,10 +2271,10 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int h=TerraDensityFunctions.blockHash(bx,bz);
         p.set(bx,sy,bz);
-        c.setBlockState(p,FARMLAND_BLOCK,false);
+        setOwned(c, p,FARMLAND_BLOCK,false);
         if(h%4!=0){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,WHEAT_BLOCK,false);}}
+            setOwned(c, p,WHEAT_BLOCK,false);}}
 
     private void placeForest(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -2260,12 +2286,12 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int h=TerraDensityFunctions.blockHash(bx,bz);
         p.set(bx,sy,bz);
-        c.setBlockState(p,GRASS_BLOCK,false);
+        setOwned(c, p,GRASS_BLOCK,false);
         if(h%7==0)placeTree(c,p,bx,bz,sy,h,lat,lon,
             roads,bridges);
         else if(h%4==0){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,SHORT_GRASS,false);}}
+            setOwned(c, p,SHORT_GRASS,false);}}
 
     private void placeMeadow(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -2273,13 +2299,13 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int h=TerraDensityFunctions.blockHash(bx,bz);
         p.set(bx,sy,bz);
-        c.setBlockState(p,GRASS_BLOCK,false);
+        setOwned(c, p,GRASS_BLOCK,false);
         if(h%5==0){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,SHORT_GRASS,false);}
+            setOwned(c, p,SHORT_GRASS,false);}
         else if(h%12==0){
             p.set(bx,sy+1,bz);
-            c.setBlockState(p,pickF(h),false);}}
+            setOwned(c, p,pickF(h),false);}}
 
     private void placeParking(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -2287,11 +2313,11 @@ public boolean generateStructuresFromList(
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int h=TerraDensityFunctions.blockHash(bx,bz);
         p.set(bx,sy,bz);
-        c.setBlockState(p,PARKING_BLOCK,false);
+        setOwned(c, p,PARKING_BLOCK,false);
         clearSafe(c,p,bx,bz,sy,1);
         if(h%8==0){
             p.set(bx,sy,bz);
-            c.setBlockState(p,
+            setOwned(c, p,
                 ROAD_MARKING_WHITE,false);}}
 
     private void placeStreetLamp(ChunkAccess c,
@@ -2308,10 +2334,10 @@ public boolean generateStructuresFromList(
         int my=c.getMaxBuildHeight()-2;
         for(int y=1;y<=4&&sy+y<=my;y++){
             p.set(bx,sy+y,bz);
-            c.setBlockState(p,IRON_BARS,false);}
+            setOwned(c, p,IRON_BARS,false);}
         if(sy+5<=my){
             p.set(bx,sy+5,bz);
-            c.setBlockState(p,SEA_LANTERN,false);}}
+            setOwned(c, p,SEA_LANTERN,false);}}
 
     // ================================================================
     // HEIGHT / LEVEL
@@ -2679,7 +2705,7 @@ public boolean generateStructuresFromList(
             p.set(bx,sy+i,bz);
             BlockState e=c.getBlockState(p);
             if(!e.isAir()&&!isBuildingBlock(e))
-                c.setBlockState(p,AIR,false);}}
+                setOwned(c, p,AIR,false);}}
 
     private BlockState pickF(int h){
         return switch(h%5){
@@ -2706,7 +2732,7 @@ public boolean generateStructuresFromList(
             default->SPRUCE_LEAVES;};
         for(int y=1;y<=th&&sy+y<=my;y++){
             p.set(bx,sy+y,bz);
-            c.setBlockState(p,OAK_LOG,false);}
+            setOwned(c, p,OAK_LOG,false);}
         int cb=sy+th-1,ct=sy+th+2;
         for(int cy=cb;cy<=ct&&cy<=my;cy++){
             int r=(cy==ct)?1:2;
@@ -2725,5 +2751,5 @@ public boolean generateStructuresFromList(
                         continue;
                     p.set(tx,cy,tz);
                     if(c.getBlockState(p).isAir())
-                        c.setBlockState(p,lf,false);}}}
+                        setOwned(c, p,lf,false);}}}
 }                

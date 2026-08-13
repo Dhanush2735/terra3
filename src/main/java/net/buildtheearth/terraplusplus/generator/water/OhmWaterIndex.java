@@ -574,6 +574,18 @@ public class OhmWaterIndex {
             + "(" + bbox + ");"
             + "relation[\"natural\"=\"water\"]"
             + "(" + bbox + ");"
+            + "relation[\"waterway\"=\"riverbank\"]"
+            + "(" + bbox + ");"
+            + "relation[\"water\"~\"lake|reservoir|pond"
+            + "|oxbow|basin|drain|river|canal"
+            + "|ditch|moat\"](" + bbox + ");"
+            + "relation[\"landuse\"=\"reservoir\"]"
+            + "(" + bbox + ");"
+            + "relation[\"natural\"=\"wetland\"]"
+            + "(" + bbox + ");"
+            + "relation[\"wetland\"~"
+            + "\"swamp|marsh|bog|fen\"]"
+            + "(" + bbox + ");"
             + "way[\"water\"~\"lake|reservoir|pond"
             + "|oxbow|basin|drain|river|canal"
             + "|ditch|moat\"](" + bbox + ");"
@@ -591,12 +603,15 @@ public class OhmWaterIndex {
         totalQueries.incrementAndGet();
 
         HttpURLConnection conn = null;
+        boolean endpointInFlight = false;
         try {
             // Acquire token — blocks only if we have
             // sent too many requests recently.
             // Does NOT block other threads fetching
             // OSM tiles in parallel.
             limiter.acquire();
+                limiter.acquireInFlight();
+                endpointInFlight = true;
 
             conn = (HttpURLConnection)
                 new URL(OHM_OVERPASS).openConnection();
@@ -641,7 +656,7 @@ public class OhmWaterIndex {
                     || code == 504) {
                 // Server-side rate limit —
                 // back off by resetting limiter
-                limiter.reset();
+                limiter.penalize(code == 429 ? 30_000L : 10_000L);
                 LOGGER.debug(
                     "OHM water rate limited ({})",
                     code);
@@ -659,6 +674,7 @@ public class OhmWaterIndex {
                 e.getMessage());
         } finally {
             if (conn != null) conn.disconnect();
+            if (endpointInFlight) limiter.releaseInFlight();
         }
 
         consecutiveFailures++;

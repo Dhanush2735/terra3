@@ -96,6 +96,29 @@ public class HistoricalStructureManager {
         }
     }
 
+    /** Four-by-four local building coverage gate for expensive ML sources. */
+    private static boolean hasBuildingGap(
+            List<OsmStructureIndex.OsmStructure> structures,
+            double minLat, double maxLat, double minLon, double maxLon) {
+        final int grid = 4;
+        final double margin = 0.00045;
+        boolean[][] covered = new boolean[grid][grid];
+        int count = 0;
+        double dLat = Math.max(1e-9, (maxLat - minLat) / grid);
+        double dLon = Math.max(1e-9, (maxLon - minLon) / grid);
+        for (OsmStructureIndex.OsmStructure st : structures) {
+            if (st.type != OsmStructureIndex.StructureType.BUILDING
+                    && st.type != OsmStructureIndex.StructureType.BUILDING_PART) continue;
+            int x0 = Math.max(0, Math.min(grid - 1, (int) Math.floor((st.minLat - margin - minLat) / dLat)));
+            int x1 = Math.max(0, Math.min(grid - 1, (int) Math.floor((st.maxLat + margin - minLat) / dLat)));
+            int z0 = Math.max(0, Math.min(grid - 1, (int) Math.floor((st.minLon - margin - minLon) / dLon)));
+            int z1 = Math.max(0, Math.min(grid - 1, (int) Math.floor((st.maxLon + margin - minLon) / dLon)));
+            for (int x = x0; x <= x1; x++) for (int z = z0; z <= z1; z++)
+                if (!covered[x][z]) { covered[x][z] = true; count++; }
+        }
+        return count < 14;
+    }
+
     // ── MAIN METHOD ───────────────────────────────────────────
 
     public MergedStructures getStructuresForChunk(
@@ -285,6 +308,13 @@ public class HistoricalStructureManager {
                 visible.size());
         }
 
+        // Lower ML tiers carry no historical dates. Apply an inexpensive,
+        // conservative year/coverage gate before triggering their potentially
+        // large source downloads. This is only a "definitely too early" skip.
+        boolean lowerTierYearEligible = currentYear >=
+                StructureDateEstimator.getPopulationFloor(centreLat, centreLon);
+        boolean lowerTierGap = hasBuildingGap(visible, minLat, maxLat, minLon, maxLon);
+
         // ── STEP 3: VIDA (Google/MS/OSM open buildings) ──
         // Sits below OSM, above Microsoft. Gap-fill only.
         // Carries no dates, so it uses the same
@@ -292,7 +322,7 @@ public class HistoricalStructureManager {
         // WikiData (VIDA footprints are unnamed).
         List<SourceCooperativeIndex.VidaBuilding>
             vidaAccepted = new ArrayList<>();
-        if (config.vidaBuildings) {
+        if (config.vidaBuildings && lowerTierYearEligible && lowerTierGap) {
 
             List<SourceCooperativeIndex.VidaBuilding>
                 vidaAll = vidaIndex
@@ -353,9 +383,17 @@ public class HistoricalStructureManager {
                 vidaAccepted.size());
         }
 
+        if (config.vidaBuildings && (!lowerTierYearEligible || !lowerTierGap)) {
+            LOGGER.debug("VIDA skipped [{},{}]: yearEligible={} gap={}",
+                    String.format("%.4f", centreLat), String.format("%.4f", centreLon),
+                    lowerTierYearEligible, lowerTierGap);
+        }
+
         // ── STEP 4: OVERTURE (MICROSOFT) ──────────
+        boolean microsoftGap = hasBuildingGap(visible, minLat, maxLat, minLon, maxLon);
         if (config.overtureBuildings
-                && overtureIndex.isEnabled()) {
+                && overtureIndex.isEnabled()
+                && lowerTierYearEligible && microsoftGap) {
 
             List<OvertureIndex.OvertureBuilding>
                 ovAll = overtureIndex

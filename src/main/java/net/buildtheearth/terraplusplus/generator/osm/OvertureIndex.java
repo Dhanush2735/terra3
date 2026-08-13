@@ -267,8 +267,13 @@ public class OvertureIndex {
             return sb.toString().trim();
         }
 
+        /** A completed source lookup containing no buildings. */
         public static final BuildingTile EMPTY =
                 new BuildingTile(new OvertureBuilding[0], true,
+                        DataSource.MEMORY_CACHE);
+        /** Download/index state is unavailable; callers must retry. */
+        public static final BuildingTile FAILED =
+                new BuildingTile(new OvertureBuilding[0], false,
                         DataSource.MEMORY_CACHE);
     }
 
@@ -288,6 +293,10 @@ public class OvertureIndex {
     /** Quadkeys currently being downloaded/parsed, to prevent duplicate work. */
     private final java.util.Set<String> msftInFlight =
         java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+    // Parsing a Microsoft quadkey can scan 600k+ lines and allocate many
+    // objects. Allow exactly one cold parse at a time process-wide.
+    private final java.util.concurrent.Semaphore msftParsePermit =
+        new java.util.concurrent.Semaphore(1, true);
 
     private final ConcurrentHashMap<String, List<OvertureBuilding>> msftQuadkeyCache =
             new ConcurrentHashMap<>();
@@ -309,6 +318,7 @@ public class OvertureIndex {
 
     private final Path    diskDir;
     private final Path    msftCacheDir;
+    private final Path    msftRegionCacheDir;
     private final boolean diskOk;
 
     private volatile boolean enabled             = true;
@@ -352,16 +362,19 @@ public class OvertureIndex {
 
         Path dir     = Paths.get("terra_cache", "overture_buildings");
         Path msftDir = Paths.get("terra_cache", "msft_buildings");
+        Path regionDir = msftDir.resolve("regions");
         boolean ok   = false;
         try {
             Files.createDirectories(dir);
             Files.createDirectories(msftDir);
+            Files.createDirectories(regionDir);
             ok = true;
         } catch (Exception e) {
             LOGGER.warn("Cache dir failed: {}", e.getMessage());
         }
         this.diskDir      = dir;
         this.msftCacheDir = msftDir;
+        this.msftRegionCacheDir = regionDir;
         this.diskOk       = ok;
 
         LOGGER.info("OvertureIndex initialized");
@@ -505,7 +518,7 @@ public class OvertureIndex {
     public BuildingTile query(double lat, double lon) {
         if (!enabled) return BuildingTile.EMPTY;
         if (lat <= -85 || lat >= 85) return BuildingTile.EMPTY;
-        if (System.currentTimeMillis() < pauseUntilMs) return BuildingTile.EMPTY;
+        if (System.currentTimeMillis() < pauseUntilMs) return BuildingTile.FAILED;
 
         long key = tileKey(lat, lon);
         BuildingTile cached = memCache.get(key);
@@ -513,7 +526,7 @@ public class OvertureIndex {
 
         CompletableFuture<BuildingTile> future = triggerFetch(key, lat, lon);
         try { return future.get(TILE_WAIT_MS, TimeUnit.MILLISECONDS); }
-        catch (Exception e) { return BuildingTile.EMPTY; }
+        catch (Exception e) { return BuildingTile.FAILED; }
     }
 
     public List<OvertureBuilding> getBuildingsAt(double lat, double lon) {
@@ -782,7 +795,17 @@ public class OvertureIndex {
 
         if (System.currentTimeMillis() < pauseUntilMs) {
             pending.remove(key);
-            return BuildingTile.EMPTY;
+            return BuildingTile.FAILED;
+        }
+
+        // The Microsoft dataset-links index is loaded asynchronously at
+        // startup. That state is pending work, not a failed building request;
+        // counting it as a failure previously triggered a 60-second pause
+        // before the first real Microsoft lookup could even begin.
+        if (!msftIndexLoaded) {
+            if (!msftIndexLoading) dlPool.submit(this::loadMicrosoftIndex);
+            pending.remove(key);
+            return BuildingTile.FAILED;
         }
 
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -791,7 +814,7 @@ public class OvertureIndex {
             pauseUntilMs        = System.currentTimeMillis() + PAUSE_ON_FAILURES_MS;
             consecutiveFailures = 0;
             pending.remove(key);
-            return BuildingTile.EMPTY;
+            return BuildingTile.FAILED;
         }
 
         totalQueries.incrementAndGet();
@@ -802,25 +825,33 @@ public class OvertureIndex {
 
         List<OvertureBuilding> allBuildings = new ArrayList<>();
 
-        // Microsoft ML Building Footprints
+        // Microsoft ML Building Footprints. A null list means the index or
+        // source is still unavailable, which must not be cached as a valid
+        // empty result.
+        List<OvertureBuilding> msftBuildings = null;
         if (msftAvailable) {
             try {
-                List<OvertureBuilding> msftBuildings =
-                        fetchMicrosoftBuildings(centerLat, centerLon,
-                                minLat, minLon, maxLat, maxLon);
-                if (msftBuildings != null && !msftBuildings.isEmpty()) {
-                    allBuildings.addAll(msftBuildings);
-                    msftHits.incrementAndGet();
-                    if (dbgCount.getAndIncrement() < 30) {
-                        LOGGER.info("MSFT [{},{}]: {} buildings",
-                                String.format("%.4f", centerLat),
-                                String.format("%.4f", centerLon),
-                                msftBuildings.size());
-                    }
-                }
+                msftBuildings = fetchMicrosoftBuildings(centerLat, centerLon,
+                        minLat, minLon, maxLat, maxLon);
             } catch (Exception e) {
                 LOGGER.debug("Microsoft fetch failed: {}", e.getMessage());
-                consecutiveFailures++;
+            }
+        }
+        if (msftBuildings == null) {
+            // null also means a different task currently owns the one allowed
+            // Microsoft parse. That is normal pending work, not an endpoint
+            // failure; counting it caused false 60-second Overture pauses.
+            pending.remove(key);
+            return BuildingTile.FAILED;
+        }
+        if (!msftBuildings.isEmpty()) {
+            allBuildings.addAll(msftBuildings);
+            msftHits.incrementAndGet();
+            if (dbgCount.getAndIncrement() < 30) {
+                LOGGER.info("MSFT [{},{}]: {} buildings",
+                        String.format("%.4f", centerLat),
+                        String.format("%.4f", centerLon),
+                        msftBuildings.size());
             }
         }
 
@@ -884,10 +915,17 @@ public class OvertureIndex {
         // "not ready yet, retry".
         if (!msftInFlight.add(quadkey))
             return null;
+        // Do not park download workers behind a large parse. A caller receives
+        // retryable pending state and AsyncStructureManager reschedules it.
+        if (!msftParsePermit.tryAcquire()) {
+            msftInFlight.remove(quadkey);
+            return null;
+        }
         try {
             return fetchMicrosoftQuadkey(quadkey,
                     minLat, minLon, maxLat, maxLon);
         } finally {
+            msftParsePermit.release();
             // Must always release, or this quadkey is blocked forever.
             msftInFlight.remove(quadkey);
         }
@@ -925,10 +963,22 @@ public class OvertureIndex {
         if (url == null) {
             LOGGER.debug("No Microsoft data for quadkey {}", quadkey);
             msftQuadkeyCache.put(rKey, List.of());
-            return null;
+            return List.of();
         }
 
         if (diskOk) {
+            Path regionFile = microsoftRegionFile(quadkey, minLat, minLon);
+            if (Files.exists(regionFile)) {
+                try {
+                    List<OvertureBuilding> buildings = parseMicrosoftFile(
+                            regionFile, minLat, maxLat, minLon, maxLon);
+                    msftQuadkeyCache.put(rKey, buildings);
+                    LOGGER.info("MSFT region cache {}: {} buildings", quadkey, buildings.size());
+                    return filterByBbox(buildings, minLat, minLon, maxLat, maxLon);
+                } catch (Exception e) {
+                    LOGGER.debug("MSFT region cache read failed: {}", e.getMessage());
+                }
+            }
             Path qkFile = msftCacheDir.resolve(quadkey + ".geojsonl");
             if (Files.exists(qkFile)) {
                 try {
@@ -939,7 +989,8 @@ public class OvertureIndex {
                         // file; the file itself stays whole on disk.
                         List<OvertureBuilding> buildings =
                                 parseMicrosoftFile(qkFile,
-                                        minLat, maxLat, minLon, maxLon);
+                                        minLat, maxLat, minLon, maxLon,
+                                        regionFile);
                         msftQuadkeyCache.put(rKey, buildings);
                         LOGGER.info("MSFT quadkey {} from disk: {} buildings",
                                 quadkey, buildings.size());
@@ -996,6 +1047,12 @@ public class OvertureIndex {
 
             List<OvertureBuilding> buildings = new ArrayList<>();
             StringBuilder diskContent = new StringBuilder(1024 * 1024);
+            // Persist a compact local 0.01-degree region sidecar while the
+            // full quadkey is already being streamed for the first time.
+            StringBuilder regionContent = new StringBuilder(64 * 1024);
+            double regionLat = Math.floor(minLat / MSFT_REGION_DEG) * MSFT_REGION_DEG;
+            double regionLon = Math.floor(minLon / MSFT_REGION_DEG) * MSFT_REGION_DEG;
+            double regionPad = 0.001;
             String line;
             int lineCount = 0, parsedCount = 0;
             while ((line = reader.readLine()) != null) {
@@ -1003,6 +1060,11 @@ public class OvertureIndex {
                 line = line.trim();
                 if (line.isEmpty()) continue;
                 diskContent.append(line).append('\n');
+                if (firstVertexInBox(line, regionLat - regionPad,
+                        regionLat + MSFT_REGION_DEG + regionPad,
+                        regionLon - regionPad,
+                        regionLon + MSFT_REGION_DEG + regionPad))
+                    regionContent.append(line).append('\n');
                 if (!firstVertexInBox(line, loLat, hiLat, loLon, hiLon))
                     continue;
                 parsedCount++;
@@ -1028,6 +1090,8 @@ public class OvertureIndex {
                     Files.writeString(
                             msftCacheDir.resolve(quadkey + ".geojsonl"),
                             diskContent.toString(), StandardCharsets.UTF_8);
+                    Files.writeString(microsoftRegionFile(quadkey, minLat, minLon),
+                            regionContent.toString(), StandardCharsets.UTF_8);
                 } catch (Exception ignored) {}
             }
             LOGGER.info("MSFT quadkey {}: {} retained, {} of {} lines parsed",
@@ -1051,6 +1115,13 @@ public class OvertureIndex {
             if (url != null) return url;
         }
         return null;
+    }
+
+    /** Persistent compact cache for one 0.01-degree Microsoft region. */
+    private Path microsoftRegionFile(String quadkey, double lat, double lon) {
+        long gLat = (long) Math.floor(lat / MSFT_REGION_DEG);
+        long gLon = (long) Math.floor(lon / MSFT_REGION_DEG);
+        return msftRegionCacheDir.resolve(quadkey + "_" + gLat + "_" + gLon + ".geojsonl");
     }
 
     // ================================================================
@@ -1129,6 +1200,19 @@ public class OvertureIndex {
     private List<OvertureBuilding> parseMicrosoftFile(Path file,
             double minLat, double maxLat, double minLon, double maxLon)
             throws IOException {
+        return parseMicrosoftFile(file, minLat, maxLat, minLon, maxLon, null);
+    }
+
+    /**
+     * Parses a full cached quadkey once and, when requested, writes the raw
+     * lines for the active 0.01-degree region into a persistent sidecar. The
+     * following warm start then reads that small sidecar rather than rescanning
+     * the complete Microsoft file.
+     */
+    private List<OvertureBuilding> parseMicrosoftFile(Path file,
+            double minLat, double maxLat, double minLon, double maxLon,
+            Path regionSidecar)
+            throws IOException {
         final double pad = 0.001;   // > max building diagonal at these scales
         final double loLat = minLat - pad, hiLat = maxLat + pad;
         final double loLon = minLon - pad, hiLon = maxLon + pad;
@@ -1136,6 +1220,9 @@ public class OvertureIndex {
                 !(minLat <= -90.0 && maxLat >= 90.0);
 
         List<OvertureBuilding> buildings = new ArrayList<>();
+        StringBuilder regionLines = regionSidecar == null ? null : new StringBuilder(64 * 1024);
+        double regionLat = Math.floor(minLat / MSFT_REGION_DEG) * MSFT_REGION_DEG;
+        double regionLon = Math.floor(minLon / MSFT_REGION_DEG) * MSFT_REGION_DEG;
         int scanned = 0, parsed = 0;
         try (BufferedReader br = Files.newBufferedReader(file,
                 StandardCharsets.UTF_8)) {
@@ -1143,6 +1230,10 @@ public class OvertureIndex {
             while ((line = br.readLine()) != null) {
                 if (line.isEmpty()) continue;
                 scanned++;
+                if (regionLines != null && firstVertexInBox(line,
+                        regionLat - pad, regionLat + MSFT_REGION_DEG + pad,
+                        regionLon - pad, regionLon + MSFT_REGION_DEG + pad))
+                    regionLines.append(line).append('\n');
                 if (windowed && !firstVertexInBox(
                         line, loLat, hiLat, loLon, hiLon))
                     continue;
@@ -1151,6 +1242,13 @@ public class OvertureIndex {
                     OvertureBuilding b = parseMicrosoftLine(line.trim());
                     if (b != null) buildings.add(b);
                 } catch (Exception ignored) {}
+            }
+        }
+        if (regionLines != null && diskOk) {
+            try {
+                Files.writeString(regionSidecar, regionLines.toString(), StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                LOGGER.debug("MSFT region cache write failed: {}", e.getMessage());
             }
         }
         if (windowed)

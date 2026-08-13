@@ -191,9 +191,10 @@ public class OhmStructureIndex {
             TerraWorldConfig config,
             long timeoutMs) {
         if (!enabled) return List.of();
+        // Source cooldown is retryable, not a successful empty historical tile.
         if (System.currentTimeMillis()
                 < pauseUntilMs)
-            return List.of();
+            return null;
 
         try {
             Set<Long> neededKeys =
@@ -289,6 +290,14 @@ public class OhmStructureIndex {
                 }
             }
 
+            // A failed/missing OHM tile is retryable; do not let the caller
+            // fall through to lower hierarchy tiers as if OHM had no feature.
+            for (long key : neededKeys) {
+                OhmTile tile = memCache.get(key);
+                if (tile == null || !tile.valid)
+                    return null;
+            }
+
             return collectFromKeys(neededKeys,
                 minLat - OVERLAP_MARGIN,
                 maxLat + OVERLAP_MARGIN,
@@ -301,6 +310,29 @@ public class OhmStructureIndex {
                 e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Single-tile query for background coordinators. A FAILED result means
+     * source data is unavailable and must be retried; EMPTY is a successful
+     * terminal response with no OHM structures.
+     */
+    public OhmTile query(double lat, double lon) {
+        if (!enabled || lat <= -85 || lat >= 85) return OhmTile.EMPTY;
+        if (System.currentTimeMillis() < pauseUntilMs) return OhmTile.FAILED;
+        long key = tileKey(lat, lon);
+        OhmTile cached = memCache.get(key);
+        if (cached != null) return cached;
+        if (diskOk) {
+            OhmTile disk = loadDisk(key);
+            if (disk != null) { memCache.put(key, disk); return disk; }
+        }
+        double tLat = Math.floor(lat / TILE_DEG) * TILE_DEG;
+        double tLon = Math.floor(lon / TILE_DEG) * TILE_DEG;
+        CompletableFuture<OhmTile> future = pending.computeIfAbsent(key,
+            k -> CompletableFuture.supplyAsync(() -> fetchTile(k, tLat, tLon), dlPool));
+        try { return future.get(TILE_WAIT_MS, TimeUnit.MILLISECONDS); }
+        catch (Exception e) { return OhmTile.FAILED; }
     }
 
     public boolean areTilesLoaded(
@@ -427,7 +459,7 @@ public class OhmStructureIndex {
         if (System.currentTimeMillis()
                 < pauseUntilMs) {
             pending.remove(key);
-            return OhmTile.EMPTY;
+            return OhmTile.FAILED;
         }
 
         if (consecutiveFailures
@@ -442,7 +474,7 @@ public class OhmStructureIndex {
                 + PAUSE_ON_FAILURES_MS;
             consecutiveFailures = 0;
             pending.remove(key);
-            return OhmTile.EMPTY;
+            return OhmTile.FAILED;
         }
 
         String bbox = String.format(
@@ -472,11 +504,14 @@ public class OhmStructureIndex {
         totalQueries.incrementAndGet();
 
         HttpURLConnection conn = null;
+        boolean endpointInFlight = false;
         try {
             // Acquire token — blocks only if we have
             // sent too many requests recently.
             // Does NOT block OSM fetch threads at all.
             limiter.acquire();
+                limiter.acquireInFlight();
+                endpointInFlight = true;
 
             conn = (HttpURLConnection)
                 new URL(OHM_OVERPASS).openConnection();
@@ -518,7 +553,7 @@ public class OhmStructureIndex {
                     || code == 504) {
                 // Server-side rate limit —
                 // back off by resetting limiter
-                limiter.reset();
+                limiter.penalize(code == 429 ? 30_000L : 10_000L);
                 LOGGER.debug(
                     "OHM struct rate limited ({})",
                     code);
@@ -529,18 +564,19 @@ public class OhmStructureIndex {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             pending.remove(key);
-            return OhmTile.EMPTY;
+            return OhmTile.FAILED;
         } catch (Exception e) {
             LOGGER.debug(
                 "OHM fetch failed: {}",
                 e.getMessage());
         } finally {
             if (conn != null) conn.disconnect();
+            if (endpointInFlight) limiter.releaseInFlight();
         }
 
         consecutiveFailures++;
         pending.remove(key);
-        return OhmTile.EMPTY;
+        return OhmTile.FAILED;
     }
 
     // ── PARSING ───────────────────────────────────────────────

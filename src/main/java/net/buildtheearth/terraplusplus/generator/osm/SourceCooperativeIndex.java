@@ -349,12 +349,25 @@ public class SourceCooperativeIndex {
      * Do not raise this without re-measuring: cost grows with the SQUARE of the
      * window, and in a dense city that is millions of live objects.
      */
-    private static final double RETAIN_HALF_DEG = 0.02;
+    // Match the async structure tile scale closely. A 0.02-degree retention
+    // window turned a single 1 km request into 40–65k retained buildings in
+    // dense cities; 0.01 still gives a safety margin around the request while
+    // greatly reducing cold-start network, parsing, and memory pressure.
+    private static final double RETAIN_HALF_DEG = 0.01;
 
     private final ConcurrentHashMap<String, Shard> shardCache = new ConcurrentHashMap<>();
-    private final Set<String> failedShards = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    // A remote/range failure is retryable.  Never turn it into a permanent
+    // "no buildings" result, otherwise cold-start outages erase VIDA gaps.
+    // Give OSM/OHM and the immediate terrain path time to settle before a
+    // potentially large Google/VIDA cold fetch starts.
+    private static final long COLD_START_DELAY_MS = 5_000L;
+    private static final long RETRY_COOLDOWN_MS = 60_000L;
+    private final ConcurrentHashMap<String, Long> retryAfterMs = new ConcurrentHashMap<>();
     private final Set<String> pendingShards = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final ExecutorService dlPool = Executors.newFixedThreadPool(2, r -> {
+    // A ranged VIDA request can materialize tens of thousands of features.
+    // Serialise cold shard work so one player-area request cannot double the
+    // memory and bandwidth spike.
+    private final ExecutorService dlPool = Executors.newFixedThreadPool(1, r -> {
         Thread t = new Thread(r, "Terra++VIDA"); t.setDaemon(true); return t;
     });
     private final Path cacheDir = Paths.get("terra_cache", "vida_buildings");
@@ -389,9 +402,11 @@ public class SourceCooperativeIndex {
         if (iso == null || shardId == null) return List.of();
         double cLat = (minLat + maxLat) / 2.0, cLon = (minLon + maxLon) / 2.0;
         String key = regionKey(iso, shardId, cLat, cLon);
-        // A region that failed permanently must not re-trigger a download on
-        // every chunk; treat it as "no data here" instead of "retry forever".
-        if (failedShards.contains(key)) return List.of();
+        Long retryAfter = retryAfterMs.get(key);
+        if (retryAfter != null) {
+            if (System.currentTimeMillis() < retryAfter) return null;
+            retryAfterMs.remove(key, retryAfter);
+        }
         Shard cached = shardCache.get(key);
         if (cached != null && cached.covers(minLat, maxLat, minLon, maxLon))
             return filterBuildings(cached, minLat, maxLat, minLon, maxLon);
@@ -409,14 +424,20 @@ public class SourceCooperativeIndex {
     private void triggerShardFetch(String iso, String shardId,
                                    double centreLat, double centreLon,
                                    String key) {
+        // Missing VIDA data is optional gap-fill work, never an immediate
+        // terrain prerequisite. Delay cold work so OSM/OHM can satisfy dense
+        // areas first, avoiding immediate contention with terrain and source
+        // tile downloads before a large range fetch starts.
         CompletableFuture.runAsync(() -> {
             try { fetchShard(iso, shardId, centreLat, centreLon, key); }
             catch (Exception e) {
-                LOGGER.warn("VIDA region {} failed: {}", key, e.toString());
-                failedShards.add(key);
+                LOGGER.warn("VIDA region {} failed; retrying after {}s: {}",
+                        key, RETRY_COOLDOWN_MS / 1000, e.toString());
+                retryAfterMs.put(key, System.currentTimeMillis() + RETRY_COOLDOWN_MS);
             }
             finally { pendingShards.remove(key); }
-        }, dlPool);
+        }, CompletableFuture.delayedExecutor(COLD_START_DELAY_MS,
+                TimeUnit.MILLISECONDS, dlPool));
     }
 
     private void fetchShard(String iso, String shardId,
@@ -1086,7 +1107,11 @@ public class SourceCooperativeIndex {
         if (shardId == null) return List.of();
         double cLat = (minLat + maxLat) / 2.0, cLon = (minLon + maxLon) / 2.0;
         String key = regionKey(iso, shardId, cLat, cLon);
-        if (failedShards.contains(key)) return List.of();
+        Long retryAfter = retryAfterMs.get(key);
+        if (retryAfter != null) {
+            if (System.currentTimeMillis() < retryAfter) return null;
+            retryAfterMs.remove(key, retryAfter);
+        }
         Shard cached = shardCache.get(key);
         if (cached != null && cached.covers(minLat, maxLat, minLon, maxLon))
             return filterBuildings(cached, minLat, maxLat, minLon, maxLon);

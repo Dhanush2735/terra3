@@ -50,6 +50,8 @@ public class StructureTickHandler {
     // ── TICK CONSTANTS ─────────────────────────────────────────
     private static final int  CHUNKS_PER_TICK     = 2;
     private static final int  MAX_BLOCKS_PER_TICK = 5000;
+    // Bound CPU spent in one queue entry; large source tiles continue on later ticks.
+    private static final int  MAX_STRUCTURES_PER_BATCH = 128;
     private static final int  TICK_INTERVAL       = 2;
 
     // ── WAITING MAP CONSTANTS ──────────────────────────────────
@@ -429,30 +431,58 @@ public class StructureTickHandler {
                 continue;
             }
 
-            // ── PLACE STRUCTURES ───────────────────────────────
+            // ── HISTORICAL REFRESH OWNERSHIP ─────────────────
+            // A time jump has its own two-pass transaction. Letting this
+            // normal async placement queue write the same features first was
+            // exactly the duplicate path reported by PLACEMENT_TEST: the
+            // queue placed a building, then TerraChunkGenerator placed it
+            // again while completing the stale chunk refresh.
+            if (TerraTimeManager.isTimeEnabled()
+                    && PersistentChunkRefreshIndex.needsRefresh(
+                        level, entry.chunkX, entry.chunkZ)) {
+                TerraChunkGenerator.scheduleSingleChunkRefresh(level,
+                    new ChunkPos(entry.chunkX, entry.chunkZ));
+                placementQueue.markPlaced(entry);
+                if (dbgCount.getAndIncrement() < 40)
+                    LOGGER.info("Historical refresh owns async entry [{},{}]; normal placement skipped",
+                        entry.chunkX, entry.chunkZ);
+                continue;
+            }
+
+            // ── PLACE STRUCTURES ─────────────────────────────
             try {
-                int placed = placeStructuresInChunk(
-                    chunk, entry, level);
+                int from = Math.min(entry.nextStructureIndex, entry.structures.size());
+                int to = Math.min(entry.structures.size(), from + MAX_STRUCTURES_PER_BATCH);
+                List<OsmStructureIndex.OsmStructure> batch = entry.structures.subList(from, to);
+                int placed = placeStructuresInChunk(chunk, entry, level, batch);
+                // Covers the normal async placement queue as well as the
+                // historical refresh path. Log only after successful placement.
+                TerraChunkGenerator.placementDuplicateTest(chunk.getPos(), batch);
+                entry.nextStructureIndex = to;
                 blocksPlaced += placed;
                 chunksProcessed++;
-                placementQueue.markPlaced(entry);
-                totalChunksPlaced.incrementAndGet();
                 totalBlocksPlaced.addAndGet(placed);
-                if (dbgCount.getAndIncrement() < 20)
-                    LOGGER.info(
-                        "Placed {} blocks in [{},{}] "
-                        +"({} structs attempt {})",
-                        placed,
-                        entry.chunkX, entry.chunkZ,
-                        entry.structures.size(),
-                        entry.placementAttempts);
                 chunk.setUnsaved(true);
-                sendChunkToClients(level, chunk);
+
+                if (to < entry.structures.size()) {
+                    placementQueue.requeueContinuation(entry);
+                    if (dbgCount.getAndIncrement() < 20)
+                        LOGGER.info("Placed {} blocks in [{},{}] batch {}-{} of {}",
+                                placed, entry.chunkX, entry.chunkZ, from, to,
+                                entry.structures.size());
+                } else {
+                    placementQueue.markPlaced(entry);
+                    totalChunksPlaced.incrementAndGet();
+                    if (dbgCount.getAndIncrement() < 20)
+                        LOGGER.info("Placed {} blocks in [{},{}] ({} structs attempt {})",
+                                placed, entry.chunkX, entry.chunkZ,
+                                entry.structures.size(), entry.placementAttempts);
+                    // Resync once per finished entry, not once per partial batch.
+                    sendChunkToClients(level, chunk);
+                }
             } catch (Exception e) {
-                LOGGER.error(
-                    "Failed structs in [{},{}]: {}",
-                    entry.chunkX, entry.chunkZ,
-                    e.getMessage());
+                LOGGER.error("Failed structs in [{},{}]: {}",
+                        entry.chunkX, entry.chunkZ, e.getMessage());
                 placementQueue.requeue(entry);
             }
         }
@@ -973,7 +1003,8 @@ public class StructureTickHandler {
     private static int placeStructuresInChunk(
             LevelChunk chunk,
             StructurePlacementQueue.PlacementEntry entry,
-            ServerLevel level) {
+            ServerLevel level,
+            List<OsmStructureIndex.OsmStructure> batch) {
         if (tdf == null || config == null) return 0;
         int cx = chunk.getPos().getMinBlockX();
         int cz = chunk.getPos().getMinBlockZ();
@@ -985,6 +1016,8 @@ public class StructureTickHandler {
         double[][] geoLon = new double[16][16];
         int[][] surfaceYs = new int[16][16];
         boolean[][] valid = new boolean[16][16];
+        double minLat = Double.POSITIVE_INFINITY, maxLat = Double.NEGATIVE_INFINITY;
+        double minLon = Double.POSITIVE_INFINITY, maxLon = Double.NEGATIVE_INFINITY;
 
         for (int lx = 0; lx < 16; lx++) {
             for (int lz = 0; lz < 16; lz++) {
@@ -998,12 +1031,29 @@ public class StructureTickHandler {
                 }
                 geoLon[lx][lz] = geo[0];
                 geoLat[lx][lz] = geo[1];
+                minLon = Math.min(minLon, geo[0]); maxLon = Math.max(maxLon, geo[0]);
+                minLat = Math.min(minLat, geo[1]); maxLat = Math.max(maxLat, geo[1]);
                 TerraDensityFunctions.TerrainColumn
                     col = tdf.classify(cx+lx, cz+lz);
                 surfaceYs[lx][lz] = col.surfaceY;
                 valid[lx][lz] = true;
             }
         }
+
+        // Defensive second-stage filter. AsyncStructureManager filters before
+        // enqueue, but entries may also arrive from deferred/legacy paths.
+        // Avoid 256 × thousands of needless point-vs-structure checks.
+        final double structureMargin = 0.0005;
+        List<OsmStructureIndex.OsmStructure> localStructures = new ArrayList<>();
+        for (OsmStructureIndex.OsmStructure structure : batch) {
+            if (structure.maxLat < minLat - structureMargin
+                    || structure.minLat > maxLat + structureMargin
+                    || structure.maxLon < minLon - structureMargin
+                    || structure.minLon > maxLon + structureMargin)
+                continue;
+            localStructures.add(structure);
+        }
+        if (localStructures.isEmpty()) return 0;
 
         int cellCount = 0;
         for (int lx = 0; lx < 16; lx++) {
@@ -1014,7 +1064,7 @@ public class StructureTickHandler {
                 int sy = surfaceYs[lx][lz];
 
                 for (OsmStructureIndex.OsmStructure s
-                        : entry.structures) {
+                        : localStructures) {
                     if (!isEnabled(s.type, config))
                         continue;
                     if (config.timeEnabled

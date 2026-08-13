@@ -19,6 +19,8 @@ package net.buildtheearth.terraplusplus.generator.util;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -26,6 +28,12 @@ public class OverpassRateLimiter {
 
     private static final Logger LOGGER =
         LogManager.getLogger("Terra++RateLimit");
+
+    // Public endpoints are shared by water and structure indexes. One global
+    // bucket per endpoint prevents those independent systems from each sending
+    // their own "1 request/sec" stream to the same Overpass server.
+    private static final ConcurrentHashMap<String, OverpassRateLimiter> SHARED =
+        new ConcurrentHashMap<>();
 
     // ── FIELDS ────────────────────────────────────────────────
     private final String  name;
@@ -36,6 +44,9 @@ public class OverpassRateLimiter {
         new ReentrantLock();
     private final Condition     tokenAvailable =
         lock.newCondition();
+    // Public Overpass services are sensitive to overlapping long requests.
+    // The permit is shared whenever the limiter is shared by endpoint URL.
+    private final Semaphore inFlight = new Semaphore(1, true);
 
     // Current token count — may be fractional internally
     // but exposed as whole tokens
@@ -43,6 +54,8 @@ public class OverpassRateLimiter {
 
     // When we last refilled
     private long lastRefillMs;
+    // Endpoint-level cooldown after a rate-limit or gateway overload response.
+    private long cooldownUntilMs;
 
     // ── CONSTRUCTOR ───────────────────────────────────────────
     /**
@@ -83,6 +96,12 @@ public class OverpassRateLimiter {
         lock.lockInterruptibly();
         try {
             while (true) {
+                long now = System.currentTimeMillis();
+                if (now < cooldownUntilMs) {
+                    tokenAvailable.await(cooldownUntilMs - now,
+                            java.util.concurrent.TimeUnit.MILLISECONDS);
+                    continue;
+                }
                 refill();
 
                 if (tokens >= 1.0) {
@@ -113,6 +132,16 @@ public class OverpassRateLimiter {
         }
     }
 
+    /** Acquire the single active-request permit for this endpoint. */
+    public void acquireInFlight() throws InterruptedException {
+        inFlight.acquire();
+    }
+
+    /** Release the endpoint permit after the HTTP request has completed. */
+    public void releaseInFlight() {
+        inFlight.release();
+    }
+
     /**
      * Attempt to acquire one token without blocking.
      * Returns true if token was available, false otherwise.
@@ -121,6 +150,7 @@ public class OverpassRateLimiter {
     public boolean tryAcquireImmediate() {
         lock.lock();
         try {
+            if (System.currentTimeMillis() < cooldownUntilMs) return false;
             refill();
             if (tokens >= 1.0) {
                 tokens -= 1.0;
@@ -141,6 +171,25 @@ public class OverpassRateLimiter {
         try {
             tokens       = burstCapacity;
             lastRefillMs = System.currentTimeMillis();
+            cooldownUntilMs = 0L;
+            tokenAvailable.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Penalize an endpoint after HTTP 429/504. Unlike reset(), this removes
+     * burst capacity and postpones the next request instead of immediately
+     * sending another burst to an overloaded public service.
+     */
+    public void penalize(long cooldownMs) {
+        lock.lock();
+        try {
+            long now = System.currentTimeMillis();
+            cooldownUntilMs = Math.max(cooldownUntilMs, now + Math.max(0L, cooldownMs));
+            tokens = 0.0;
+            lastRefillMs = cooldownUntilMs;
             tokenAvailable.signalAll();
         } finally {
             lock.unlock();
@@ -155,6 +204,8 @@ public class OverpassRateLimiter {
     public long msUntilNextToken() {
         lock.lock();
         try {
+            long now = System.currentTimeMillis();
+            if (now < cooldownUntilMs) return cooldownUntilMs - now;
             refill();
             if (tokens >= 1.0) return 0;
             double needed = 1.0 - tokens;
@@ -197,8 +248,9 @@ public class OverpassRateLimiter {
      */
     public static OverpassRateLimiter forOsmEndpoint(
             String endpointName) {
-        return new OverpassRateLimiter(
-            "OSM/" + endpointName, 1000L, 2);
+        String key = "OSM/" + endpointName;
+        return SHARED.computeIfAbsent(key,
+            ignored -> new OverpassRateLimiter(key, 1000L, 1));
     }
 
     /**
@@ -206,8 +258,7 @@ public class OverpassRateLimiter {
      * 1 req/2sec, burst of 2.
      */
     public static OverpassRateLimiter forOhmWater() {
-        return new OverpassRateLimiter(
-            "OHM/Water", 2000L, 2);
+        return sharedOhmLimiter();
     }
 
     /**
@@ -215,8 +266,12 @@ public class OverpassRateLimiter {
      * 1 req/1.5sec, burst of 2.
      */
     public static OverpassRateLimiter forOhmStructures() {
-        return new OverpassRateLimiter(
-            "OHM/Structures", 1500L, 2);
+        return sharedOhmLimiter();
+    }
+
+    private static OverpassRateLimiter sharedOhmLimiter() {
+        return SHARED.computeIfAbsent("OHM/public",
+            ignored -> new OverpassRateLimiter("OHM/public", 2000L, 1));
     }
 
     // ── DIAGNOSTICS ───────────────────────────────────────────

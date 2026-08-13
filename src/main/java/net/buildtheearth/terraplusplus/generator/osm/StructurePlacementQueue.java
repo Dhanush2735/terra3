@@ -55,8 +55,10 @@ public class StructurePlacementQueue {
          */
         public final List<OsmStructureIndex.OsmStructure> structures;
 
-        /** Incremented each time this entry is re-queued. */
+        /** Incremented when a placement must retry due to chunk/world state. */
         public int placementAttempts;
+        /** Next structure index for bounded multi-tick placement batches. */
+        public int nextStructureIndex;
 
         public PlacementEntry(int chunkX, int chunkZ,
                               List<OsmStructureIndex.OsmStructure> structures,
@@ -68,6 +70,7 @@ public class StructurePlacementQueue {
             this.queuedTimeMs = System.currentTimeMillis();
             this.structures   = List.copyOf(structures); // immutable defensive copy
             this.placementAttempts = 0;
+            this.nextStructureIndex = 0;
         }
     }
 
@@ -215,6 +218,17 @@ public class StructurePlacementQueue {
             queueSize.decrementAndGet();
         }
         return entry;
+    }
+
+    /**
+     * Continue an oversized successful placement on a later tick. This is not
+     * a failure, so it must not consume placementAttempts or become deferred.
+     */
+    public void requeueContinuation(PlacementEntry entry) {
+        long key = chunkKey(entry.chunkX, entry.chunkZ);
+        if (queuedChunks.putIfAbsent(key, Boolean.TRUE) != null) return;
+        activeQueue.offerLast(entry);
+        queueSize.incrementAndGet();
     }
 
     // ================================================================

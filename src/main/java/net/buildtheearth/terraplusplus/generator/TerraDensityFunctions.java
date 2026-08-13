@@ -16,6 +16,7 @@ import net.buildtheearth.terraminusminus.projection.GeographicProjection;
 import net.buildtheearth.terraminusminus.projection.OutOfProjectionBoundsException;
 import net.buildtheearth.terraminusminus.generator.EarthGeneratorSettings;
 import net.buildtheearth.terraplusplus.generator.water.OsmWaterIndex;
+import net.buildtheearth.terraplusplus.config.TerraConfig;
 import net.buildtheearth.terraplusplus.generator.water.WaterBodyInfo;
 
 import net.minecraft.world.level.block.Blocks;
@@ -48,9 +49,19 @@ public class TerraDensityFunctions {
             GEN_DEPTH = MAX_Y - MIN_Y;
     public static final double DRY_LAND_MIN_ELEV = -500.0;
     private static final double BELOW_SEA_Y_SCALE = 0.1;
-    private static final String TILE_URL =
+    private static final String DEFAULT_TILE_URL =
             "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/";
     private static final int TILE_SIZE = 256, TIMEOUT = 10000, MAX_RETRY = 2;
+
+    // Terrarium encodes global elevation, so negative values are valid over
+    // oceans.  These bounds only reject values that cannot exist on Earth.
+    private static final double MIN_EARTH_ELEVATION = -11_000.0;
+    private static final double MAX_EARTH_ELEVATION = 9_500.0;
+    private static final double OUTLIER_DELTA_METERS = 500.0;
+    private static final double STABLE_NEIGHBOUR_SPREAD_METERS = 120.0;
+    private static final int REPAIR_RADIUS = 2;
+    private static final int REPAIR_PASSES = 8;
+    private static final double QUARANTINE_REPAIR_FRACTION = 0.05;
     private static final int[] BATHY_ZOOM_CHAIN = {8, 7, 6, 5, 3};
     private static final double CLUSTER_THRESHOLD = 150.0,
             ARTIFACT_LOW_CEILING  = 10.0,
@@ -96,6 +107,7 @@ public class TerraDensityFunctions {
     private final Path diskCacheDir;
     private final boolean useDiskCache;
     private final ExecutorService dlPool;
+    private final String tileUrl;
 
     private final AtomicInteger elevDebug     = new AtomicInteger(0);
     private final AtomicInteger bathyDebug    = new AtomicInteger(0);
@@ -119,6 +131,16 @@ public class TerraDensityFunctions {
         }
         this.projection   = proj;
         this.projectionOk = ok;
+        String configuredUrl;
+        try {
+            configuredUrl = TerraConfig.TERRAIN_DATA_URL.get();
+        } catch (Throwable ignored) {
+            configuredUrl = DEFAULT_TILE_URL;
+        }
+        if (configuredUrl == null || configuredUrl.isBlank())
+            configuredUrl = DEFAULT_TILE_URL;
+        this.tileUrl = configuredUrl.endsWith("/")
+                ? configuredUrl : configuredUrl + "/";
         this.tileCache    = new ConcurrentHashMap<>(512);
         this.pendingTiles = new ConcurrentHashMap<>();
         this.elevCache    = new ConcurrentHashMap<>(8192);
@@ -668,6 +690,23 @@ public class TerraDensityFunctions {
                 || longitude < -180 || longitude > 180) return -50;
         try {
             double elev = getElevationBilinear(latitude, longitude, this.zoom);
+
+            // A globally impossible value, or a deep value at a location OSM
+            // already knows is land, must not become a terrain trench.  Use a
+            // coarser parent tile instead. This is non-blocking: only the
+            // in-memory coastline index is consulted.
+            if (needsParentTileFallback(latitude, longitude, elev)) {
+                double parent = getElevationBilinear(latitude, longitude,
+                        Math.max(0, this.zoom - 1));
+                if (isPlausibleParent(parent, elev)) {
+                    LOGGER.warn("Elevation fallback at lat={} lon={}: {}m -> {}m",
+                            String.format("%.5f", latitude),
+                            String.format("%.5f", longitude),
+                            String.format("%.1f", elev),
+                            String.format("%.1f", parent));
+                    elev = parent;
+                }
+            }
             boolean noData   = Double.isNaN(elev);
             boolean nearZero = !noData && elev > -1.0 && elev < 1.0;
             if (noData || nearZero) {
@@ -834,7 +873,7 @@ public class TerraDensityFunctions {
             HttpURLConnection conn = null;
             try {
                 conn = (HttpURLConnection)
-                        new URL(TILE_URL + key + ".png").openConnection();
+                        new URL(tileUrl + key + ".png").openConnection();
                 conn.setConnectTimeout(TIMEOUT);
                 conn.setReadTimeout(TIMEOUT);
                 conn.setRequestProperty("User-Agent", "TerraPlusPlus/2.0");
@@ -844,11 +883,17 @@ public class TerraDensityFunctions {
                     try (InputStream is = conn.getInputStream()) {
                         img = ImageIO.read(is);
                     }
+                    img = validateAndRepairTile(img, key);
                     if (img != null) {
                         tileCache.put(key, img);
                         if (useDiskCache) saveToDisk(key, img);
                         return img;
                     }
+                    // Bad source data is semantically invalid even though it
+                    // may be a perfectly valid PNG. Do not cache it on disk.
+                    LOGGER.warn("Quarantined invalid elevation tile {}", key);
+                    tileCache.put(key, SENTINEL_FAILED);
+                    return null;
                 } else if (sc == 404) {
                     tileCache.put(key, SENTINEL_FAILED);
                     return null;
@@ -874,7 +919,19 @@ public class TerraDensityFunctions {
         try {
             File f = diskCacheDir.resolve(
                     key.replace('/', File.separatorChar) + ".png").toFile();
-            if (f.exists() && f.length() > 0) return ImageIO.read(f);
+            if (!f.exists() || f.length() <= 0) return null;
+            BufferedImage image = ImageIO.read(f);
+            BufferedImage checked = validateAndRepairTile(image, key);
+            // Replace an old cached source tile with its repaired form. A
+            // quarantined cache entry is deleted so it cannot poison restarts.
+            if (checked == null) {
+                Files.deleteIfExists(f.toPath());
+                return null;
+            }
+            // validateAndRepairTile mutates a valid image in place, so always
+            // write it back and prevent an old raw tile from recurring.
+            saveToDisk(key, checked);
+            return checked;
         } catch (Exception ignored) {}
         return null;
     }
@@ -886,6 +943,113 @@ public class TerraDensityFunctions {
             if (f.getParentFile() != null) f.getParentFile().mkdirs();
             ImageIO.write(img, "PNG", f);
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Validates a Terrarium tile once at cache time.  The test is deliberately
+     * local: negative elevations remain valid for oceans, while an inland
+     * multi-kilometre spike surrounded by a stable neighbourhood is repaired.
+     */
+    private BufferedImage validateAndRepairTile(BufferedImage image, String key) {
+        if (image == null || image.getWidth() != TILE_SIZE
+                || image.getHeight() != TILE_SIZE) {
+            LOGGER.warn("Rejected malformed elevation tile {}", key);
+            return null;
+        }
+        double[] elevation = new double[TILE_SIZE * TILE_SIZE];
+        int impossible = 0;
+        for (int y = 0; y < TILE_SIZE; y++) for (int x = 0; x < TILE_SIZE; x++) {
+            elevation[y * TILE_SIZE + x] = decodeTerrarium(image.getRGB(x, y));
+            if (!isGloballyPlausible(elevation[y * TILE_SIZE + x])) impossible++;
+        }
+        if (impossible > TILE_SIZE * TILE_SIZE * QUARANTINE_REPAIR_FRACTION) {
+            LOGGER.warn("Rejected tile {}: {} globally impossible samples", key, impossible);
+            return null;
+        }
+
+        boolean changed = false;
+        int repaired = 0;
+        for (int pass = 0; pass < REPAIR_PASSES; pass++) {
+            int passRepairs = 0;
+            double[] next = elevation.clone();
+            // Include tile edges as well. Source artifacts often touch a tile
+            // border, and adjacent tiles are not guaranteed to be in cache.
+            for (int y = 0; y < TILE_SIZE; y++)
+                for (int x = 0; x < TILE_SIZE; x++) {
+                    int i = y * TILE_SIZE + x;
+                    double value = elevation[i];
+                    double[] neighbours = new double[(REPAIR_RADIUS * 2 + 1)
+                            * (REPAIR_RADIUS * 2 + 1) - 1];
+                    int count = 0;
+                    for (int dy = -REPAIR_RADIUS; dy <= REPAIR_RADIUS; dy++)
+                        for (int dx = -REPAIR_RADIUS; dx <= REPAIR_RADIUS; dx++) {
+                            if (dx == 0 && dy == 0) continue;
+                            int ny = y + dy, nx = x + dx;
+                            if (ny < 0 || ny >= TILE_SIZE || nx < 0 || nx >= TILE_SIZE)
+                                continue;
+                            double n = elevation[ny * TILE_SIZE + nx];
+                            if (isGloballyPlausible(n)) neighbours[count++] = n;
+                        }
+                    if (count < 8) continue;
+                    java.util.Arrays.sort(neighbours, 0, count);
+                    double median = neighbours[count / 2];
+                    double spread = neighbours[(count * 3) / 4]
+                            - neighbours[count / 4];
+                    if (!isGloballyPlausible(value) || (spread <= STABLE_NEIGHBOUR_SPREAD_METERS
+                            && Math.abs(value - median) > OUTLIER_DELTA_METERS)) {
+                        next[i] = median;
+                        passRepairs++;
+                    }
+                }
+            elevation = next;
+            repaired += passRepairs;
+            if (passRepairs == 0) break;
+            changed = true;
+        }
+        if (repaired > TILE_SIZE * TILE_SIZE * QUARANTINE_REPAIR_FRACTION) {
+            LOGGER.warn("Rejected tile {}: repaired {} suspect samples", key, repaired);
+            return null;
+        }
+        if (!changed) return image;
+        for (int y = 0; y < TILE_SIZE; y++) for (int x = 0; x < TILE_SIZE; x++)
+            image.setRGB(x, y, encodeTerrarium(elevation[y * TILE_SIZE + x]));
+        LOGGER.warn("Repaired {} suspect elevation samples in tile {}", repaired, key);
+        return image;
+    }
+
+    private static double decodeTerrarium(int rgb) {
+        int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+        return r * 256.0 + g + b / 256.0 - 32768.0;
+    }
+
+    private static int encodeTerrarium(double meters) {
+        double encoded = Math.max(0.0, Math.min(65535.99609375, meters + 32768.0));
+        int r = (int) (encoded / 256.0);
+        encoded -= r * 256.0;
+        int g = (int) encoded;
+        int b = (int) Math.round((encoded - g) * 256.0);
+        if (b == 256) { b = 0; if (++g == 256) { g = 0; r = Math.min(255, r + 1); } }
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    private static boolean isGloballyPlausible(double elevation) {
+        return Double.isFinite(elevation) && elevation >= MIN_EARTH_ELEVATION
+                && elevation <= MAX_EARTH_ELEVATION;
+    }
+
+    private boolean needsParentTileFallback(double lat, double lon, double elevation) {
+        if (!isGloballyPlausible(elevation)) return true;
+        if (elevation >= DRY_LAND_MIN_ELEV) return false;
+        OsmWaterIndex water = osmWater;
+        return water != null && water.classifyCoastlineMemOnly(lat, lon)
+                == OsmWaterIndex.CoastSide.LAND;
+    }
+
+    private static boolean isPlausibleParent(double parent, double original) {
+        if (!isGloballyPlausible(parent)) return false;
+        // Any plausible parent fixes impossible source data. For an inland deep
+        // reading, only accept a parent that is not another deep-ocean value.
+        return !isGloballyPlausible(original) || parent >= DRY_LAND_MIN_ELEV;
     }
 
     private static int clamp(int v, int min, int max) {

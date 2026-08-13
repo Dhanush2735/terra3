@@ -233,147 +233,16 @@ public class TerraTimeCommand {
 
         PersistentChunkRefreshIndex
             .advanceRefreshGeneration(level, actualYear);
+        PersistentChunkRefreshIndex.beginTimeJumpAudit(
+            PersistentChunkRefreshIndex.getGeneration(), actualYear);
+        // Discard queued work for the old year before selecting nearest chunks
+        // for this new year.
+        TerraChunkGenerator.resetRefreshQueuesForTimeJump();
 
-        // ── IMMEDIATE WATER SYNC ──────────────────────
-        // Must run BEFORE queue-based refresh.
-        // Uses chunkMap.getChunks() to reach ALL
-        // chunks in server memory including semi-loaded
-        // chunks that getChunk(x,z,false) misses.
-        // Semi-loaded chunks are in the server's chunk
-        // holder map but not yet fully promoted to
-        // ticking state — getChunk(x,z,false) returns
-        // null for them but chunkMap.getChunks() does
-        // not.
-        // Safe here because we are inside a server tick
-        // command execution, not inside ChunkEvent.Load,
-        // so no chunk lock is held.
-        var gen = TerraChunkGenerator.activeInstance;
-        if (gen != null) {
-            int totalScanned = 0;
-            int waterSynced  = 0;
-            int waterFailed  = 0;
-            boolean usedChunkMap = false;
-
-// ── METHOD 1: chunkMap.getChunks() via reflection ─
-// getChunks() is package-private in ChunkMap so
-// we must use reflection to call it.
-try {
-    var chunkSource =
-        level.getChunkSource();
-    var chunkMap = chunkSource.chunkMap;
-
-    java.lang.reflect.Method getChunks =
-        chunkMap.getClass()
-        .getDeclaredMethod("getChunks");
-    getChunks.setAccessible(true);
-
-    @SuppressWarnings("unchecked")
-    Iterable<net.minecraft.server.level.ChunkHolder>
-        holders =
-        (Iterable<net.minecraft.server.level
-            .ChunkHolder>)
-        getChunks.invoke(chunkMap);
-
-    if (holders != null) {
-        usedChunkMap = true;
-        for (var holder : holders) {
-            totalScanned++;
-            LevelChunk lc = null;
-            try {
-                lc = holder.getTickingChunk();
-
-                if (lc == null) {
-                    var fut =
-                        holder.getFullChunkFuture();
-                    if (fut != null
-                            && fut.isDone()) {
-                        var result =
-                            fut.getNow(null);
-                        if (result != null) {
-                            var opt =
-                                result.left();
-                            if (opt != null
-                                    && opt
-                                    .isPresent())
-                                lc = opt.get();
-                        }
-                    }
-                }
-
-                if (lc == null) continue;
-
-                gen.syncHistoricalWaterPublic(
-                    level, lc);
-                waterSynced++;
-            } catch (Exception e) {
-                waterFailed++;
-                LOGGER.debug(
-                    "Water sync holder error: {}",
-                    e.getMessage());
-            }
-        }
-    }
-} catch (Exception e) {
-    LOGGER.warn(
-        "ChunkMap reflection failed: {} "
-        + "— using fallback",
-        e.getMessage());
-}
-
-            // ── METHOD 2: FALLBACK ────────────────────
-            // If chunkMap failed or returned nothing,
-            // fall back to PersistentChunkRefreshIndex
-            // snapshot + level.hasChunk.
-            // This covers fully loaded chunks only
-            // but is better than nothing.
-            if (!usedChunkMap || totalScanned == 0) {
-                LOGGER.info(
-                    "TIMEJUMP water sync: using "
-                    + "fallback snapshot method");
-                totalScanned = 0;
-                waterSynced  = 0;
-                waterFailed  = 0;
-
-                for (ChunkPos cp :
-                        PersistentChunkRefreshIndex
-                        .getLoadedChunkSnapshot(
-                            level)) {
-                    totalScanned++;
-                    try {
-                        if (!level.hasChunk(
-                                cp.x, cp.z))
-                            continue;
-                        LevelChunk lc =
-                            level.getChunk(cp.x, cp.z);
-                        if (lc == null) continue;
-                        gen.syncHistoricalWaterPublic(
-                            level, lc);
-                        waterSynced++;
-                    } catch (Exception e) {
-                        waterFailed++;
-                        LOGGER.debug(
-                            "Water sync fallback "
-                            + "[{},{}]: {}",
-                            cp.x, cp.z,
-                            e.getMessage());
-                    }
-                }
-            }
-
-            LOGGER.info(
-                "TIMEJUMP water sync complete: "
-                + "method={} scanned={} "
-                + "synced={} failed={}",
-                usedChunkMap ? "chunkMap" : "fallback",
-                totalScanned,
-                waterSynced,
-                waterFailed);
-        } else {
-            LOGGER.warn(
-                "TIMEJUMP water sync SKIPPED: "
-                + "activeInstance is null");
-        }
-
+        // ── QUEUE WATER/VEGETATION/STRUCTURE REFRESH ─────
+        // Do not enqueue the unsorted snapshot here. scheduleLoadedChunkRefresh
+        // below sorts by player distance and its pass-1 transaction handles
+        // water, vegetation, and structures together.
         // ── QUEUE VEGETATION + STRUCTURE REFRESH ─────
         // Pass 1: vegetation (10-64/tick)
         // Pass 2: roads + buildings via

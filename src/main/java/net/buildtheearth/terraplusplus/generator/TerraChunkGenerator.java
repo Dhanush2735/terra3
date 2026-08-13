@@ -91,7 +91,10 @@ public class TerraChunkGenerator extends ChunkGenerator {
 
         // ADD alongside REFRESH_PER_TICK:
     private static final int
-        REFRESH_PER_TICK_BURST = 64;    
+        // Post-jump work must not turn one server tick into a large source and
+        // vegetation burst. Nearby chunks are ordered first; throughput stays
+        // bounded while the queue drains over subsequent ticks.
+        REFRESH_PER_TICK_BURST = 12;
 
     // ── BLOCK STATES ──────────────────────────────────────────
     private static final BlockState
@@ -150,6 +153,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private volatile boolean configResolved=false;
     private volatile TerraDensityFunctions df;
     private volatile RiverLakeEngine rle;
+    private volatile AsyncWaterManager asyncWaterManager;
     private volatile TerraBiomeProvider terraBiomes;
     private volatile OsmStructureIndex structureIndex;
     private volatile OsmStructureGenerator
@@ -189,6 +193,36 @@ public class TerraChunkGenerator extends ChunkGenerator {
         List<OsmStructureIndex.OsmStructure>>
         refreshStructureCache=new ConcurrentHashMap<>();
 
+    // One historical refresh can span ticks: vegetation/water is applied in
+    // pass 1 and structures in pass 2. Keep the exact writes until pass 2
+    // commits the complete ownership record.
+    private final ConcurrentHashMap<Long,
+        List<GeneratedBlockOwnershipIndex.OwnedBlock>> refreshOwnershipCache=
+        new ConcurrentHashMap<>();
+    private static final ThreadLocal<List<GeneratedBlockOwnershipIndex.OwnedBlock>>
+        historicalWriteCapture = new ThreadLocal<>();
+
+    private static void beginHistoricalWriteCapture() {
+        historicalWriteCapture.set(new ArrayList<>());
+    }
+
+    private static List<GeneratedBlockOwnershipIndex.OwnedBlock> endHistoricalWriteCapture() {
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> writes = historicalWriteCapture.get();
+        historicalWriteCapture.remove();
+        return writes == null ? List.of() : writes;
+    }
+
+    /** Historical code must use this instead of direct level.setBlock(). The
+     * wrapper records exact final states only while a refresh transaction is
+     * active, so normal gameplay and generation are never claimed as owned. */
+    private static void setHistoricalBlock(net.minecraft.server.level.ServerLevel level,
+            BlockPos pos, BlockState state, int flags) {
+        level.setBlock(pos, state, flags);
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> writes = historicalWriteCapture.get();
+        if (writes != null) writes.add(new GeneratedBlockOwnershipIndex.OwnedBlock(
+            pos.asLong(), Block.getId(state)));
+    }
+
     private static volatile String activeSource="both";
     public static void setActiveSource(String s){
         activeSource=s;}
@@ -211,6 +245,21 @@ public class TerraChunkGenerator extends ChunkGenerator {
         queuedVegRefresh=ConcurrentHashMap.newKeySet();
     private static final Set<Long>
         queuedStructRefresh=ConcurrentHashMap.newKeySet();
+    // A chunk may become structurally ready before its vegetation pass has
+    // obtained source data.  Do not let pass 2 mark it current in that order:
+    // doing so permanently skips pass 1 and leaves old trees/ground behind.
+    // This is deliberately runtime-only; after a restart chunkYear makes an
+    // interrupted refresh stale again and the two phases restart safely.
+    private static final Set<Long>
+        vegetationPhaseComplete=ConcurrentHashMap.newKeySet();
+
+    // Diagnostic-only duplicate detector. It does not block placement: it
+    // records whether the same feature signature is successfully sent to the
+    // same chunk more than once in one time-jump generation.
+    private static final ConcurrentHashMap<String, Long>
+        successfulPlacementSignatures = new ConcurrentHashMap<>();
+    private static final int PLACEMENT_TEST_MAX = 200_000;
+
     public static volatile TerraChunkGenerator
         activeInstance=null;
     /**
@@ -225,6 +274,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
 
     private static final int REFRESH_PER_TICK=10;
     private static final int STRUCT_REFRESH_PER_TICK=2;
+    private static final int TIMEJUMP_IMMEDIATE_RADIUS = 20;
+    private static final int TIMEJUMP_IMMEDIATE_MAX = 256;
         public static volatile int
         postJumpRescanCountdown = 0;
 
@@ -252,6 +303,10 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private static boolean qv(ChunkPos cp){
         long k=rk(cp.x,cp.z);
         if(!queuedVegRefresh.add(k))return false;
+        // A newly scheduled year invalidates a completion from an earlier
+        // refresh generation. Internal retry paths do not call qv(), so they
+        // retain their completed prerequisite.
+        vegetationPhaseComplete.remove(k);
         refreshQueue.add(cp);
         return true;}
 
@@ -261,11 +316,29 @@ public class TerraChunkGenerator extends ChunkGenerator {
         structureRefreshQueue.add(cp);
         return true;}
 
+    /** A time jump supersedes every pre-jump queue entry. Keeping those
+     * entries made qv()/qs() reject the newly sorted nearby work, so old spawn
+     * chunks consumed the budget while the player's loaded chunks waited. */
+    public static void resetRefreshQueuesForTimeJump() {
+        refreshQueue.clear();
+        structureRefreshQueue.clear();
+        queuedVegRefresh.clear();
+        queuedStructRefresh.clear();
+        vegetationPhaseComplete.clear();
+        successfulPlacementSignatures.clear();
+        TerraChunkGenerator instance = activeInstance;
+        if (instance != null) {
+            instance.refreshStructureCache.clear();
+            instance.refreshOwnershipCache.clear();
+        }
+    }
+
     public static void scheduleSingleChunkRefresh(
             net.minecraft.server.level.ServerLevel level,
             ChunkPos cp){
         if(activeInstance==null||level==null
                 ||!level.hasChunk(cp.x,cp.z))return;
+        PersistentChunkRefreshIndex.markChunkRefreshQueued(cp.x, cp.z);
         qv(cp);
         if(activeInstance.getWorldConfig()
                 .hasAnyStructures())
@@ -279,25 +352,58 @@ public class TerraChunkGenerator extends ChunkGenerator {
         var chunk=level.getChunkSource()
             .getChunk(cp.x,cp.z,false);
         if(chunk==null)return;
+        PersistentChunkRefreshIndex.markChunkRefreshQueued(cp.x, cp.z);
         qv(cp);}
 
     public static void scheduleLoadedChunkRefresh(
             net.minecraft.server.level.ServerLevel level){
         if(activeInstance==null||level==null)return;
-        int va=0,sa=0;
-        for(ChunkPos cp:
-                PersistentChunkRefreshIndex
-                    .getLoadedChunkSnapshot(level)){
+        int va=0,sa=0,deferred=0;
+        List<ChunkPos> refreshOrder = PersistentChunkRefreshIndex
+                .getLoadedChunkSnapshot(level);
+        // A ConcurrentHashMap snapshot has arbitrary order. Refresh the
+        // nearest player area first so a time jump becomes visibly coherent
+        // without making distant loaded chunks compete for source work.
+        refreshOrder.sort(java.util.Comparator.comparingLong(cp -> {
+            long best = Long.MAX_VALUE;
+            for (ServerPlayer player : level.players()) {
+                long dx = (long) cp.x - player.chunkPosition().x;
+                long dz = (long) cp.z - player.chunkPosition().z;
+                best = Math.min(best, dx * dx + dz * dz);
+            }
+            return best;
+        }));
+        for(ChunkPos cp: refreshOrder){
             if(!level.hasChunk(cp.x,cp.z))continue;
+            long nearest = Long.MAX_VALUE;
+            for (ServerPlayer player : level.players()) {
+                long dx = (long) cp.x - player.chunkPosition().x;
+                long dz = (long) cp.z - player.chunkPosition().z;
+                nearest = Math.min(nearest, dx * dx + dz * dz);
+            }
+            if (!level.players().isEmpty()
+                    && nearest > (long) TIMEJUMP_IMMEDIATE_RADIUS * TIMEJUMP_IMMEDIATE_RADIUS) {
+                PersistentChunkRefreshIndex.markChunkDeferred(cp.x, cp.z);
+                deferred++;
+                continue;
+            }
+            if (va >= TIMEJUMP_IMMEDIATE_MAX
+                    || (activeInstance.getWorldConfig().hasAnyStructures()
+                    && sa >= TIMEJUMP_IMMEDIATE_MAX)) {
+                PersistentChunkRefreshIndex.markChunkDeferred(cp.x, cp.z);
+                deferred++;
+                continue;
+            }
+            PersistentChunkRefreshIndex.markChunkRefreshQueued(cp.x, cp.z);
             if(qv(cp))va++;
             if(activeInstance.getWorldConfig()
                     .hasAnyStructures()
                     &&qs(cp))sa++;
         }
         LOGGER.info(
-            "Scheduled refresh: +{}veg +{}struct"
+            "Scheduled refresh: +{}veg +{}struct deferred={}"
             +" loadedNow={} queued={}",
-            va,sa,
+            va,sa,deferred,
             PersistentChunkRefreshIndex
                 .getLoadedChunkCount(),
             getRefreshQueueSize());}
@@ -402,7 +508,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
             BlockState s=level.getBlockState(pos);
             if(s.isAir())continue;
             if(isTreeOrVegetation(s))
-                level.setBlock(pos,AIR,3);
+                setHistoricalBlock(level, pos,AIR,3);
             else break;
         }
         pos.set(bx,groundY,bz);
@@ -411,60 +517,22 @@ public class TerraChunkGenerator extends ChunkGenerator {
             pos.set(bx,groundY+1,bz);
             if(level.getBlockState(pos).isAir()){
                 pos.set(bx,groundY,bz);
-                level.setBlock(pos,GRASS,3);
+                setHistoricalBlock(level, pos,GRASS,3);
             }
         }
     }
 
     // ── CLEAR CHUNK BOUNDARY ORPHANS ──────────────────────────
+    /**
+     * Boundary reconciliation is intentionally dormant until the ownership
+     * model is finished. A previous refresh-neighbour implementation expanded
+     * indefinitely as newly loaded chunks queued their own unloaded edges.
+     * Never force-load, invalidate, or cascade-refresh neighbours here.
+     */
     private static void clearBoundaryOrphans(
             net.minecraft.server.level.ServerLevel level,
             int chunkX,int chunkZ){
-        int[][] neighbors={
-            {chunkX-1,chunkZ},
-            {chunkX+1,chunkZ},
-            {chunkX,chunkZ-1},
-            {chunkX,chunkZ+1}};
-        for(int[] nb:neighbors){
-            int nx=nb[0],nz=nb[1];
-            if(!level.hasChunk(nx,nz))continue;
-            int bx0,bz0,bx1,bz1;
-            if(nx==chunkX-1){
-                bx0=nx*16+15;bx1=bx0;
-                bz0=nz*16;bz1=nz*16+15;
-            }else if(nx==chunkX+1){
-                bx0=nx*16;bx1=bx0;
-                bz0=nz*16;bz1=nz*16+15;
-            }else if(nz==chunkZ-1){
-                bx0=nx*16;bx1=nx*16+15;
-                bz0=nz*16+15;bz1=bz0;
-            }else{
-                bx0=nx*16;bx1=nx*16+15;
-                bz0=nz*16;bz1=bz0;
-            }
-            BlockPos.MutableBlockPos pos=
-                new BlockPos.MutableBlockPos();
-            LevelChunk nch=level.getChunk(nx,nz);
-            for(int bx=bx0;bx<=bx1;bx++){
-                for(int bz=bz0;bz<=bz1;bz++){
-                    int lx=bx-(nx*16);
-                    int lz=bz-(nz*16);
-                    int sy=nch.getHeight(
-                        Heightmap.Types.WORLD_SURFACE,
-                        lx,lz);
-                    for(int y=sy;
-                            y<=Math.min(sy+30,XY-1);
-                            y++){
-                        pos.set(bx,y,bz);
-                        BlockState s=
-                            level.getBlockState(pos);
-                        if(s.isAir())continue;
-                        if(isTreeBlock(s))
-                            level.setBlock(pos,AIR,3);
-                    }
-                }
-            }
-        }
+        // Ownership/deferred-boundary processing is postponed by design.
     }
 
     // ── SEND CHUNK TO CLIENT ──────────────────────────────────
@@ -571,6 +639,20 @@ public class TerraChunkGenerator extends ChunkGenerator {
                     mxLa=Math.max(mxLa,g[1]);
                     mnLo=Math.min(mnLo,g[0]);
                     mxLo=Math.max(mxLo,g[0]);}
+
+            // Historical refresh must use the same OHM → OSM → VIDA →
+            // Microsoft accepted result as async placement, never raw OSM.
+            if (worldConfig.timeEnabled) {
+                AsyncStructureManager async = getAsyncManager();
+                List<OsmStructureIndex.OsmStructure> accepted = async
+                        .getCompletedStructures((mnLa + mxLa) / 2,
+                                (mnLo + mxLo) / 2,
+                                mnLa, mxLa, mnLo, mxLo);
+                if (accepted != null) return accepted;
+                async.queueRetry((mnLa + mxLa) / 2,
+                        (mnLo + mxLo) / 2, ch.getPos().x, ch.getPos().z);
+                return null;
+            }
 
             // Are the OSM tiles already resident? areTilesLoaded() is a pure
             // map lookup and never touches the network.
@@ -795,6 +877,22 @@ public class TerraChunkGenerator extends ChunkGenerator {
     public void drainRefreshQueue(
             net.minecraft.server.level.ServerLevel level){
 
+        // Water source downloads complete on AsyncWaterManager workers. Only
+        // this server-thread drain mutates blocks in the now-ready chunks.
+        if (asyncWaterManager != null) {
+            for (int i = 0; i < 2; i++) {
+                ChunkPos waterPos = asyncWaterManager.pollReady();
+                if (waterPos == null) break;
+                try {
+                    if (level.hasChunk(waterPos.x, waterPos.z))
+                        scheduleSingleChunkRefresh(level, waterPos);
+                } catch (Exception e) {
+                    LOGGER.debug("Async water placement [{},{}]: {}",
+                            waterPos.x, waterPos.z, e.getMessage());
+                }
+            }
+        }
+
         // ── PASS 1: VEGETATION ONLY ──────────────────────────
     int refreshLimit =
         TerraChunkGenerator
@@ -817,7 +915,6 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 LevelChunk ch=
                     level.getChunk(pos.x,pos.z);
                 long k=ck(pos.x,pos.z);
-
                 // Fetch structures for tree clearing in footprints only.
                 //
                 // NON-BLOCKING. This runs on the server tick thread, so it
@@ -843,13 +940,40 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 }
 
                 // Vegetation pass — clears trees at
-                // structure footprints, no road placement
-                refreshChunkForYear(level,ch,structs);
+                // structure footprints, no road placement. Target source data
+                // is resident now, so it is safe to remove old tracked blocks.
+                if (!GeneratedBlockOwnershipIndex.clearOwnedBlocks(level, pos)) {
+                    if (queuedVegRefresh.add(rk(pos.x,pos.z)))
+                        refreshQueue.offer(pos);
+                    PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
+                    vp++; continue;
+                }
+                PersistentChunkRefreshIndex.markChunkRefreshing(pos.x, pos.z);
+                beginHistoricalWriteCapture();
+                if (!refreshChunkForYear(level,ch,structs)) {
+                    // Projection/data readiness failed. Keep the durable year
+                    // stale and retry rather than losing this refresh entry.
+                    if (queuedVegRefresh.add(rk(pos.x,pos.z)))
+                        refreshQueue.offer(pos);
+                    endHistoricalWriteCapture();
+                    PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
+                    vp++; continue;
+                }
 
-                if(!worldConfig.hasAnyStructures())
-                    PersistentChunkRefreshIndex
-                        .markChunkRefreshed(
-                            level,pos.x,pos.z);
+                refreshOwnershipCache.put(k, endHistoricalWriteCapture());
+                vegetationPhaseComplete.add(rk(pos.x,pos.z));
+                if(!worldConfig.hasAnyStructures()) {
+                    vegetationPhaseComplete.remove(rk(pos.x,pos.z));
+                    if (GeneratedBlockOwnershipIndex.commit(level, pos,
+                            refreshOwnershipCache.remove(k))) {
+                        PersistentChunkRefreshIndex
+                            .markChunkRefreshed(level,pos.x,pos.z);
+                    } else {
+                        if (queuedVegRefresh.add(rk(pos.x,pos.z)))
+                            refreshQueue.offer(pos);
+                        PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
+                    }
+                }
 
                 clearBoundaryOrphans(level,
                     pos.x,pos.z);
@@ -857,6 +981,10 @@ public class TerraChunkGenerator extends ChunkGenerator {
             }catch(Exception e){
                 LOGGER.debug("VegRefresh [{},{}]: {}",
                     pos.x,pos.z,e.getMessage());
+                endHistoricalWriteCapture();
+                if (queuedVegRefresh.add(rk(pos.x,pos.z)))
+                    refreshQueue.offer(pos);
+                PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
             }
             vp++;
         }
@@ -880,17 +1008,36 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         sp++;continue;}
                     LevelChunk ch=
                         level.getChunk(pos.x,pos.z);
+                    long refreshKey = rk(pos.x,pos.z);
+                    // Pass 2 is not allowed to commit the durable year before
+                    // pass 1 completed. This prevents a fast structure cache
+                    // hit from skipping vegetation/tree cleanup.
+                    if (!vegetationPhaseComplete.contains(refreshKey)) {
+                        if (queuedStructRefresh.add(refreshKey))
+                            structureRefreshQueue.offer(pos);
+                        sp++; continue;
+                    }
+                    PersistentChunkRefreshIndex.markChunkRefreshing(pos.x, pos.z);
                     boolean ok=
                         refreshStructuresForChunk(
                             level,ch);
-                    if(ok)
+                    if(ok) {
+                        vegetationPhaseComplete.remove(refreshKey);
                         PersistentChunkRefreshIndex
                             .markChunkRefreshed(
                                 level,pos.x,pos.z);
+                    } else {
+                        if (queuedStructRefresh.add(refreshKey))
+                            structureRefreshQueue.offer(pos);
+                        PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
+                    }
                 }catch(Exception e){
                     LOGGER.debug(
                         "StructRefresh [{},{}]: {}",
                         pos.x,pos.z,e.getMessage());
+                    if (queuedStructRefresh.add(rk(pos.x,pos.z)))
+                        structureRefreshQueue.offer(pos);
+                    PersistentChunkRefreshIndex.markChunkRefreshFailed(pos.x, pos.z);
                 }
                 sp++;
             }
@@ -908,20 +1055,23 @@ public class TerraChunkGenerator extends ChunkGenerator {
     // Called at the top of refreshChunkForYear() before
     // vegetation or structure placement.
 
-        public void syncHistoricalWaterPublic(
+        public boolean syncHistoricalWaterPublic(
             net.minecraft.server.level.ServerLevel level,
             net.minecraft.world.level.chunk.LevelChunk ch) {
-        if (!worldConfig.waterBodies) return;
-        syncHistoricalWater(level, ch);
+        if (!worldConfig.waterBodies) return true;
+        return syncHistoricalWater(level, ch);
     }
 
-    public void syncHistoricalWater(
+    /** @return true only when all water source decisions needed by this chunk
+     * are resident; false keeps the refresh transaction stale for retry. */
+    public boolean syncHistoricalWater(
             net.minecraft.server.level.ServerLevel level,
             LevelChunk ch) {
         try {
             var d = getDf();
             if (d == null || !d.isProjectionLoaded())
-                return;
+                return false;
+            boolean pendingWater = false;
 
             var rle  = getRle();
             var esa  = getWorldCover();
@@ -933,6 +1083,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
             BlockPos.MutableBlockPos pos =
                 new BlockPos.MutableBlockPos();
 
+            int placedColumns = 0;
             int drainedColumns = 0;
 
             for (int lx = 0; lx < 16; lx++) {
@@ -980,7 +1131,9 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         }
                     }
 
-                    if (!hasWater) continue;
+                    // Do not require existing water here. A time jump can make
+                    // an OHM/OSM water feature appear on terrain that was land
+                    // in the previous year.
 
                     // ── GEO LOOKUP ────────────────────
                     double[] geo = d.toGeo(bx, bz);
@@ -1019,19 +1172,41 @@ public class TerraChunkGenerator extends ChunkGenerator {
                     }
 
                     // ── CHECK CURRENT-YEAR WATER ──────
-                    // If current year still says water
-                    // here, keep it — do not drain
-                    try {
-                        WaterBodyInfo wb =
-                            rle.analyze(bx, bz,
-                                lat, lon, baseElev);
-                        if (wb != null && wb.isWater)
-                            continue;
-                    } catch (Exception e) {
-                        // Query failed — be cautious,
-                        // do not drain
+                    // Never interpret an absent source tile as "no water".
+                    // Trigger a non-blocking prefetch and leave this column
+                    // unchanged until a later refresh can make a real decision.
+                    boolean ohmCached = rle.getOhmWaterIndex().isTileCached(
+                            rle.getOhmWaterIndex().getTileKeyPublic(lat, lon));
+                    boolean osmCached = rle.getOsmWaterIndex().isTileCached(
+                            rle.getOsmWaterIndex().getTileKeyPublic(lat, lon));
+                    if (!ohmCached && !osmCached) {
+                        // A missing source tile is PENDING, never proof of
+                        // dry land. AsyncWaterManager retries it and requeues
+                        // this chunk once a real OSM/OHM result is available.
+                        getAsyncWaterManager().request(lat, lon, ch.getPos());
+                        pendingWater = true;
                         continue;
                     }
+
+                    WaterBodyInfo currentWater;
+                    try {
+                        currentWater = rle.analyze(bx, bz, lat, lon, baseElev);
+                    } catch (Exception e) {
+                        // Query failed — be cautious, do not alter terrain.
+                        continue;
+                    }
+
+                    // Water exists in the target year: carve any previous
+                    // elevation terrain and build its current mapped bed/water
+                    // column. This also refreshes a body that already existed.
+                    if (currentWater != null && currentWater.isWater) {
+                        if (placeHistoricalMappedWater(level, ch, bx, bz, lx, lz,
+                                currentWater, baseElev, mb)) placedColumns++;
+                        continue;
+                    }
+
+                    // No current mapped water and no old water to remove.
+                    if (!hasWater) continue;
 
                     // ── DECIDE REPLACEMENT BLOCK ──────
                     // For built-up areas at modern
@@ -1102,13 +1277,13 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         if (y == waterTopY) {
                             // Top of the water column
                             // becomes the surface block
-                            level.setBlock(
+                            setHistoricalBlock(level,
                                 pos,
                                 replacementTop, 3);
                         } else {
                             // Everything below becomes
                             // fill material
-                            level.setBlock(
+                            setHistoricalBlock(level,
                                 pos,
                                 replacementFill, 3);
                         }
@@ -1130,7 +1305,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                                 || bs.is(Blocks.KELP)
                                 || bs.is(
                                     Blocks.KELP_PLANT))
-                            level.setBlock(
+                            setHistoricalBlock(level,
                                 pos,
                                 AIR, 3);
                         else break;
@@ -1150,7 +1325,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                                 || bs.is(Blocks.KELP)
                                 || bs.is(
                                     Blocks.KELP_PLANT))
-                            level.setBlock(
+                            setHistoricalBlock(level,
                                 pos,
                                 replacementFill, 3);
                     }
@@ -1159,7 +1334,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 }
             }
 
-            if (drainedColumns > 0) {
+            if (placedColumns + drainedColumns > 0) {
                 // Force heightmap recalculation so
                 // the vegetation pass sees the correct
                 // surface Y after water conversion.
@@ -1188,20 +1363,71 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 }
 
                 LOGGER.debug(
-                    "syncWater [{},{}]: converted "
-                    + "{} columns "
+                    "syncWater [{},{}]: placed={} drained={} "
                     + "(builtUp={}) year={}",
                     ch.getPos().x, ch.getPos().z,
-                    drainedColumns,
+                    placedColumns, drainedColumns,
                     isBuiltUpChunk(ch, esa, d),
                     currentYear);
             }
+            return !pendingWater;
 
         } catch (Exception e) {
             LOGGER.debug(
                 "syncHistoricalWater [{},{}]: {}",
                 ch.getPos().x, ch.getPos().z,
                 e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Applies a source-confirmed OHM/OSM water body to an existing chunk after
+     * a time jump. Terrain is removed only within the feature's water column;
+     * recognised structure blocks are retained (for example bridge decks).
+     */
+    private boolean placeHistoricalMappedWater(
+            net.minecraft.server.level.ServerLevel level, LevelChunk chunk,
+            int blockX, int blockZ, int localX, int localZ,
+            WaterBodyInfo water, double elevation, int minBuildY) {
+        try {
+            int surfaceY = water.waterSurfaceY > 0 ? water.waterSurfaceY
+                    : TerraDensityFunctions.elevMetersToSurfaceY(elevation, true);
+            surfaceY = Math.max(minBuildY + 2, Math.min(XY - 1, surfaceY));
+            int floorY = Math.max(minBuildY + 1,
+                    surfaceY - Math.max(2, water.profileDepthBlocks()));
+            int topY = Math.min(XY, Math.max(surfaceY,
+                    chunk.getHeight(Heightmap.Types.WORLD_SURFACE, localX, localZ)));
+            BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+            // Remove the old elevation column, plants, and stale water above
+            // the new floor. Structures are deliberately left in place.
+            for (int y = floorY + 1; y <= topY; y++) {
+                pos.set(blockX, y, blockZ);
+                BlockState state = level.getBlockState(pos);
+                if (!isStructBlock(state) && !state.isAir())
+                    setHistoricalBlock(level, pos, AIR, 3);
+            }
+
+            int hash = TerraDensityFunctions.blockHash(blockX, blockZ);
+            BlockState bed = water.isRiver()
+                    ? (hash % 3 == 0 ? SAND : GRAVEL)
+                    : (water.edgeFactor < 0.3 ? CLAY : GRAVEL);
+            for (int y = Math.max(minBuildY + 1, floorY - 3); y <= floorY; y++) {
+                pos.set(blockX, y, blockZ);
+                if (!isStructBlock(level.getBlockState(pos)))
+                    setHistoricalBlock(level, pos, bed, 3);
+            }
+            for (int y = floorY + 1; y <= surfaceY; y++) {
+                pos.set(blockX, y, blockZ);
+                if (!isStructBlock(level.getBlockState(pos)))
+                    setHistoricalBlock(level, pos, WATER, 3);
+            }
+            return true;
+        } catch (Exception e) {
+            LOGGER.debug("Historical water placement [{},{}]: {}",
+                    blockX, blockZ, e.getMessage());
+            return false;
         }
     }
 
@@ -1249,8 +1475,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
             // Must run before vegetation so drained
             // areas get proper surface restoration
             // before trees/grass are placed on them.
-            if (worldConfig.waterBodies) {
-                syncHistoricalWater(level, ch);
+            if (worldConfig.waterBodies && !syncHistoricalWater(level, ch)) {
+                return false;
             }
 
             var esa = getWorldCover();
@@ -1373,7 +1599,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         level.getBlockState(pos);
                     if (isYearSensitiveVegetation(
                             above))
-                        level.setBlock(pos, AIR, 3);
+                        setHistoricalBlock(level, pos, AIR, 3);
 
                     if (!level.getBlockState(pos)
                             .isAir())
@@ -1445,7 +1671,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                                 if (level
                                     .getBlockState(pos)
                                     .isAir())
-                                    level.setBlock(pos,
+                                    setHistoricalBlock(level, pos,
                                         Blocks
                                         .MOSS_CARPET
                                         .defaultBlockState(),
@@ -1536,9 +1762,9 @@ private static int findGroundY(
                         // Restore natural surface at
                         // ground level
                         if(y==groundY){
-                            level.setBlock(pos,GRASS,3);
+                            setHistoricalBlock(level, pos,GRASS,3);
                         }else{
-                            level.setBlock(pos,AIR,3);
+                            setHistoricalBlock(level, pos,AIR,3);
                         }
                     }
                 }
@@ -1612,6 +1838,46 @@ private static int findGroundY(
         return false;
     }
 
+    /** Log only real repeated successful placements in the same target chunk
+     * and time-jump generation. This catches duplicate-building regressions
+     * without treating a building spilling into a neighbour as a duplicate. */
+    public static void placementDuplicateTest(ChunkPos chunk,
+            List<OsmStructureIndex.OsmStructure> structures) {
+        if (structures == null || structures.isEmpty()) return;
+        if (successfulPlacementSignatures.size() > PLACEMENT_TEST_MAX)
+            successfulPlacementSignatures.clear();
+        long generation = PersistentChunkRefreshIndex.getGeneration();
+        int year = TerraTimeManager.getCurrentYear();
+        Set<String> batch = new HashSet<>();
+        int repeated = 0;
+        for (OsmStructureIndex.OsmStructure s : structures) {
+            String feature;
+            if (s.osmId != 0L) feature = "osm:" + s.osmId;
+            else feature = "geo:" + Math.round(s.minLat * 1_000_000d) + ":"
+                    + Math.round(s.minLon * 1_000_000d) + ":"
+                    + Math.round(s.maxLat * 1_000_000d) + ":"
+                    + Math.round(s.maxLon * 1_000_000d);
+            String key = generation + ":" + year + ":" + chunk.x + ":" + chunk.z
+                    + ":" + s.type + ":" + feature;
+            if (!batch.add(key)) {
+                LOGGER.warn("PLACEMENT_TEST duplicate input chunk=[{},{}] feature={} type={}",
+                        chunk.x, chunk.z, feature, s.type);
+                continue;
+            }
+            Long first = successfulPlacementSignatures.putIfAbsent(key,
+                    System.currentTimeMillis());
+            if (first != null) {
+                repeated++;
+                LOGGER.warn("PLACEMENT_TEST DUPLICATE_SUCCESS chunk=[{},{}] feature={} type={} year={} generation={} firstAgeMs={}",
+                        chunk.x, chunk.z, feature, s.type, year, generation,
+                        Math.max(0L, System.currentTimeMillis() - first));
+            }
+        }
+        if (repeated == 0)
+            LOGGER.debug("PLACEMENT_TEST success chunk=[{},{}] features={} year={} generation={}",
+                    chunk.x, chunk.z, batch.size(), year, generation);
+    }
+
 // ── UPDATED Pass 2: ALL STRUCTURES (ROADS + BUILDINGS) ──
 private boolean refreshStructuresForChunk(
         net.minecraft.server.level.ServerLevel level,
@@ -1637,8 +1903,19 @@ private boolean refreshStructuresForChunk(
             all = fetchStructuresCachedOnly(level, ch);
             if (all == null) return false;
         }
-        if (all.isEmpty()) return true;
+        if (all.isEmpty()) {
+            // Pass 1 already cleared prior ownership and may have written
+            // water/vegetation. Preserve those writes as this year's ledger.
+            List<GeneratedBlockOwnershipIndex.OwnedBlock> transactionWrites =
+                refreshOwnershipCache.remove(k);
+            if (!GeneratedBlockOwnershipIndex.commit(level, ch.getPos(), transactionWrites))
+                return false;
+            ch.setUnsaved(true);
+            return true;
+        }
 
+        // Prior owned content was cleared when pass 1 began the transaction.
+        // Pass 2 only appends its exact final writes before committing.
         int cmx = ch.getPos().getMinBlockX();
         int cmz = ch.getPos().getMinBlockZ();
         
@@ -1681,10 +1958,29 @@ for (int lx = 0; lx < 16; lx++) {
         // Note: The OsmStructureGenerator needs to be aware of the water check.
         // We pass the TerrainInfo to the generator or rely on the generator's 
         // internal check which we should now ensure mirrors this logic.
-        boolean ok = getStructureGenerator()
-            .generateStructuresFromList(ch, all);
+        OsmStructureGenerator structureGenerator = getStructureGenerator();
+        structureGenerator.beginOwnershipCapture();
+        boolean ok;
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> owned;
+        try {
+            ok = structureGenerator.generateStructuresFromList(ch, all);
+        } finally {
+            owned = structureGenerator.endOwnershipCapture();
+        }
 
         if (!ok) return false;
+
+        placementDuplicateTest(ch.getPos(), all);
+
+        // The durable ledger is committed only after the generator reports a
+        // complete placement. A crash/retry therefore cannot mark a partial
+        // structure as current-year content.
+        List<GeneratedBlockOwnershipIndex.OwnedBlock> transactionWrites =
+            refreshOwnershipCache.remove(k);
+        if (transactionWrites == null) transactionWrites = new ArrayList<>();
+        transactionWrites.addAll(owned);
+        if (!GeneratedBlockOwnershipIndex.commit(level, ch.getPos(), transactionWrites))
+            return false;
 
         // Placement succeeded, so the cached structures are no longer needed.
         // (They are only released here; a failed placement keeps them so the
@@ -1714,7 +2010,7 @@ for (int lx = 0; lx < 16; lx++) {
             BlockState s=level.getBlockState(pos);
             if(s.isAir())continue;
             if(isTreeBlock(s))
-                level.setBlock(pos,AIR,3);
+                setHistoricalBlock(level, pos,AIR,3);
             else break;
         }
     }
@@ -1846,6 +2142,19 @@ for (int lx = 0; lx < 16; lx++) {
             if(rle==null)rle=
                 new RiverLakeEngine(getDf());}
         return rle;}
+    private AsyncWaterManager getAsyncWaterManager(){
+        if(asyncWaterManager==null)synchronized(this){
+            if(asyncWaterManager==null){
+                RiverLakeEngine water=getRle();
+                asyncWaterManager=new AsyncWaterManager(
+                    water.getOsmWaterIndex(), water.getOhmWaterIndex());
+                LOGGER.info("AsyncWaterManager init");}}
+        return asyncWaterManager;}
+
+    public void shutdownAsyncWater(){
+        AsyncWaterManager water=asyncWaterManager;
+        if(water!=null)water.shutdown();
+    }
     private TerraBiomeProvider getTerraBiomes(){
         if(terraBiomes==null)synchronized(this){
             if(terraBiomes==null)try{
@@ -1899,6 +2208,7 @@ for (int lx = 0; lx < 16; lx++) {
         if(asyncManager==null)synchronized(this){
             if(asyncManager==null){
                 asyncManager=new AsyncStructureManager(
+                    getOhmIndex(),
                     getStructureIndex(),
                     getOvertureIndex(),
                     getStructureGenerator(),getDf(),
@@ -2327,6 +2637,7 @@ for (int lx = 0; lx < 16; lx++) {
                 boolean success=getStructureGenerator()
                     .generateStructuresFromList(ch,all);
                 if(success){
+                    placementDuplicateTest(ch.getPos(), all);
                     markDecorationPlaced(ch);
                     markCurrentYear=true;
                 }else{
@@ -3682,19 +3993,15 @@ for (int lx = 0; lx < 16; lx++) {
                 double ce=d.getElevationFast(cLa,cLo);
                 if(worldConfig.waterBodies
                         &&ce>-200.0&&ce<5000.0){
-                    // Wait for BOTH OHM and OSM tiles
-                    boolean ohmLoaded=
-                        r.getOhmWaterIndex()
-                        .getTileBlocking(cLa,cLo,
-                            WATER_TILE_WAIT_MS);
-                    boolean osmLoaded=
-                        r.getOsmWaterIndex()
-                        .getTileBlocking(cLa,cLo,
-                            WATER_TILE_WAIT_MS/2);
-                    // Water data available if OHM
-                    // loaded (primary source).
-                    // OSM is fallback so not required.
-                    waterDataAvailable=ohmLoaded;
+                    // Never wait for public Overpass while generating a
+                    // chunk. Terrain remains provisional and AsyncWaterManager
+                    // requeues it for authoritative water placement once its
+                    // geographic source tile is ready.
+                    getAsyncWaterManager().request(cLa,cLo,ch.getPos());
+                    waterDataAvailable = r.getOhmWaterIndex().isTileCached(
+                        r.getOhmWaterIndex().getTileKeyPublic(cLa,cLo))
+                        || r.getOsmWaterIndex().isTileCached(
+                        r.getOsmWaterIndex().getTileKeyPublic(cLa,cLo));
                     r.prefetch(cLa,cLo);}
                 getWorldCover().prefetch(cLa,cLo);
                 // OSM/Overture structure tiles were NOT prefetched here, so
@@ -3709,7 +4016,15 @@ for (int lx = 0; lx < 16; lx++) {
                     double m=STRUCT_PREFETCH_DEG;
                     getStructureIndex().prefetchTiles(
                         cLa-m,cLa+m,cLo-m,cLo+m);
-                    if(worldConfig.overtureBuildings){
+                    // Microsoft is a present-day ML source. Do not even
+                    // prefetch its heavy index/tile data when the historical
+                    // year is definitely earlier than this region's population
+                    // floor; HistoricalStructureManager will make the same
+                    // eligibility decision before lower-tier downloads.
+                    boolean overtureEligible = !worldConfig.timeEnabled
+                        || TerraTimeManager.getCurrentYear() >=
+                            StructureDateEstimator.getPopulationFloor(cLa, cLo);
+                    if(worldConfig.overtureBuildings && overtureEligible){
                         var ov=getOvertureIndex();
                         if(ov.isEnabled())
                             ov.prefetchTiles(
@@ -3849,6 +4164,10 @@ for (int lx = 0; lx < 16; lx++) {
 
         reclassWB(cols,ht,osy,mb);
         smoothBSW(cols,ht);
+        // Terrace both sides of every water boundary. Each horizontal block
+        // changes by at most one vertical block: terrain slopes into the
+        // shoreline while river, lake, and ocean floors slope away from it.
+        applyFloorTransitions(cols,ht,osy,mb);
         for(int ps=0;ps<12;ps++){
             boolean chg=false;
             int s=ps%2==0?1:G-2;
@@ -3949,6 +4268,132 @@ for (int lx = 0; lx < 16; lx++) {
             LOGGER.error("Chunk [{},{}] FAILED: {}",
                 ch.getPos().x,ch.getPos().z,
                 ex.getMessage());}}
+
+    /**
+     * Creates one-by-one terraced transitions at water boundaries.
+     *
+     * Land is carved outward from the shoreline at +1 Y per horizontal block.
+     * Underwater floors are raised from the edge inward at -1 Y per horizontal
+     * block. This removes the abrupt vertical wall between the elevation floor
+     * and river/lake/ocean floors without changing the water surface itself.
+     */
+    private void applyFloorTransitions(
+            TerraDensityFunctions.TerrainColumn[][] cols,
+            int[][] ht, int[][] osy, int minBuildY) {
+        boolean[][] water = new boolean[G][G];
+        boolean[][] terrain = new boolean[G][G];
+        boolean[][] changedTerrain = new boolean[G][G];
+
+        for (int x = 0; x < G; x++) for (int z = 0; z < G; z++) {
+            var type = cols[x][z].type;
+            water[x][z] = isTransitionWater(type);
+            terrain[x][z] = type == TerraDensityFunctions.TerrainType.LAND
+                    || type == TerraDensityFunctions.TerrainType.RIVER_BANK
+                    || type == TerraDensityFunctions.TerrainType.LAKE_SHORE;
+        }
+
+        // Water-floor edge: preserve a two-block minimum depth, then let the
+        // floor descend one block per water cell towards its natural depth.
+        for (int x = 1; x < G - 1; x++) for (int z = 1; z < G - 1; z++) {
+            if (!water[x][z]) continue;
+            boolean edge = false;
+            for (int i = 0; i < 4; i++)
+                if (!water[x + BDX[i]][z + BDZ[i]]) { edge = true; break; }
+            if (!edge) continue;
+            int surface = transitionWaterSurface(cols[x][z].type, osy[x][z]);
+            int edgeFloor = Math.max(minBuildY + 1, surface - 2);
+            ht[x][z] = Math.max(ht[x][z], edgeFloor);
+        }
+        for (int pass = 0; pass < B - 1; pass++) {
+            int[][] next = copyHeights(ht);
+            boolean any = false;
+            for (int x = 1; x < G - 1; x++) for (int z = 1; z < G - 1; z++) {
+                if (!water[x][z]) continue;
+                int surface = transitionWaterSurface(cols[x][z].type, osy[x][z]);
+                int desired = ht[x][z];
+                for (int i = 0; i < 4; i++) {
+                    int nx = x + BDX[i], nz = z + BDZ[i];
+                    if (!water[nx][nz]) continue;
+                    // A neighbour one block higher may only descend by one.
+                    desired = Math.max(desired, ht[nx][nz] - 1);
+                }
+                desired = Math.min(desired, surface - 2);
+                if (desired > next[x][z]) { next[x][z] = desired; any = true; }
+            }
+            ht = copyInto(next, ht);
+            if (!any) break;
+        }
+
+        // Direct shoreline terrain becomes one block above the water surface.
+        for (int x = 1; x < G - 1; x++) for (int z = 1; z < G - 1; z++) {
+            if (!terrain[x][z]) continue;
+            int surface = Integer.MIN_VALUE;
+            for (int i = 0; i < 4; i++) {
+                int nx = x + BDX[i], nz = z + BDZ[i];
+                if (water[nx][nz]) surface = Math.max(surface,
+                        transitionWaterSurface(cols[nx][nz].type, osy[nx][nz]));
+            }
+            if (surface == Integer.MIN_VALUE) continue;
+            int bank = Math.max(minBuildY + 2, Math.min(XY - 1, surface + 1));
+            if (ht[x][z] > bank) {
+                ht[x][z] = bank;
+                osy[x][z] = bank;
+                changedTerrain[x][z] = true;
+            }
+        }
+
+        // Continue that bank outward: one horizontal block equals one vertical
+        // block, until it naturally meets the original elevation terrain.
+        for (int pass = 0; pass < B - 1; pass++) {
+            int[][] next = copyHeights(ht);
+            boolean[][] nextChanged = new boolean[G][G];
+            boolean any = false;
+            for (int x = 1; x < G - 1; x++) for (int z = 1; z < G - 1; z++) {
+                if (!terrain[x][z] || changedTerrain[x][z]) continue;
+                int best = Integer.MAX_VALUE;
+                for (int i = 0; i < 4; i++) {
+                    int nx = x + BDX[i], nz = z + BDZ[i];
+                    if (changedTerrain[nx][nz]) best = Math.min(best, ht[nx][nz] + 1);
+                }
+                if (best != Integer.MAX_VALUE && ht[x][z] > best) {
+                    next[x][z] = best;
+                    nextChanged[x][z] = true;
+                    any = true;
+                }
+            }
+            ht = copyInto(next, ht);
+            for (int x = 1; x < G - 1; x++) for (int z = 1; z < G - 1; z++)
+                if (nextChanged[x][z]) { changedTerrain[x][z] = true; osy[x][z] = ht[x][z]; }
+            if (!any) break;
+        }
+    }
+
+    private static boolean isTransitionWater(TerraDensityFunctions.TerrainType type) {
+        return type == TerraDensityFunctions.TerrainType.RIVER
+                || type == TerraDensityFunctions.TerrainType.LAKE
+                || type == TerraDensityFunctions.TerrainType.BELOW_SEA_WATER
+                || type == TerraDensityFunctions.TerrainType.SHALLOW_WATER
+                || type == TerraDensityFunctions.TerrainType.OCEAN;
+    }
+
+    private static int transitionWaterSurface(
+            TerraDensityFunctions.TerrainType type, int storedSurface) {
+        return type == TerraDensityFunctions.TerrainType.OCEAN
+                || type == TerraDensityFunctions.TerrainType.SHALLOW_WATER
+                ? SL : storedSurface;
+    }
+
+    private static int[][] copyHeights(int[][] source) {
+        int[][] copy = new int[G][G];
+        for (int x = 0; x < G; x++) System.arraycopy(source[x], 0, copy[x], 0, G);
+        return copy;
+    }
+
+    // Copy values back to the original height grid; callers retain its reference.
+    private static int[][] copyInto(int[][] from, int[][] into) {
+        for (int x = 0; x < G; x++) System.arraycopy(from[x], 0, into[x], 0, G);
+        return into;
+    }
 
     // ── WATER FAILSAFE ────────────────────────────────────────
     private void applyDepressionFallback(
@@ -4091,17 +4536,17 @@ for (int lx = 0; lx < 16; lx++) {
             Double.longBitsToDouble(entry[2]);
         var r2=getRle();
 
-        // Retry OHM first (primary source)
-        boolean ohmLoaded=
-            r2.getOhmWaterIndex()
-            .getTileBlocking(cLa,cLo,250L);
-        // Also try OSM (fallback)
-        boolean osmLoaded=
-            r2.getOsmWaterIndex()
-            .getTileBlocking(cLa,cLo,250L);
-
-        // Need at least OHM loaded to proceed
-        if(!ohmLoaded&&!osmLoaded)return;
+        // Never wait for remote Overpass in a generation retry.  Subscribe the
+        // chunk to the shared async geographic-tile task and return; its ready
+        // queue will perform authoritative placement on the server thread.
+        boolean ohmLoaded = r2.getOhmWaterIndex().isTileCached(
+            r2.getOhmWaterIndex().getTileKeyPublic(cLa, cLo));
+        boolean osmLoaded = r2.getOsmWaterIndex().isTileCached(
+            r2.getOsmWaterIndex().getTileKeyPublic(cLa, cLo));
+        if(!ohmLoaded&&!osmLoaded){
+            getAsyncWaterManager().request(cLa, cLo, ch.getPos());
+            return;
+        }
 
         waterRetryChunks.remove(k);
         int cx2=ch.getPos().getMinBlockX();

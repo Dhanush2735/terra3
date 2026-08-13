@@ -85,6 +85,10 @@ public class TerraPlusPlus {
         if (async != null) {
             async.shutdown();
         }
+        TerraChunkGenerator generator = TerraChunkGenerator.activeInstance;
+        if (generator != null) {
+            generator.shutdownAsyncWater();
+        }
 
         LOGGER.info("Terra++ shutdown complete");
     }

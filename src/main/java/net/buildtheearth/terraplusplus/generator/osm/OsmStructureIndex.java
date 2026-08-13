@@ -170,6 +170,8 @@ public class OsmStructureIndex {
         public final String          colour,
                                      roofColour;
         public final OsmNode[]       nodes;
+        /** Courtyard/island rings for area relations; empty for simple ways. */
+        public OsmNode[][]           innerRings = new OsmNode[0][];
         public final boolean         isArea, isOneWay,
                                      isPart, tunnel,
                                      isRailBridge;
@@ -297,7 +299,12 @@ public class OsmStructureIndex {
                 return false;
             if (!isArea || nodes.length < 3)
                 return false;
-            return pointInPolygon(lat, lon, nodes);
+            if (!pointInPolygon(lat, lon, nodes)) return false;
+            for (OsmNode[] ring : innerRings)
+                if (ring != null && ring.length >= 3
+                        && pointInPolygon(lat, lon, ring))
+                    return false;
+            return true;
         }
 
         public double distanceToLine(
@@ -415,9 +422,14 @@ public class OsmStructureIndex {
                 System.currentTimeMillis();
         }
 
+        /** A successful source response containing no structures. */
         public static final StructureTile EMPTY =
             new StructureTile(
                 new OsmStructure[0], true);
+        /** Source unavailable/timeout: callers must retry, never finalise empty. */
+        public static final StructureTile FAILED =
+            new StructureTile(
+                new OsmStructure[0], false);
     }
 
     // ── FIELDS ────────────────────────────────────────────────
@@ -495,7 +507,7 @@ public class OsmStructureIndex {
             return StructureTile.EMPTY;
         if (System.currentTimeMillis()
                 < pauseUntilMs)
-            return StructureTile.EMPTY;
+            return StructureTile.FAILED;
 
         long key = tileKey(lat, lon);
         StructureTile cached = memCache.get(key);
@@ -524,7 +536,7 @@ public class OsmStructureIndex {
             return future.get(TILE_WAIT_MS,
                 TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            return StructureTile.EMPTY;
+            return StructureTile.FAILED;
         }
     }
 
@@ -678,6 +690,14 @@ public class OsmStructureIndex {
                         "BLOCKING TIMEOUT resolved:"
                         + " all {} tiles loaded",
                         missingKeys.size());
+            }
+
+            // A failed/missing tile is retryable source state, not proof that
+            // this geographic area contains no structures.
+            for (long key : neededKeys) {
+                StructureTile tile = memCache.get(key);
+                if (tile == null || !tile.valid)
+                    return null;
             }
 
             return collectFromKeys(neededKeys,
@@ -905,7 +925,7 @@ public class OsmStructureIndex {
         if (System.currentTimeMillis()
                 < pauseUntilMs) {
             pending.remove(key);
-            return StructureTile.EMPTY;
+            return StructureTile.FAILED;
         }
 
         if (consecutiveFailures
@@ -920,7 +940,7 @@ public class OsmStructureIndex {
                 + PAUSE_ON_FAILURES_MS;
             consecutiveFailures = 0;
             pending.remove(key);
-            return StructureTile.EMPTY;
+            return StructureTile.FAILED;
         }
 
         String bbox = String.format(
@@ -941,6 +961,9 @@ public class OsmStructureIndex {
             + "way[\"railway\"~\"rail|light_rail"
             + "|subway|tram\"](" + bbox + ");"
             + "way[\"bridge\"](" + bbox + ");"
+            // Some mapped bridges are multipolygon/route relations whose
+            // member ways carry no individual bridge tag.
+            + "relation[\"bridge\"](" + bbox + ");"
             + "way[\"barrier\"~\"wall|fence|hedge\"]"
             + "(" + bbox + ");"
             + "way[\"landuse\"~\"farmland|forest"
@@ -970,11 +993,14 @@ public class OsmStructureIndex {
                 endpointLimiters[idx];
 
             HttpURLConnection conn = null;
+        boolean endpointInFlight = false;
             try {
                 // Acquire token for THIS endpoint.
                 // Threads using a different endpoint
                 // are completely unaffected.
                 limiter.acquire();
+                limiter.acquireInFlight();
+                endpointInFlight = true;
 
                 conn = (HttpURLConnection)
                     new URL(ep).openConnection();
@@ -1026,7 +1052,7 @@ public class OsmStructureIndex {
                         || code == 504) {
                     // Server-side rate limit —
                     // back off this endpoint
-                    limiter.reset();
+                    limiter.penalize(code == 429 ? 30_000L : 10_000L);
                     continue;
                 } else {
                     LOGGER.debug(
@@ -1036,19 +1062,20 @@ public class OsmStructureIndex {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 pending.remove(key);
-                return StructureTile.EMPTY;
+                return StructureTile.FAILED;
             } catch (Exception e) {
                 LOGGER.debug(
                     "Struct fetch failed: {}",
                     e.getMessage());
             } finally {
                 if (conn != null) conn.disconnect();
+                if (endpointInFlight) limiter.releaseInFlight();
             }
         }
 
         consecutiveFailures++;
         pending.remove(key);
-        return StructureTile.EMPTY;
+        return StructureTile.FAILED;
     }
 
     // ── PARSING ───────────────────────────────────────────────
@@ -1066,9 +1093,12 @@ public class OsmStructureIndex {
             List<OsmStructure> structures =
                 new ArrayList<>();
             for (JsonElement el : elements) {
-                OsmStructure s = parseElement(
-                    el.getAsJsonObject());
-                if (s != null) structures.add(s);
+                JsonObject obj = el.getAsJsonObject();
+                OsmStructure s = parseElement(obj);
+                if (s == null) continue;
+                List<OsmStructure> parts = splitRelationOuterParts(obj, s);
+                if (parts.isEmpty()) structures.add(s);
+                else structures.addAll(parts);
             }
             return new StructureTile(
                 structures.toArray(
@@ -1077,8 +1107,113 @@ public class OsmStructureIndex {
             LOGGER.warn(
                 "Structure parse failed: {}",
                 e.getMessage());
-            return StructureTile.EMPTY;
+            return StructureTile.FAILED;
         }
+    }
+
+    /**
+     * A multipolygon relation may contain several disconnected outer rings.
+     * The old parser flattened them into one artificial polygon, drawing walls
+     * across unrelated building parts. Represent each assembled outer ring as
+     * an independent placement structure instead.
+     */
+    private List<OsmStructure> splitRelationOuterParts(
+            JsonObject obj, OsmStructure base) {
+        if (!base.isArea || !obj.has("members")) return List.of();
+        List<List<OsmNode>> rings = new ArrayList<>();
+        for (JsonElement memberEl : obj.getAsJsonArray("members")) {
+            JsonObject member = memberEl.getAsJsonObject();
+            String role = member.has("role") ? member.get("role").getAsString() : "";
+            if (!(role.isEmpty() || "outer".equals(role)) || !member.has("geometry")) continue;
+            List<OsmNode> segment = new ArrayList<>();
+            for (JsonElement pointEl : member.getAsJsonArray("geometry")) {
+                JsonObject point = pointEl.getAsJsonObject();
+                if (point.has("lat") && point.has("lon"))
+                    segment.add(new OsmNode(point.get("lat").getAsDouble(),
+                            point.get("lon").getAsDouble()));
+            }
+            if (segment.size() >= 2) appendRingSegment(rings, segment);
+        }
+        if (rings.size() <= 1) return List.of();
+        List<OsmStructure> parts = new ArrayList<>(rings.size());
+        int part = 0;
+        for (List<OsmNode> ring : rings) {
+            if (ring.size() < 3) continue;
+            OsmNode[] outer = ring.toArray(new OsmNode[0]);
+            OsmStructure partStructure = copyWithNodes(base, outer,
+                    part++ == 0 ? base.osmId : 0L);
+            // Keep only courtyard rings enclosed by this particular outer
+            // part. A relation with separate wings must not apply one wing's
+            // courtyard to every other wing.
+            List<OsmNode[]> localInner = new ArrayList<>();
+            for (OsmNode[] inner : base.innerRings)
+                if (inner != null && inner.length >= 3
+                        && pointInRing(inner[0].lat, inner[0].lon, outer))
+                    localInner.add(inner);
+            partStructure.innerRings = localInner.toArray(new OsmNode[0][]);
+            parts.add(partStructure);
+        }
+        return parts;
+    }
+
+    private static void appendRingSegment(List<List<OsmNode>> rings,
+            List<OsmNode> segment) {
+        for (List<OsmNode> ring : rings) {
+            if (sameNode(ring.get(ring.size() - 1), segment.get(0))) {
+                ring.addAll(segment.subList(1, segment.size())); return;
+            }
+            if (sameNode(ring.get(ring.size() - 1), segment.get(segment.size() - 1))) {
+                java.util.Collections.reverse(segment);
+                ring.addAll(segment.subList(1, segment.size())); return;
+            }
+        }
+        rings.add(new ArrayList<>(segment));
+    }
+
+    private static List<OsmNode> joinLinearRelationMembers(JsonObject relation) {
+        List<List<OsmNode>> chains = new ArrayList<>();
+        for (JsonElement memberEl : relation.getAsJsonArray("members")) {
+            JsonObject member = memberEl.getAsJsonObject();
+            String role = member.has("role") ? member.get("role").getAsString() : "";
+            if ("inner".equals(role) || !member.has("geometry")) continue;
+            List<OsmNode> segment = new ArrayList<>();
+            for (JsonElement pointEl : member.getAsJsonArray("geometry")) {
+                JsonObject point = pointEl.getAsJsonObject();
+                if (point.has("lat") && point.has("lon"))
+                    segment.add(new OsmNode(point.get("lat").getAsDouble(),
+                            point.get("lon").getAsDouble()));
+            }
+            if (segment.size() >= 2) appendRingSegment(chains, segment);
+        }
+        List<OsmNode> longest = List.of();
+        for (List<OsmNode> chain : chains)
+            if (chain.size() > longest.size()) longest = chain;
+        return longest;
+    }
+
+    private static boolean pointInRing(double lat, double lon, OsmNode[] ring) {
+        boolean inside = false;
+        for (int i = 0, j = ring.length - 1; i < ring.length; j = i++)
+            if (((ring[i].lat > lat) != (ring[j].lat > lat))
+                    && lon < (ring[j].lon - ring[i].lon) * (lat - ring[i].lat)
+                    / (ring[j].lat - ring[i].lat) + ring[i].lon)
+                inside = !inside;
+        return inside;
+    }
+
+    private static boolean sameNode(OsmNode a, OsmNode b) {
+        return Math.abs(a.lat - b.lat) < 1e-9 && Math.abs(a.lon - b.lon) < 1e-9;
+    }
+
+    private static OsmStructure copyWithNodes(OsmStructure b, OsmNode[] nodes, long osmId) {
+        OsmStructure copy = new OsmStructure(b.type, b.subType, b.name, nodes, b.isArea, osmId,
+                b.material, b.levels, b.height, b.roofShape, b.roofMaterial,
+                b.surface, b.lanes, b.isOneWay, b.minHeight, b.roofHeight,
+                b.roofDirection, b.colour, b.roofColour, b.isPart, b.parentOsmId,
+                b.layer, b.tunnel, b.isRailBridge, b.bridgeStructure,
+                b.startYear, b.endYear);
+        copy.innerRings = b.innerRings;
+        return copy;
     }
 
     private OsmStructure parseElement(JsonObject obj) {
@@ -1315,36 +1450,40 @@ public class OsmStructureIndex {
                         g.get("lon").getAsDouble()));
             }
         } else if (obj.has("members")) {
-            for (JsonElement m :
-                    obj.getAsJsonArray("members")) {
-                JsonObject mObj =
-                    m.getAsJsonObject();
-                String role = mObj.has("role")
-                    ? mObj.get("role")
-                        .getAsString() : "";
-                if ("outer".equals(role)
-                        || role.isEmpty()) {
-                    if (mObj.has("geometry")) {
-                        JsonArray geom =
-                            mObj.getAsJsonArray(
-                                "geometry");
-                        for (int i = 0;
-                                i < geom.size();
-                                i++) {
-                            JsonObject g =
-                                geom.get(i)
-                                .getAsJsonObject();
-                            if (g.has("lat")
-                                    && g.has("lon"))
-                                nodeList.add(
-                                    new OsmNode(
-                                        g.get("lat")
-                                        .getAsDouble(),
-                                        g.get("lon")
-                                        .getAsDouble()));
-                        }
+            if (!isArea) {
+                // Bridges/roads represented as relations contain several way
+                // segments. Join connected members instead of drawing an
+                // artificial line between unrelated member endpoints.
+                nodeList.addAll(joinLinearRelationMembers(obj));
+            } else {
+                for (JsonElement m : obj.getAsJsonArray("members")) {
+                    JsonObject mObj = m.getAsJsonObject();
+                    String role = mObj.has("role") ? mObj.get("role").getAsString() : "";
+                    if (!("outer".equals(role) || role.isEmpty()) || !mObj.has("geometry")) continue;
+                    for (JsonElement pointEl : mObj.getAsJsonArray("geometry")) {
+                        JsonObject point = pointEl.getAsJsonObject();
+                        if (point.has("lat") && point.has("lon"))
+                            nodeList.add(new OsmNode(point.get("lat").getAsDouble(),
+                                    point.get("lon").getAsDouble()));
                     }
                 }
+            }
+        }
+
+        List<OsmNode[]> innerRings = new ArrayList<>();
+        if (obj.has("members")) {
+            for (JsonElement memberEl : obj.getAsJsonArray("members")) {
+                JsonObject member = memberEl.getAsJsonObject();
+                String role = member.has("role") ? member.get("role").getAsString() : "";
+                if (!"inner".equals(role) || !member.has("geometry")) continue;
+                List<OsmNode> ring = new ArrayList<>();
+                for (JsonElement pointEl : member.getAsJsonArray("geometry")) {
+                    JsonObject point = pointEl.getAsJsonObject();
+                    if (point.has("lat") && point.has("lon"))
+                        ring.add(new OsmNode(point.get("lat").getAsDouble(),
+                                point.get("lon").getAsDouble()));
+                }
+                if (ring.size() >= 3) innerRings.add(ring.toArray(new OsmNode[0]));
             }
         }
 
@@ -1433,7 +1572,7 @@ public class OsmStructureIndex {
         String roofColour =
             getTag(tags, "roof:colour");
 
-        return new OsmStructure(type, subType, name,
+        OsmStructure parsed = new OsmStructure(type, subType, name,
             nodeList.toArray(new OsmNode[0]),
             isArea, osmId, material, levels, height,
             roofShape, roofMat, surfaceTag, lanes,
@@ -1441,6 +1580,8 @@ public class OsmStructureIndex {
             colour, roofColour, isPart, 0, layer,
             tunnel, isRailBridge, bridgeStructure,
             startYear, endYear);
+        parsed.innerRings = innerRings.toArray(new OsmNode[0][]);
+        return parsed;
     }
 
     // ── HELPERS ───────────────────────────────────────────────
