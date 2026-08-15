@@ -135,6 +135,8 @@ public final class PersistentChunkRefreshIndex {
     // not guessed block types: a chunk is considered updated only after the
     // normal transaction reaches markChunkRefreshed().
     private static final Set<Long> auditTargets = ConcurrentHashMap.newKeySet();
+    // Runtime marker for a target chunk's one-hop second boundary refresh.
+    private static final Set<Long> secondBoundaryRefreshes = ConcurrentHashMap.newKeySet();
     private static volatile int auditGeneration = -1;
     private static volatile int auditYear = Integer.MIN_VALUE;
     private static int auditLastReportTick = 0;
@@ -329,6 +331,7 @@ public final class PersistentChunkRefreshIndex {
     /** Begins a bounded runtime audit for one /terra timejump. */
     public static void beginTimeJumpAudit(int generation, int year) {
         auditTargets.clear();
+        secondBoundaryRefreshes.clear();
         auditGeneration = generation;
         auditYear = year;
         auditLastReportTick = tickCounter;
@@ -364,6 +367,21 @@ public final class PersistentChunkRefreshIndex {
             markDirty(region);
             refreshStates.put(chunkKey(cx, cz), RefreshState.STALE);
         }
+    }
+
+    public static boolean isTimeJumpAuditComplete() {
+        if (auditGeneration != globalGeneration || auditTargets.isEmpty()) return false;
+        for (long key : auditTargets)
+            if (refreshStates.get(key) != RefreshState.COMPLETE) return false;
+        return true;
+    }
+
+    public static void beginSecondBoundaryRefresh(int cx, int cz) {
+        secondBoundaryRefreshes.add(chunkKey(cx, cz));
+    }
+
+    public static boolean isSecondBoundaryRefresh(int cx, int cz) {
+        return secondBoundaryRefreshes.contains(chunkKey(cx, cz));
     }
 
     public static RefreshState getRefreshState(int cx, int cz) {
@@ -420,6 +438,7 @@ public final class PersistentChunkRefreshIndex {
                 markDirty(region);
             }
             refreshStates.put(chunkKey(cx, cz), RefreshState.COMPLETE);
+            secondBoundaryRefreshes.remove(chunkKey(cx, cz));
         }
     }
 
@@ -663,6 +682,7 @@ public final class PersistentChunkRefreshIndex {
                 flushAllInternal();
                 GeneratedBlockOwnershipIndex.flush();
                 DeferredChunkRefreshLedger.flush();
+                BoundaryPairRefreshLedger.flush();
                 clearRuntimeOnly();
                 initialized = false;
             }
@@ -685,9 +705,6 @@ public final class PersistentChunkRefreshIndex {
         int cz = event.getChunk().getPos().z;
 
         recordChunkSeen(level, cx, cz);
-        // Deferred boundary ownership work is intentionally disabled until
-        // feature ownership is complete; do not let stale experimental queue
-        // files fan out refreshes merely because a chunk loads.
         boolean deferredBoundaryRefresh = false;
 
         if (!TerraTimeManager.isTimeEnabled())
@@ -732,6 +749,8 @@ public final class PersistentChunkRefreshIndex {
 
         ServerLevel level = getOverworld();
         if (level == null) return;
+
+        TerraChunkGenerator.processTimeJumpBoundaryRing(level);
 
         if (tickCounter - auditLastReportTick >= AUDIT_REPORT_INTERVAL_TICKS) {
             auditLastReportTick = tickCounter;
@@ -878,6 +897,7 @@ public final class PersistentChunkRefreshIndex {
             flushAllInternal();
             GeneratedBlockOwnershipIndex.flush();
                 DeferredChunkRefreshLedger.flush();
+                BoundaryPairRefreshLedger.flush();
             clearRuntimeOnly();
             initialized = false;
         }
@@ -1163,6 +1183,7 @@ public final class PersistentChunkRefreshIndex {
         loadedChunks.clear();
         refreshStates.clear();
         auditTargets.clear();
+        secondBoundaryRefreshes.clear();
         auditGeneration = -1;
         auditYear = Integer.MIN_VALUE;
         reconciliationQueue.clear();

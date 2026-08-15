@@ -276,6 +276,10 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private static final int STRUCT_REFRESH_PER_TICK=2;
     private static final int TIMEJUMP_IMMEDIATE_RADIUS = 20;
     private static final int TIMEJUMP_IMMEDIATE_MAX = 256;
+    private static final int TIMEJUMP_BOUNDARY_RING_MAX = 128;
+    private static final int TIMEJUMP_BOUNDARY_LOADS_PER_TICK = 2;
+    private static final ConcurrentLinkedQueue<ChunkPos> timeJumpBoundaryRing = new ConcurrentLinkedQueue<>();
+    private static volatile boolean timeJumpBoundaryAwaiting = false;
         public static volatile int
         postJumpRescanCountdown = 0;
 
@@ -326,11 +330,48 @@ public class TerraChunkGenerator extends ChunkGenerator {
         queuedStructRefresh.clear();
         vegetationPhaseComplete.clear();
         successfulPlacementSignatures.clear();
+        timeJumpBoundaryRing.clear();
+        timeJumpBoundaryAwaiting = false;
         TerraChunkGenerator instance = activeInstance;
         if (instance != null) {
             instance.refreshStructureCache.clear();
             instance.refreshOwnershipCache.clear();
+            // Prevent an old async placement entry from racing the new
+            // historical transaction after a time jump.
+            instance.getPlacementQueue().discardActiveForTimeJump();
         }
+    }
+
+    public static void captureTimeJumpBoundaryRing(net.minecraft.server.level.ServerLevel level) {
+        if (level == null) return;
+        Set<Long> unique = new HashSet<>();
+        List<ChunkPos> candidates = new ArrayList<>();
+        for (ChunkPos base : PersistentChunkRefreshIndex.getLoadedChunkSnapshot(level))
+            for (int dx=-1; dx<=1; dx++) for (int dz=-1; dz<=1; dz++) {
+                if (dx==0 && dz==0) continue;
+                int x=base.x+dx, z=base.z+dz;
+                if (!level.hasChunk(x,z) && unique.add(rk(x,z))) candidates.add(new ChunkPos(x,z));
+            }
+        candidates.sort(java.util.Comparator.comparingLong(cp -> {
+            long best=Long.MAX_VALUE;
+            for(ServerPlayer p:level.players()) { long dx=(long)cp.x-p.chunkPosition().x, dz=(long)cp.z-p.chunkPosition().z; best=Math.min(best,dx*dx+dz*dz); }
+            return best;
+        }));
+        timeJumpBoundaryRing.clear();
+        for (int i=0;i<Math.min(TIMEJUMP_BOUNDARY_RING_MAX,candidates.size());i++) timeJumpBoundaryRing.offer(candidates.get(i));
+        timeJumpBoundaryAwaiting=!timeJumpBoundaryRing.isEmpty();
+        LOGGER.info("TIMEJUMP_BOUNDARY_RING captured={} queued={}", candidates.size(), timeJumpBoundaryRing.size());
+    }
+
+    public static void processTimeJumpBoundaryRing(net.minecraft.server.level.ServerLevel level) {
+        if (!timeJumpBoundaryAwaiting || level==null || !PersistentChunkRefreshIndex.isTimeJumpAuditComplete()) return;
+        for (int i=0;i<TIMEJUMP_BOUNDARY_LOADS_PER_TICK;i++) {
+            ChunkPos pos=timeJumpBoundaryRing.poll();
+            if(pos==null){timeJumpBoundaryAwaiting=false;break;}
+            try { level.getChunk(pos.x,pos.z); PersistentChunkRefreshIndex.invalidateChunk(level,pos.x,pos.z); scheduleSingleChunkRefresh(level,pos); }
+            catch(Exception e){LOGGER.debug("TIMEJUMP_BOUNDARY_RING [{},{}]: {}",pos.x,pos.z,e.getMessage());}
+        }
+        if(!timeJumpBoundaryAwaiting) LOGGER.info("TIMEJUMP_BOUNDARY_RING complete");
     }
 
     public static void scheduleSingleChunkRefresh(
@@ -523,16 +564,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
     }
 
     // ── CLEAR CHUNK BOUNDARY ORPHANS ──────────────────────────
-    /**
-     * Boundary reconciliation is intentionally dormant until the ownership
-     * model is finished. A previous refresh-neighbour implementation expanded
-     * indefinitely as newly loaded chunks queued their own unloaded edges.
-     * Never force-load, invalidate, or cascade-refresh neighbours here.
-     */
-    private static void clearBoundaryOrphans(
-            net.minecraft.server.level.ServerLevel level,
-            int chunkX,int chunkZ){
-        // Ownership/deferred-boundary processing is postponed by design.
+    private static void clearBoundaryOrphans(net.minecraft.server.level.ServerLevel level,int chunkX,int chunkZ) {
+        // Fixed Layer-2.1 ring is captured once at time jump; no recursive discovery.
     }
 
     // ── SEND CHUNK TO CLIENT ──────────────────────────────────
@@ -1878,6 +1911,64 @@ private static int findGroundY(
                     chunk.x, chunk.z, batch.size(), year, generation);
     }
 
+    /** Read-only post-refresh check. It reports vegetation/tree-like blocks
+     * still inside target-year building/bridge footprints; it never deletes or
+     * claims those blocks. Wood alone is only a suspect because it may be an
+     * intentional building material. */
+    private void possibleStaleBlockAudit(net.minecraft.server.level.ServerLevel level,
+            LevelChunk chunk, List<OsmStructureIndex.OsmStructure> structures,
+            TerraDensityFunctions density) {
+        if (structures == null || structures.isEmpty()) return;
+        int leaves = 0, vines = 0, logs = 0, columns = 0;
+        int minX = chunk.getPos().getMinBlockX();
+        int minZ = chunk.getPos().getMinBlockZ();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int lx = 0; lx < 16; lx++) for (int lz = 0; lz < 16; lz++) {
+            int bx = minX + lx, bz = minZ + lz;
+            double[] geo = density.toGeo(bx, bz);
+            if (geo == null || Double.isNaN(geo[0]) || Double.isNaN(geo[1])) continue;
+            boolean targetFootprint = false;
+            for (OsmStructureIndex.OsmStructure structure : structures) {
+                if (structure.type != OsmStructureIndex.StructureType.BUILDING
+                        && structure.type != OsmStructureIndex.StructureType.BUILDING_PART
+                        && structure.type != OsmStructureIndex.StructureType.BRIDGE) continue;
+                if (structure.nodes != null && structure.nodes.length >= 3
+                        && structure.containsPoint(geo[1], geo[0])) {
+                    targetFootprint = true;
+                    break;
+                }
+            }
+            if (!targetFootprint) continue;
+            int surface = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, lx, lz);
+            int localLeaves = 0, localVines = 0, localLogs = 0;
+            // Bounded vertical inspection: no full world scan on a server tick.
+            for (int y = Math.max(level.getMinBuildHeight(), surface - 48);
+                    y <= Math.min(XY - 1, surface + 24); y++) {
+                pos.set(bx, y, bz);
+                BlockState state = level.getBlockState(pos);
+                if (state.is(Blocks.OAK_LEAVES) || state.is(Blocks.SPRUCE_LEAVES)
+                        || state.is(Blocks.BIRCH_LEAVES) || state.is(Blocks.JUNGLE_LEAVES)
+                        || state.is(Blocks.ACACIA_LEAVES) || state.is(Blocks.DARK_OAK_LEAVES)
+                        || state.is(Blocks.MANGROVE_LEAVES) || state.is(Blocks.CHERRY_LEAVES)) localLeaves++;
+                else if (state.is(Blocks.VINE)) localVines++;
+                else if (state.is(Blocks.OAK_LOG) || state.is(Blocks.SPRUCE_LOG)
+                        || state.is(Blocks.BIRCH_LOG) || state.is(Blocks.JUNGLE_LOG)
+                        || state.is(Blocks.ACACIA_LOG) || state.is(Blocks.DARK_OAK_LOG)
+                        || state.is(Blocks.MANGROVE_LOG) || state.is(Blocks.CHERRY_LOG)) localLogs++;
+            }
+            if (localLeaves + localVines + localLogs > 0) {
+                columns++;
+                leaves += localLeaves;
+                vines += localVines;
+                logs += localLogs;
+            }
+        }
+        if (leaves > 0 || vines > 0 || logs > 0)
+            LOGGER.warn("POSSIBLE_STALE_BLOCK_AUDIT chunk=[{},{}] year={} footprintColumns={} leaves={} vines={} treeLikeLogs={} (read-only; logs may be intentional building wood)",
+                    chunk.getPos().x, chunk.getPos().z, TerraTimeManager.getCurrentYear(),
+                    columns, leaves, vines, logs);
+    }
+
 // ── UPDATED Pass 2: ALL STRUCTURES (ROADS + BUILDINGS) ──
 private boolean refreshStructuresForChunk(
         net.minecraft.server.level.ServerLevel level,
@@ -1970,6 +2061,7 @@ for (int lx = 0; lx < 16; lx++) {
 
         if (!ok) return false;
 
+        possibleStaleBlockAudit(level, ch, all, d);
         placementDuplicateTest(ch.getPos(), all);
 
         // The durable ledger is committed only after the generator reports a

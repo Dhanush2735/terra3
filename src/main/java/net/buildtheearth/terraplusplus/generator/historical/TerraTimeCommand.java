@@ -238,6 +238,7 @@ public class TerraTimeCommand {
         // Discard queued work for the old year before selecting nearest chunks
         // for this new year.
         TerraChunkGenerator.resetRefreshQueuesForTimeJump();
+        TerraChunkGenerator.captureTimeJumpBoundaryRing(level);
 
         // ── QUEUE WATER/VEGETATION/STRUCTURE REFRESH ─────
         // Do not enqueue the unsorted snapshot here. scheduleLoadedChunkRefresh

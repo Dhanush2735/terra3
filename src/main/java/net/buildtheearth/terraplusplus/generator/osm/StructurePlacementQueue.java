@@ -300,6 +300,16 @@ public class StructurePlacementQueue {
         totalPlaced.incrementAndGet();
     }
 
+    /** Server-thread time-jump handoff: discard old-year async entries so the
+     * historical transaction is the sole writer for stale loaded chunks. */
+    public int discardActiveForTimeJump() {
+        int discarded = 0;
+        while (poll() != null) discarded++;
+        if (discarded > 0)
+            LOGGER.info("[PlaceQ] Discarded {} pre-jump active entries", discarded);
+        return discarded;
+    }
+
     // ================================================================
     // DEFERRED — for chunks that exhausted placement attempts
     // ================================================================
