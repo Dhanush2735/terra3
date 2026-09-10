@@ -122,8 +122,7 @@ public class WikiDataLookup {
                 return t;
             });
 
-        Path dir = Paths.get(
-            "terra_cache", "wikidata");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("wikidata");
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -357,7 +356,7 @@ public class WikiDataLookup {
             LOGGER.debug("SPARQL error: {}",
                 e.getMessage());
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
         }
         return WikiResult.NOT_FOUND;
     }
@@ -389,7 +388,7 @@ public class WikiDataLookup {
             String pageTitle = hits.get(0)
                 .getAsJsonObject()
                 .get("title").getAsString();
-            conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
 
             // Fetch page extract
             String extractUrl = WIKIPEDIA_API
@@ -419,7 +418,7 @@ public class WikiDataLookup {
             LOGGER.debug("Wikipedia error: {}",
                 e.getMessage());
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
         }
         return WikiResult.NOT_FOUND;
     }

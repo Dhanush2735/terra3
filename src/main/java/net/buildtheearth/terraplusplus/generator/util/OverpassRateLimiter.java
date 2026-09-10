@@ -249,8 +249,11 @@ public class OverpassRateLimiter {
     public static OverpassRateLimiter forOsmEndpoint(
             String endpointName) {
         String key = "OSM/" + endpointName;
+        // burst 2: a cold start (empty cache) may send two requests
+        // back-to-back per endpoint before settling at 1 req/sec.
+        // Steady-state rate is unchanged.
         return SHARED.computeIfAbsent(key,
-            ignored -> new OverpassRateLimiter(key, 1000L, 1));
+            ignored -> new OverpassRateLimiter(key, 1000L, 2));
     }
 
     /**

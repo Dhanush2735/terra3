@@ -219,7 +219,7 @@ public final class FootprintAlignment {
                              b.minLat, b.maxLat, b.minLon, b.maxLon, 0);
         }
 
-        public static Print of(OvertureIndex.OvertureBuilding b) {
+        public static Print of(MicrosoftIndex.MicrosoftBuilding b) {
             return new Print(b.centerLat, b.centerLon,
                              b.minLat, b.maxLat, b.minLon, b.maxLon, 0);
         }
@@ -446,6 +446,13 @@ public final class FootprintAlignment {
      * six-lane road excludes its full carriageway.
      */
     private static double roadHalfWidthM(OsmStructureIndex.OsmStructure s) {
+        // Mapper-tagged width beats the per-type table, matching the
+        // width the generator now actually paints.
+        if (s.explicitWidth > 0
+                && (s.type == OsmStructureIndex.StructureType.ROAD
+                    || s.type == OsmStructureIndex.StructureType.FOOTWAY
+                    || s.type == OsmStructureIndex.StructureType.CYCLEWAY))
+            return Math.min(s.explicitWidth / 2.0, 30.0);
         switch (s.type) {
             case ROAD: {
                 String sub = s.subType == null ? "" : s.subType;
@@ -468,6 +475,8 @@ public final class FootprintAlignment {
             case RAILWAY:  return 5.0;
             case FOOTWAY:
             case CYCLEWAY: return 1.0;   // generator paints these at 1.0
+            case RUNWAY:   return "runway".equals(s.subType)
+                                ? 22.0 : 11.0;  // ML buildings never on runways
             default:       return 0.0;   // not a linear way: no exclusion
         }
     }

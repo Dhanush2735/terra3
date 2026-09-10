@@ -1,0 +1,8 @@
+-nowarn
+-encoding
+UTF-8
+-Xmaxerrs
+20000
+-d
+/tmp/outv
+@/tmp/sources.txt

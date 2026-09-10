@@ -53,7 +53,11 @@ public class TerraChunkGenerator extends ChunkGenerator {
             TerraWorldConfig.CODEC
                 .optionalFieldOf("world_config",
                     TerraWorldConfig.DEFAULT)
-                .forGetter(g -> g.worldConfig)
+                .forGetter(g -> g.worldConfig),
+            // Axis 6: which universe this dimension hosts.
+            Codec.STRING.optionalFieldOf("universe",
+                    UniverseTransforms.PRIME)
+                .forGetter(g -> g.universeId)
         ).apply(i, TerraChunkGenerator::new));
 
     // ── CONSTANTS ─────────────────────────────────────────────
@@ -80,6 +84,29 @@ public class TerraChunkGenerator extends ChunkGenerator {
         WATER_RETRY_MAX_AGE_MS=300_000L;
     private static final long
         STRUCTURE_FETCH_TIMEOUT_MS=8000L;
+    /** FAST-TELEPORT FIX (run 13): chunk generation used to
+     *  block up to 8s PER SOURCE inside applyBiomeDecoration
+     *  waiting for downloads — destination chunks could not
+     *  reach FULL until Overpass answered, so /tpll waited on
+     *  the network (126s in run 13) while the terrain itself
+     *  was ready in 1s. Generation now waits at most this long
+     *  (covers disk/memory hits + a warm fast-API fetch); on a
+     *  miss the appetizer serves resident Overture data and the
+     *  proven swap machinery (117/117 in run 13) upgrades the
+     *  chunk when the main course lands. */
+    public static final long GEN_STRUCT_WAIT_MS=1500L;
+    /** ORDER->APPETIZER LATENCY FIX: the generation-path
+     *  appetizer polled at 0ms — but /tpll's prefetch puts the
+     *  Overture tiles in flight ~2-3s before chunks decorate,
+     *  so a 0ms poll missed tiles that were SECONDS from
+     *  landing and the chunk generated bare. Decoration runs on
+     *  Worker-Main async threads (not the server thread), so a
+     *  short bounded wait is legal there — the old code blocked
+     *  8s on these very threads. getStructuresForArea already
+     *  dispatches all missing tiles in parallel and plates
+     *  whatever is resident at the deadline (partial serve).
+     *  Server-thread polls (fetchStructuresCachedOnly) stay 0ms. */
+    public static final long GEN_APPETIZER_WAIT_MS=1500L;
     private static final int
         PRESENCE_EMPTY=0,
         PRESENCE_TERRAIN=1,
@@ -149,6 +176,9 @@ public class TerraChunkGenerator extends ChunkGenerator {
     // ── FIELDS ────────────────────────────────────────────────
     private final String projectionName;
     private final int zoom;
+    /** Axis 6: universe id hosted by this generator/dimension. */
+    private final String universeId;
+    public String getUniverseId(){ return universeId; }
     private volatile TerraWorldConfig worldConfig;
     private volatile boolean configResolved=false;
     private volatile TerraDensityFunctions df;
@@ -158,7 +188,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private volatile OsmStructureIndex structureIndex;
     private volatile OsmStructureGenerator
         structureGenerator;
-    private volatile OvertureIndex overtureIndex;
+    private volatile MicrosoftIndex overtureIndex;
     private volatile SourceCooperativeIndex vidaIndex;
     private volatile AsyncStructureManager asyncManager;
     private volatile StructurePlacementQueue
@@ -260,6 +290,110 @@ public class TerraChunkGenerator extends ChunkGenerator {
         successfulPlacementSignatures = new ConcurrentHashMap<>();
     private static final int PLACEMENT_TEST_MAX = 200_000;
 
+    // ── REFRESH ENGINE (unified pipeline; replaces the dual-queue
+    //    system when enabled). Toggle for A/B migration safety.
+    public static volatile boolean USE_REFRESH_ENGINE = true;
+    // ── APPETIZER PROTOCOL (cold-start progressive serve) ──
+    // OSM pending -> serve fast sources provisionally, swap on
+    // OSM arrival. Toggle for A/B safety, same as the engine.
+    public static volatile boolean APPETIZER_SERVING = true;
+    private volatile net.buildtheearth.terraplusplus.generator
+        .historical.RefreshEngine refreshEngine;
+
+    public net.buildtheearth.terraplusplus.generator.historical
+            .RefreshEngine getRefreshEngine() {
+        if (refreshEngine == null) synchronized (this) {
+            if (refreshEngine == null)
+                refreshEngine = new net.buildtheearth.terraplusplus
+                    .generator.historical.RefreshEngine(
+                        new EngineWorker(), 6);
+        }
+        return refreshEngine;
+    }
+
+    /** Adapter: the engine drives, these proven methods place. */
+    private final class EngineWorker implements
+            net.buildtheearth.terraplusplus.generator.historical
+                .RefreshEngine.ChunkWorker {
+        @Override public List<?> peekData(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos) {
+            try {
+                if (!worldConfig.hasAnyStructures())
+                    return java.util.List.of();
+                LevelChunk ch = level.getChunk(pos.x, pos.z);
+                return fetchStructuresCachedOnly(level, ch);
+            } catch (Exception e) { return null; }
+        }
+        @Override public void requestData(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos) {
+            // fetchStructuresCachedOnly already queues the async
+            // retry on a miss; nothing more needed here.
+        }
+        @Override public void escalateData(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos) {
+            // Tile wanted >10s: push a prefetch straight at the
+            // structure index (single-tile fast path, endpoint
+            // rotation included) instead of waiting for the async
+            // manager's own retry cadence.
+            try {
+                var d = getDf();
+                if (d == null) return;
+                double[] gc = d.toGeo(pos.getMinBlockX() + 8,
+                    pos.getMinBlockZ() + 8);
+                if (gc == null) return;
+                getStructureIndex().prefetchTiles(
+                    gc[1] - 0.006, gc[1] + 0.006,
+                    gc[0] - 0.006, gc[0] + 0.006);
+            } catch (Exception ignored) {}
+        }
+        @Override public boolean runClearing(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos, List<?> data) {
+            try {
+                LevelChunk ch = level.getChunk(pos.x, pos.z);
+                @SuppressWarnings("unchecked")
+                List<OsmStructureIndex.OsmStructure> structs =
+                    (List<OsmStructureIndex.OsmStructure>) data;
+                if (!GeneratedBlockOwnershipIndex
+                        .clearOwnedBlocks(level, pos))
+                    return false;
+                PersistentChunkRefreshIndex
+                    .markChunkRefreshing(pos.x, pos.z);
+                beginHistoricalWriteCapture();
+                boolean ok = refreshChunkForYear(level, ch, structs);
+                List<GeneratedBlockOwnershipIndex.OwnedBlock> writes =
+                    endHistoricalWriteCapture();
+                if (!ok) return false;
+                long k = ck(pos.x, pos.z);
+                refreshOwnershipCache.put(k, writes);
+                if (structs != null && !structs.isEmpty())
+                    refreshStructureCache.put(k, structs);
+                clearBoundaryOrphans(level, pos.x, pos.z);
+                return true;
+            } catch (Exception e) {
+                endHistoricalWriteCapture();
+                return false;
+            }
+        }
+        @Override public boolean runStructures(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos, List<?> data) {
+            try {
+                LevelChunk ch = level.getChunk(pos.x, pos.z);
+                return refreshStructuresForChunk(level, ch);
+            } catch (Exception e) { return false; }
+        }
+        @Override public void markDone(
+                net.minecraft.server.level.ServerLevel level,
+                ChunkPos pos) {
+            PersistentChunkRefreshIndex
+                .markChunkRefreshed(level, pos.x, pos.z);
+        }
+    }
+
     public static volatile TerraChunkGenerator
         activeInstance=null;
     /**
@@ -285,13 +419,23 @@ public class TerraChunkGenerator extends ChunkGenerator {
 
     // ── CONSTRUCTORS ──────────────────────────────────────────
     public TerraChunkGenerator(BiomeSource bs,String pn,
-            int z,TerraWorldConfig wc){
+            int z,TerraWorldConfig wc,String universe){
         super(bs);
         projectionName=pn;zoom=z;worldConfig=wc;
-        activeInstance=this;
+        universeId=UniverseTransforms.get(universe).id();
+        // The PRIME generator is the shared singleton other
+        // systems reach through activeInstance; exotic-universe
+        // dimensions must not steal it.
+        if(UniverseTransforms.PRIME.equals(universeId)
+                ||activeInstance==null)
+            activeInstance=this;
         LOGGER.info("TerraChunkGenerator: proj={} zoom={}"
-            +" Y=[{},{}] cfg={}",pn,z,MY,XY,wc);
+            +" Y=[{},{}] universe={} cfg={}",
+            pn,z,MY,XY,universeId,wc);
     }
+    public TerraChunkGenerator(BiomeSource bs,String pn,
+            int z,TerraWorldConfig wc){
+        this(bs,pn,z,wc,UniverseTransforms.PRIME);}
     public TerraChunkGenerator(BiomeSource bs,String pn,
             int z){
         this(bs,pn,z,TerraWorldConfig.DEFAULT);}
@@ -324,6 +468,9 @@ public class TerraChunkGenerator extends ChunkGenerator {
      * entries made qv()/qs() reject the newly sorted nearby work, so old spawn
      * chunks consumed the budget while the player's loaded chunks waited. */
     public static void resetRefreshQueuesForTimeJump() {
+        if (activeInstance != null
+                && activeInstance.refreshEngine != null)
+            activeInstance.refreshEngine.clear();
         refreshQueue.clear();
         structureRefreshQueue.clear();
         queuedVegRefresh.clear();
@@ -380,6 +527,12 @@ public class TerraChunkGenerator extends ChunkGenerator {
         if(activeInstance==null||level==null
                 ||!level.hasChunk(cp.x,cp.z))return;
         PersistentChunkRefreshIndex.markChunkRefreshQueued(cp.x, cp.z);
+        if (USE_REFRESH_ENGINE) {
+            activeInstance.getRefreshEngine().submit(cp,
+                net.buildtheearth.terraplusplus.generator
+                    .historical.RefreshEngine.Reason.CHUNK_LOAD);
+            return;
+        }
         qv(cp);
         if(activeInstance.getWorldConfig()
                 .hasAnyStructures())
@@ -436,11 +589,24 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 continue;
             }
             PersistentChunkRefreshIndex.markChunkRefreshQueued(cp.x, cp.z);
+            if (USE_REFRESH_ENGINE) {
+                if (activeInstance.getRefreshEngine().submit(cp,
+                        net.buildtheearth.terraplusplus.generator
+                            .historical.RefreshEngine.Reason.TIME_JUMP))
+                    va++;
+                continue;
+            }
             if(qv(cp))va++;
             if(activeInstance.getWorldConfig()
                     .hasAnyStructures()
                     &&qs(cp))sa++;
         }
+        // TIMEJUMP DRAIN FIX: a jump just queued a burst of
+        // chunks the player is actively waiting on — let the
+        // engine drain at burst budget for the next minute
+        // instead of 8ms/tick politeness.
+        if (USE_REFRESH_ENGINE && va > 0)
+            activeInstance.getRefreshEngine().burst();
         LOGGER.info(
             "Scheduled refresh: +{}veg +{}struct deferred={}"
             +" loadedNow={} queued={}",
@@ -450,11 +616,19 @@ public class TerraChunkGenerator extends ChunkGenerator {
             getRefreshQueueSize());}
 
     public static boolean hasRefreshPending(){
+        if (USE_REFRESH_ENGINE && activeInstance != null
+                && activeInstance.refreshEngine != null
+                && !activeInstance.refreshEngine.isIdle())
+            return true;
         return !refreshQueue.isEmpty()
             ||!structureRefreshQueue.isEmpty();}
 
     public static int getRefreshQueueSize(){
-        return refreshQueue.size()
+        int engine = (USE_REFRESH_ENGINE
+            && activeInstance != null
+            && activeInstance.refreshEngine != null)
+            ? activeInstance.refreshEngine.depth() : 0;
+        return engine + refreshQueue.size()
             +structureRefreshQueue.size();}
 
     // ── TREE/VEGETATION CHECK ─────────────────────────────────
@@ -684,6 +858,65 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 if (accepted != null) return accepted;
                 async.queueRetry((mnLa + mxLa) / 2,
                         (mnLo + mxLo) / 2, ch.getPos().x, ch.getPos().z);
+                // ── APPETIZER (live path — RUN-12 FIX) ──────────
+                // The original appetizer branch lived in
+                // fetchStructuresForChunk, which lost its last
+                // caller in the RefreshEngine migration: runs
+                // 10-12 had tiles resident (26 cached) yet zero
+                // APPETIZER lines, because THIS method is what
+                // EngineWorker.peekData actually calls. Server
+                // thread, so budget=0: plate only what prefetch
+                // already made resident, never wait. Year filter
+                // mirrors the cached path below — at 3000 BCE an
+                // appetizer of modern buildings would be wrong.
+                // RUN-13 FIX (churn): only serve when the OSM
+                // tile is genuinely NOT resident. Run 13 proved
+                // the serve->swap cycle works (117/117) but all
+                // serves happened AFTER OSM arrived (async merge
+                // still combining) — each was instantly swapped
+                // by presenceCheck = pointless double placement.
+                // areTilesLoaded is a pure map lookup.
+                // RUN-16 FIX (deleted roads/buildings): the
+                // appetizer must NEVER be served as REFRESH
+                // data for a chunk that already has content.
+                // The refresh pipeline wipes first and
+                // re-places from whatever this method returns —
+                // during the post-jump burst the merge was
+                // often still combining, so decorated chunks
+                // got wiped and re-placed with a handful of
+                // Overture silhouettes (and the corrective
+                // swap deferred). Appetizer is for EMPTY
+                // plates only: presence < DECORATED. A
+                // decorated chunk parks in NEEDS_DATA until
+                // the complete merge exists — no data, no wipe.
+                if (APPETIZER_SERVING
+                        && getChunkPresence(ch) < PRESENCE_DECORATED
+                        && !getStructureIndex().areTilesLoaded(
+                            mnLa, mxLa, mnLo, mxLo)) {
+                    var ovOsm = net.buildtheearth.terraplusplus
+                        .generator.osm.OvertureOsmIndex
+                        .getInstance().getStructuresForArea(
+                            mnLa, mxLa, mnLo, mxLo, 0);
+                    if (ovOsm != null && !ovOsm.isEmpty()) {
+                        int year = TerraTimeManager.getCurrentYear();
+                        List<OsmStructureIndex.OsmStructure> vis =
+                            new ArrayList<>(ovOsm.size());
+                        for (var s : ovOsm)
+                            if (HistoricalDateParser.isVisibleAt(
+                                    s.startYear, s.endYear,
+                                    year, true))
+                                vis.add(s);
+                        if (!vis.isEmpty()) {
+                            net.buildtheearth.terraplusplus
+                                .generator.historical
+                                .ProvisionalServing.markServed(
+                                    ch.getPos().x, ch.getPos().z,
+                                    (mnLa + mxLa) / 2,
+                                    (mnLo + mxLo) / 2, vis.size());
+                            return vis;
+                        }
+                    }
+                }
                 return null;
             }
 
@@ -694,6 +927,24 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 getAsyncManager().queueRetry(
                     (mnLa+mxLa)/2,(mnLo+mxLo)/2,
                     ch.getPos().x,ch.getPos().z);
+                // APPETIZER (live path, non-time worlds): same
+                // 0ms resident-only serve as the timeEnabled
+                // branch above. RUN-12 FIX.
+                if (APPETIZER_SERVING) {
+                    var ovOsm = net.buildtheearth.terraplusplus
+                        .generator.osm.OvertureOsmIndex
+                        .getInstance().getStructuresForArea(
+                            mnLa, mxLa, mnLo, mxLo, 0);
+                    if (ovOsm != null && !ovOsm.isEmpty()) {
+                        net.buildtheearth.terraplusplus
+                            .generator.historical
+                            .ProvisionalServing.markServed(
+                                ch.getPos().x, ch.getPos().z,
+                                (mnLa + mxLa) / 2,
+                                (mnLo + mxLo) / 2, ovOsm.size());
+                        return new ArrayList<>(ovOsm);
+                    }
+                }
                 return null;
             }
 
@@ -767,13 +1018,20 @@ public class TerraChunkGenerator extends ChunkGenerator {
                     mxLo=Math.max(mxLo,g[0]);}
             List<OsmStructureIndex.OsmStructure> all=
                 new ArrayList<>();
+            boolean osmPending=false;
             if(worldConfig.timeEnabled){
                 var merged=getHistoricalManager()
                     .getStructuresForChunk(
                         mnLa,mxLa,mnLo,mxLo,
                         timeoutMs);
-                if(merged==null)return null;
-                if(!merged.visible.isEmpty())
+                if(merged==null){
+                    // APPETIZER PROTOCOL: OSM/OHM still cooking.
+                    // Old behaviour: return null -> bare chunk
+                    // until async retry. New: serve the fast
+                    // sources NOW, mark provisional; the OSM
+                    // arrival hook swaps in the main course.
+                    osmPending=true;
+                }else if(!merged.visible.isEmpty())
                     all.addAll(merged.visible);
             }else{
                 String src=activeSource;
@@ -783,8 +1041,9 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         .getStructuresForChunkBlocking(
                             mnLa,mxLa,mnLo,mxLo,
                             worldConfig,timeoutMs);
-                    if(os==null)return null;
-                    if(!os.isEmpty())all.addAll(os);
+                    if(os==null){
+                        osmPending=true; // appetizer path below
+                    }else if(!os.isEmpty())all.addAll(os);
                 }
                 // ── TIER 3: VIDA (after OSM, before Microsoft) ──
                 List<SourceCooperativeIndex.VidaBuilding>
@@ -829,7 +1088,7 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         ||"both".equals(src))
                         &&worldConfig.overtureBuildings)
                     try{
-                        var ov=getOvertureIndex();
+                        var ov=getMicrosoftIndex();
                         if(ov.isEnabled()){
                             var ob=ov
                                 .getBuildingsForChunkBlocking(
@@ -870,6 +1129,83 @@ public class TerraChunkGenerator extends ChunkGenerator {
                             ch.getPos().z,
                             e.getMessage());
                     }
+            }
+
+            // ── APPETIZER (cold-start progressive serve) ──────
+            // OSM tile still cooking: serve the fast sources NOW
+            // (appetizer hierarchy: VIDA/Google > Microsoft; the
+            // Overture(OSM) GeoParquet tier upgrades this later)
+            // and record the chunk as provisional. When the OSM
+            // tile lands, AsyncStructureManager fires the swap.
+            // Warm areas never reach here (OSM answers from disk
+            // instantly), so this is strictly a cold-start path.
+            if(osmPending){
+                if(!APPETIZER_SERVING)
+                    return null;   // feature off: old behaviour
+                int before=all.size();
+                try{
+                    // OVERTURE(OSM) — appetizer tier 1. The
+                    // real Overture: OSM-derived planet tiles,
+                    // fast even on a truly cold first visit
+                    // (run 9 proved MSFT/VIDA are NOT: 40s/143s
+                    // cold, so OSM won the race and the
+                    // appetizer starved). Buildings AND roads.
+                    // RUN-10 FIX: 1500ms starved from India —
+                    // 2-3 range reads x ~400ms RTT x 3 themes.
+                    // 6s bounded on a worker thread is legal
+                    // (tier-2 rules) and OSM itself takes 15s+.
+                    var ovOsm=net.buildtheearth.terraplusplus
+                        .generator.osm.OvertureOsmIndex
+                        .getInstance()
+                        .getStructuresForArea(
+                            mnLa,mxLa,mnLo,mxLo,6000);
+                    if(ovOsm!=null&&!ovOsm.isEmpty())
+                        all.addAll(ovOsm);
+                    // VIDA (Google) — appetizer tier 2
+                    if(worldConfig.vidaBuildings){
+                        var vb=getVidaIndex()
+                            .getBuildingsForChunkBlocking(
+                                mnLa,mxLa,mnLo,mxLo,
+                                1500,null);
+                        if(vb!=null)
+                            for(var b:vb){
+                                if(SourceCooperativeIndex
+                                        .overlapsExisting(b,all))
+                                    continue;
+                                all.add(b.toOsmStructure());}
+                    }
+                    // Microsoft — appetizer tier 3
+                    if(worldConfig.overtureBuildings){
+                        var ov=getMicrosoftIndex();
+                        if(ov.isEnabled()){
+                            var ob=ov
+                                .getBuildingsForChunkBlocking(
+                                    mnLa,mxLa,mnLo,mxLo,1500);
+                            if(ob!=null)
+                                for(var b:ob){
+                                    if(overlaps(b,all))continue;
+                                    all.add(b.toOsmStructure());}
+                        }
+                    }
+                }catch(Exception e){
+                    LOGGER.debug("appetizer [{},{}]: {}",
+                        ch.getPos().x,ch.getPos().z,
+                        e.getMessage());
+                }
+                if(all.size()>before){
+                    // Something to serve: track for the swap.
+                    net.buildtheearth.terraplusplus.generator
+                        .historical.ProvisionalServing
+                        .markServed(ch.getPos().x,
+                            ch.getPos().z,
+                            (mnLa+mxLa)/2,(mnLo+mxLo)/2,
+                            all.size()-before);
+                    return all;
+                }
+                // Appetizer kitchen also empty/cold: behave
+                // exactly as before (null = pending, async
+                // retry owns it).
+                return null;
             }
             return all;
         }catch(Exception e){
@@ -924,6 +1260,15 @@ public class TerraChunkGenerator extends ChunkGenerator {
                             waterPos.x, waterPos.z, e.getMessage());
                 }
             }
+        }
+
+        // ── UNIFIED ENGINE PATH ───────────────────────────────
+        // One owner, time-budgeted, push-based data readiness.
+        // The legacy dual-queue path below remains for A/B
+        // comparison (USE_REFRESH_ENGINE=false).
+        if (USE_REFRESH_ENGINE) {
+            getRefreshEngine().tick(level);
+            return;
         }
 
         // ── PASS 1: VEGETATION ONLY ──────────────────────────
@@ -1377,17 +1722,26 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 // column entirely.
                 try {
                     ch.setUnsaved(true);
-                    // Rebuild WORLD_SURFACE heightmap
-                    // by re-scanning every column that
-                    // was modified
-                    var heightmap = ch.getOrCreateHeightmapUnprimed(
-                        Heightmap.Types.WORLD_SURFACE);
-                    for (int lx = 0; lx < 16; lx++) {
-                        for (int lz = 0; lz < 16; lz++) {
-                            heightmap.update(lx, 0,
-                                lz, STONE);
-                        }
-                    }
+                    // Rebuild heightmaps with a real top-down scan.
+                    //
+                    // The old code called heightmap.update(lx, 0, lz, STONE)
+                    // per column. Vanilla Heightmap.update early-exits when
+                    // y <= firstAvailable - 2, and terrain here sits hundreds
+                    // of blocks above y=0, so every call returned false and
+                    // the heightmap was NEVER rebuilt (audit FINDING 2).
+                    // Consequence: after a time-jump water drain,
+                    // ch.getHeight() kept returning the old water surface Y
+                    // and placeBuiltUpProgression skipped the column.
+                    //
+                    // primeHeightmaps scans each column from the top section
+                    // downward and sets the true first-opaque Y — exactly
+                    // the rebuild the comment above always promised.
+                    Heightmap.primeHeightmaps(ch,
+                        java.util.EnumSet.of(
+                            Heightmap.Types.WORLD_SURFACE,
+                            Heightmap.Types.MOTION_BLOCKING,
+                            Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                            Heightmap.Types.OCEAN_FLOOR));
                 } catch (Exception e) {
                     LOGGER.debug(
                         "Heightmap rebuild [{},{}]: {}",
@@ -1901,11 +2255,21 @@ private static int findGroundY(
                     System.currentTimeMillis());
             if (first != null) {
                 repeated++;
-                LOGGER.warn("PLACEMENT_TEST DUPLICATE_SUCCESS chunk=[{},{}] feature={} type={} year={} generation={} firstAgeMs={}",
-                        chunk.x, chunk.z, feature, s.type, year, generation,
+                // RUN-3 FINDING: the historical-refresh drain and the async
+                // placement queue both legitimately re-place the same chunk
+                // within one generation (the second pass overwrites cleanly;
+                // world state is correct). Per-feature WARN spam (thousands
+                // of lines) buried real errors, so repeats are now counted
+                // and summarised at DEBUG; a genuine regression still shows
+                // as a nonzero repeat count in the summary line below.
+                LOGGER.debug("PLACEMENT_TEST repeat chunk=[{},{}] feature={} type={} firstAgeMs={}",
+                        chunk.x, chunk.z, feature, s.type,
                         Math.max(0L, System.currentTimeMillis() - first));
             }
         }
+        if (repeated > 0)
+            LOGGER.info("PLACEMENT_TEST chunk=[{},{}] year={} gen={}: {} repeats of {} features (dual-path re-place; expected during refresh)",
+                    chunk.x, chunk.z, year, generation, repeated, structures.size());
         if (repeated == 0)
             LOGGER.debug("PLACEMENT_TEST success chunk=[{},{}] features={} year={} generation={}",
                     chunk.x, chunk.z, batch.size(), year, generation);
@@ -2227,7 +2591,7 @@ for (int lx = 0; lx < 16; lx++) {
     private TerraDensityFunctions getDf(){
         if(df==null)synchronized(this){
             if(df==null)df=
-                new TerraDensityFunctions(zoom);}
+                new TerraDensityFunctions(zoom,universeId);}
         return df;}
     private RiverLakeEngine getRle(){
         if(rle==null)synchronized(this){
@@ -2264,8 +2628,98 @@ for (int lx = 0; lx < 16; lx++) {
         if(structureIndex==null)synchronized(this){
             if(structureIndex==null){
                 structureIndex=new OsmStructureIndex();
+                // APPETIZER race guard: lets markServed detect
+                // "tile already arrived" and self-swap (the
+                // standalone RACE TEST caught chunks that would
+                // otherwise stay provisional forever).
+                final OsmStructureIndex idx=structureIndex;
+                net.buildtheearth.terraplusplus.generator
+                    .historical.ProvisionalServing.presenceCheck=
+                    (la,lo)->idx.areTilesLoaded(la,la,lo,lo);
                 LOGGER.info("OsmStructureIndex init");}}
         return structureIndex;}
+
+    // ── PARADOX ENGINE ACCESSORS ──────────────────────────────
+    /** Public block→geo for ParadoxEngine (returns [lon,lat]). */
+    public double[] toGeoPublic(int blockX,int blockZ){
+        var d=getDf();
+        return d==null?null:d.toGeo(blockX,blockZ);}
+    /** Public structure index access for ParadoxEngine. */
+    public OsmStructureIndex getStructureIndexPublic(){
+        return getStructureIndex();}
+
+    // ── COLD-START DESTINATION WARMUP ─────────────────────────
+    // Run 7 forensics: /tpll to cold Durgam Cheruvu spent ~90s
+    // generating terrain, and only THEN did chunks start asking
+    // for structure/water/cover tiles — serially, per source.
+    // The player wait and the network wait ran back-to-back.
+    // This fires every source's prefetch in ONE parallel burst
+    // at command time, so tiles download WHILE terrain
+    // generates. Warm starts are untouched (prefetch methods
+    // are mem+disk-checked no-ops on hits). ~0.01 deg covers
+    // the teleport view radius.
+    public void warmDestination(double lat,double lon){
+        final double R=0.01;
+        long t0=System.currentTimeMillis();
+        int fired=0;
+        try{getStructureIndex().prefetchTiles(
+            lat-R,lat+R,lon-R,lon+R);fired++;
+        }catch(Exception e){
+            LOGGER.warn("WARMUP osm-struct failed: {}",
+                e.getMessage());}
+        // OVERTURE DEMOTION (user directive: "If osm is fast
+        // there is no need for overture"): only prefetch the
+        // appetizer when live OSM shows evidence of struggling
+        // (API cooldown, recent failure, or last fetch >3s).
+        // Healthy OSM = zero Overture bandwidth; the appetizer
+        // machinery stays dormant and self-arms when needed.
+        try{if(net.buildtheearth.terraplusplus.generator.osm
+                .OsmStructureIndex.osmStruggling()){
+            net.buildtheearth.terraplusplus.generator.osm
+                .OvertureOsmIndex.getInstance()
+                .prefetch(lat,lon);fired++;
+            LOGGER.info("WARMUP: OSM struggling — Overture "
+                +"appetizer armed");}
+        }catch(Exception e){
+            LOGGER.warn("WARMUP overture-osm failed: {}",
+                e.getMessage());}
+        try{if(worldConfig.overtureBuildings){
+            getMicrosoftIndex().prefetchTiles(
+                lat-R,lat+R,lon-R,lon+R);fired++;}
+        }catch(Exception e){
+            LOGGER.warn("WARMUP msft failed: {}",
+                e.getMessage());}
+        try{if(worldConfig.waterBodies){
+            var rle=getRle();
+            rle.getOsmWaterIndex().prefetch(lat,lon);
+            rle.getOhmWaterIndex().prefetch(lat,lon);
+            fired+=2;}
+        }catch(Exception e){
+            LOGGER.warn("WARMUP water failed: {}",
+                e.getMessage());}
+        try{getWorldCover().prefetch(lat,lon);fired++;
+        }catch(Exception e){
+            LOGGER.warn("WARMUP worldcover failed: {}",
+                e.getMessage());}
+        // 7th SOURCE (teleport/terrain fix): ELEVATION. It was
+        // never prefetched — the one source every single column
+        // of every chunk blocks on (up to 3s per missing tile,
+        // serially). Warm the whole destination area so terrain
+        // gen becomes pure math on memory hits.
+        try{var d=getDf();
+            if(d!=null&&d.isProjectionLoaded()){
+                d.prefetchArea(lat-R,lat+R,lon-R,lon+R);
+                fired++;}
+        }catch(Exception e){
+            LOGGER.warn("WARMUP elevation failed: {}",
+                e.getMessage());}
+        LOGGER.info("COLD WARMUP [{},{}]: {} sources "
+            +"prefetching in parallel with terrain gen "
+            +"({}ms to dispatch)",
+            String.format("%.4f",lat),
+            String.format("%.4f",lon),
+            fired,System.currentTimeMillis()-t0);}
+
     private OsmStructureGenerator
             getStructureGenerator(){
         if(structureGenerator==null)synchronized(this){
@@ -2277,11 +2731,11 @@ for (int lx = 0; lx < 16; lx++) {
                 LOGGER.info(
                     "OsmStructureGenerator init");}}
         return structureGenerator;}
-    private OvertureIndex getOvertureIndex(){
+    private MicrosoftIndex getMicrosoftIndex(){
         if(overtureIndex==null)synchronized(this){
             if(overtureIndex==null){
-                overtureIndex=OvertureIndex.getInstance();
-                LOGGER.info("OvertureIndex init");}}
+                overtureIndex=MicrosoftIndex.getInstance();
+                LOGGER.info("MicrosoftIndex init");}}
         return overtureIndex;}
     private SourceCooperativeIndex getVidaIndex(){
         if(vidaIndex==null)synchronized(this){
@@ -2302,7 +2756,7 @@ for (int lx = 0; lx < 16; lx++) {
                 asyncManager=new AsyncStructureManager(
                     getOhmIndex(),
                     getStructureIndex(),
-                    getOvertureIndex(),
+                    getMicrosoftIndex(),
                     getStructureGenerator(),getDf(),
                     worldConfig,getPlacementQueue());
                 LOGGER.info(
@@ -2491,11 +2945,71 @@ for (int lx = 0; lx < 16; lx++) {
                 assignBiomes(ch);return ch;}
             if(terrChunks.containsKey(k)){
                 assignBiomes(ch);return ch;}
+            // COLD-START PIPELINE: kick data downloads THE MOMENT
+            // terrain generation starts, not when decoration
+            // discovers missing tiles minutes later. Terrain gen
+            // is the prefetch window — generating and downloading
+            // run simultaneously instead of back-to-back.
+            // Area-deduped (one trigger per 0.01-deg tile ≈ 41
+            // chunks); warm start = mem/disk hit = no-op.
+            prefetchForChunk(cx,cz);
             generateTerrain(ch);
             assignBiomes(ch);
             markTerrainPlaced(ch);
             evict(cx,cz);
             return ch;},ex);}
+
+    // ── GENERATION-TIME PREFETCH ──────────────────────────────
+    /** 0.01-deg areas whose data prefetch already fired. Bounded:
+     *  cleared when it grows past 4096 entries (an area re-fire
+     *  is a cheap cache no-op anyway). */
+    private final Set<Long> prefetchedAreas =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private void prefetchForChunk(int cx,int cz){
+        try{
+            var d=getDf();
+            if(d==null||!d.isProjectionLoaded())return;
+            double[] g=d.toGeo((cx<<4)+8,(cz<<4)+8);
+            if(g==null||Double.isNaN(g[0]))return;
+            // LOADING-SCREEN FIX: don't warm 6 data sources
+            // for open-Atlantic spawn chunks (projection
+            // origin). Nothing to fetch there at any year.
+            if(isDeepOcean(g[1],g[1],g[0],g[0]))return;
+            long area=(((long)Math.floor(g[1]/0.01))<<32)
+                |(((long)Math.floor(g[0]/0.01))&0xFFFFFFFFL);
+            if(!prefetchedAreas.add(area))return;
+            if(prefetchedAreas.size()>4096)
+                prefetchedAreas.clear();
+            // Already on a worker thread; prefetches are
+            // fire-and-forget submits to each index's dl-pool.
+            warmDestination(g[1],g[0]);
+        }catch(Exception ignored){}}
+
+    // ── LOADING-SCREEN FIX: deep-ocean detection ─────────────
+    private final java.util.concurrent.atomic.AtomicInteger
+        oceanFastLogged=
+            new java.util.concurrent.atomic.AtomicInteger();
+    /** True when every sampled corner+centre of the bbox is far
+     *  below sea level (<-30m). Elevation comes from the same
+     *  cache the terrain pass just filled, so this costs no
+     *  network. -30m keeps every coastal, lake and shallow
+     *  chunk on the normal path (Netherlands at -6m is safe). */
+    private boolean isDeepOcean(double mnLa,double mxLa,
+            double mnLo,double mxLo){
+        try{
+            var d=getDf();
+            if(d==null)return false;
+            double[][] pts={
+                {mnLa,mnLo},{mnLa,mxLo},
+                {mxLa,mnLo},{mxLa,mxLo},
+                {(mnLa+mxLa)/2,(mnLo+mxLo)/2}};
+            for(double[] p:pts)
+                if(d.getElevationFast(p[0],p[1])>-30)
+                    return false;
+            return true;
+        }catch(Exception e){return false;}}
+
 
     // ── BIOME DECORATION ──────────────────────────────────────
     @Override
@@ -2558,16 +3072,38 @@ for (int lx = 0; lx < 16; lx++) {
                     mxLa=Math.max(mxLa,g[1]);
                     mnLo=Math.min(mnLo,g[0]);
                     mxLo=Math.max(mxLo,g[0]);}
+            // LOADING-SCREEN FIX: deep-ocean fast path. World
+            // spawn is the projection origin (open Atlantic,
+            // -4835m); run 13's loading screen spent ~50s
+            // asking OSM/OHM/WorldCover about 441 chunks of
+            // open water. If every sample is deep ocean there
+            // are no structures/vegetation at ANY year: mark
+            // decorated and return without touching a single
+            // data source. Elevation is already cached from
+            // the terrain pass, so this is pure math. -30m
+            // spares all coastal/shallow chunks.
+            if(isDeepOcean(mnLa,mxLa,mnLo,mxLo)){
+                if(oceanFastLogged.getAndIncrement()<10)
+                    LOGGER.info("OCEAN FASTPATH [{},{}]: "
+                        +"deep ocean chunk, all data "
+                        +"sources skipped",cx,cz);
+                markDecorationPlaced(ch);
+                markChunkCurrentYear(ch);
+                return;}
             List<OsmStructureIndex.OsmStructure> all=
                 new ArrayList<>();
             List<OhmStructureIndex.OhmStructure>
                 upcoming=new ArrayList<>();
             boolean retry=false;
+            // FAST-TELEPORT FIX: short bounded wait instead of
+            // 8s/source. Miss -> appetizer + async retry; the
+            // chunk reaches FULL immediately and the swap
+            // machinery upgrades it when downloads land.
             if(worldConfig.timeEnabled){
                 var merged=getHistoricalManager()
                     .getStructuresForChunk(
                         mnLa,mxLa,mnLo,mxLo,
-                        STRUCTURE_FETCH_TIMEOUT_MS);
+                        GEN_STRUCT_WAIT_MS);
                 if(merged==null){
                     retry=true;
                     LOGGER.debug(
@@ -2586,7 +3122,7 @@ for (int lx = 0; lx < 16; lx++) {
                         .getStructuresForChunkBlocking(
                             mnLa,mxLa,mnLo,mxLo,
                             worldConfig,
-                            STRUCTURE_FETCH_TIMEOUT_MS);
+                            GEN_STRUCT_WAIT_MS);
                     if(os!=null&&!os.isEmpty())
                         all.addAll(os);
                     else if(os==null){
@@ -2614,7 +3150,7 @@ for (int lx = 0; lx < 16; lx++) {
                         var vb=vi
                             .getBuildingsForChunkBlocking(
                                 mnLa,mxLa,mnLo,mxLo,
-                                STRUCTURE_FETCH_TIMEOUT_MS,
+                                GEN_STRUCT_WAIT_MS,
                                 null);
                         if(vb==null)
                             retry=true;   // shard still downloading
@@ -2643,12 +3179,12 @@ for (int lx = 0; lx < 16; lx++) {
                         ||"both".equals(src))
                         &&worldConfig.overtureBuildings)
                     try{
-                        var ov=getOvertureIndex();
+                        var ov=getMicrosoftIndex();
                         if(ov.isEnabled()){
                             var ob=ov
                                 .getBuildingsForChunkBlocking(
                                     mnLa,mxLa,mnLo,mxLo,
-                                    STRUCTURE_FETCH_TIMEOUT_MS);
+                                    GEN_STRUCT_WAIT_MS);
                             if(ob!=null&&!ob.isEmpty()){
                                 List<OsmStructureIndex
                                     .OsmStructure> blk=
@@ -2671,7 +3207,7 @@ for (int lx = 0; lx < 16; lx++) {
                                             mnLa,mxLa,
                                             mnLo,mxLo,
                                             worldConfig,
-                                            STRUCTURE_FETCH_TIMEOUT_MS);
+                                            GEN_STRUCT_WAIT_MS);
                                     if(oc!=null)
                                         for(var s:oc)
                                             if(s.type==
@@ -2725,6 +3261,42 @@ for (int lx = 0; lx < 16; lx++) {
                             cx,cz,e.getMessage());
                         retry=true;}
             }
+            // ── APPETIZER (generation path — fast-teleport fix)
+            // Main sources missed the short budget: plate any
+            // resident Overture data NOW so the chunk generates
+            // with buildings/roads instead of bare, and mark it
+            // provisional; the async retry above still runs and
+            // the swap upgrades to the main course on arrival.
+            if(retry&&all.isEmpty()&&APPETIZER_SERVING){
+                try{
+                    var ovOsm=net.buildtheearth.terraplusplus
+                        .generator.osm.OvertureOsmIndex
+                        .getInstance().getStructuresForArea(
+                            mnLa,mxLa,mnLo,mxLo,
+                            GEN_APPETIZER_WAIT_MS);
+                    if(ovOsm!=null&&!ovOsm.isEmpty()){
+                        int yr=TerraTimeManager
+                            .getCurrentYear();
+                        for(var s:ovOsm)
+                            if(!worldConfig.timeEnabled
+                                    ||HistoricalDateParser
+                                        .isVisibleAt(
+                                            s.startYear,
+                                            s.endYear,yr,true))
+                                all.add(s);
+                        if(!all.isEmpty())
+                            net.buildtheearth.terraplusplus
+                                .generator.historical
+                                .ProvisionalServing.markServed(
+                                    cx,cz,
+                                    (mnLa+mxLa)/2,
+                                    (mnLo+mxLo)/2,all.size());
+                    }
+                }catch(Exception e){
+                    LOGGER.debug(
+                        "gen appetizer [{},{}]: {}",
+                        cx,cz,e.getMessage());}
+            }
             if(!all.isEmpty()){
                 boolean success=getStructureGenerator()
                     .generateStructuresFromList(ch,all);
@@ -2759,7 +3331,7 @@ for (int lx = 0; lx < 16; lx++) {
 
     // ── OVERLAP HELPERS ───────────────────────────────────────
     private static boolean overlaps(
-            OvertureIndex.OvertureBuilding m,
+            MicrosoftIndex.MicrosoftBuilding m,
             List<OsmStructureIndex.OsmStructure> blk){
         for(var o:blk){
             if(o.nodes==null||o.nodes.length<2)
@@ -4117,7 +4689,7 @@ for (int lx = 0; lx < 16; lx++) {
                         || TerraTimeManager.getCurrentYear() >=
                             StructureDateEstimator.getPopulationFloor(cLa, cLo);
                     if(worldConfig.overtureBuildings && overtureEligible){
-                        var ov=getOvertureIndex();
+                        var ov=getMicrosoftIndex();
                         if(ov.isEnabled())
                             ov.prefetchTiles(
                                 cLa-m,cLa+m,cLo-m,cLo+m);

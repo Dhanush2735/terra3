@@ -10,7 +10,7 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.buildtheearth.terraplusplus.generator.TerraChunkGenerator;
 import net.buildtheearth.terraplusplus.generator.TerraDensityFunctions;
 import net.buildtheearth.terraplusplus.generator.osm.AsyncStructureManager;
-import net.buildtheearth.terraplusplus.generator.osm.OvertureIndex;
+import net.buildtheearth.terraplusplus.generator.osm.MicrosoftIndex;
 import net.buildtheearth.terraplusplus.generator.osm.StructurePlacementQueue;
 import net.buildtheearth.terraplusplus.generator.osm.StructureTickHandler;
 import net.buildtheearth.terraminusminus.projection.GeographicProjection;
@@ -68,11 +68,78 @@ public class TpllCommand {
         return densityFunctions;
     }
 
-    private static int estimateSurfaceY(int blockX, int blockZ) {
+    // classify() can trigger SYNCHRONOUS elevation-tile downloads on a
+    // cold cache (observed: /tpll froze the server thread for 57s /
+    // 1147 ticks). All command-path classification therefore runs on
+    // this worker with a hard wait cap; on timeout we teleport high
+    // and let the heightmap correct Y once the chunk generates.
+    private static final java.util.concurrent.ExecutorService CLASSIFY_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "Terra++TpllClassify");
+                t.setDaemon(true);
+                return t;
+            });
+    private static final long CLASSIFY_WAIT_MS = 1500;
+
+    private static TerraDensityFunctions.TerrainColumn classifyBounded(
+            int blockX, int blockZ) {
         TerraDensityFunctions df = getDensityFunctions();
-        if (df == null) return 200;
+        if (df == null) return null;
         try {
-            TerraDensityFunctions.TerrainColumn col = df.classify(blockX, blockZ);
+            return java.util.concurrent.CompletableFuture
+                    .supplyAsync(() -> df.classify(blockX, blockZ), CLASSIFY_POOL)
+                    .get(CLASSIFY_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            // Timeout/failure: tile keeps downloading in the background;
+            // the NEXT call for this position is a cache hit.
+            return null;
+        }
+    }
+
+    // ── ASYNC TELEPORT COMPLETION ─────────────────────────────
+    private record PendingTeleport(java.util.UUID player,
+            net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dim,
+            double x, double y, double z, float yRot, float xRot, long since) {}
+
+    private static final java.util.concurrent.ConcurrentLinkedQueue<PendingTeleport>
+            PENDING_TELEPORTS = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    // RUN-14 FIX: was 90_000 — and run 14 hit the full cap
+    // ("Destination still generating; teleported anyway" at
+    // T+90s) even though structures downloaded at T+7s and
+    // appetizers served at T+5s. The chunk's FULL status is a
+    // formality the player shouldn't wait for: terrain exists
+    // within seconds, and every remaining feature arrives via
+    // the appetizer/swap machinery AFTER arrival. 12s covers
+    // the honest terrain-generation cases; past that, waiting
+    // helps nothing.
+    private static final long PENDING_TELEPORT_TIMEOUT_MS = 12_000;
+
+    /** Called every server tick (registered from TerraPlusPlus events). */
+    public static void tickPendingTeleports(net.minecraft.server.MinecraftServer server) {
+        if (PENDING_TELEPORTS.isEmpty()) return;
+        java.util.Iterator<PendingTeleport> it = PENDING_TELEPORTS.iterator();
+        while (it.hasNext()) {
+            PendingTeleport pt = it.next();
+            ServerLevel lvl = server.getLevel(pt.dim());
+            ServerPlayer p = server.getPlayerList().getPlayer(pt.player());
+            if (lvl == null || p == null) { it.remove(); continue; }
+            boolean timedOut = System.currentTimeMillis() - pt.since() > PENDING_TELEPORT_TIMEOUT_MS;
+            // getChunkNow is non-blocking: null until workers finish generating.
+            if (lvl.getChunkSource().getChunkNow(((int) pt.x()) >> 4, ((int) pt.z()) >> 4) != null
+                    || timedOut) {
+                p.teleportTo(lvl, pt.x(), pt.y(), pt.z(), pt.yRot(), pt.xRot());
+                p.sendSystemMessage(Component.literal(timedOut
+                        ? "\u00a7e[Terra++] Destination still generating; teleported anyway."
+                        : "\u00a7a[Terra++] Destination ready \u2014 teleported."));
+                it.remove();
+            }
+        }
+    }
+
+    private static int estimateSurfaceY(int blockX, int blockZ) {
+        try {
+            TerraDensityFunctions.TerrainColumn col = classifyBounded(blockX, blockZ);
+            if (col == null) return 200;
             switch (col.type) {
                 case LAND: return col.surfaceY + 2;
                 case COASTLINE: return TerraDensityFunctions.SEA_LEVEL + 2;
@@ -277,6 +344,22 @@ public class TpllCommand {
             }
 
             double mcX = mc[0], mcZ = mc[1];
+
+            // SIT→ORDER LATENCY FIX: fire the data-source
+            // prefetch FIRST. It only needs lat/lon (valid now
+            // — bounds check passed), but it used to run AFTER
+            // estimateSurfaceY, whose classify can block up to
+            // 1.5s on a cold elevation download, plus lazy
+            // projection init (~1s). That was 1-2.5s of the
+            // waiter measuring the table before taking the
+            // order. Async: costs the command thread nothing.
+            if (TerraChunkGenerator.activeInstance != null) {
+                final double wLat = lat, wLon = lon;
+                java.util.concurrent.CompletableFuture.runAsync(() ->
+                        TerraChunkGenerator.activeInstance
+                                .warmDestination(wLat, wLon));
+            }
+
             int teleportY; String ySource;
 
             if (manualY != NO_Y) {
@@ -291,7 +374,33 @@ public class TpllCommand {
             }
 
             teleportY = Math.max(TerraDensityFunctions.MIN_Y, Math.min(TerraDensityFunctions.MAX_Y, teleportY));
-            player.teleportTo(player.serverLevel(), mcX, teleportY, mcZ, player.getYRot(), player.getXRot());
+
+            // RUN-3 FIX: teleporting into ungenerated chunks forced
+            // SYNCHRONOUS generation on the server thread (measured:
+            // 53s stall / 1063 ticks behind). If the destination chunk
+            // is already live we teleport instantly; otherwise we add a
+            // chunk ticket so workers generate it in the background and
+            // a tick handler completes the teleport when it is ready.
+            ServerLevel destLevel = player.serverLevel();
+            int dcx = ((int) mcX) >> 4, dcz = ((int) mcZ) >> 4;
+
+            // (data-source prefetch already dispatched above,
+            // before the Y estimate — SIT→ORDER latency fix)
+
+            if (destLevel.getChunkSource().getChunkNow(dcx, dcz) != null) {
+                player.teleportTo(destLevel, mcX, teleportY, mcZ, player.getYRot(), player.getXRot());
+            } else {
+                net.minecraft.world.level.ChunkPos dpos = new net.minecraft.world.level.ChunkPos(dcx, dcz);
+                destLevel.getChunkSource().addRegionTicket(
+                        net.minecraft.server.level.TicketType.POST_TELEPORT, dpos, 1,
+                        player.getId());
+                PENDING_TELEPORTS.add(new PendingTeleport(player.getUUID(), destLevel.dimension(),
+                        mcX, teleportY, mcZ, player.getYRot(), player.getXRot(),
+                        System.currentTimeMillis()));
+                source.sendSuccess(() -> prefix().append(Component.literal(
+                        "Generating destination terrain... you will be teleported when ready.")
+                        .withStyle(ChatFormatting.YELLOW)), false);
+            }
 
             String coordText = String.format("%.4f, %.4f", lat, lon);
             MutableComponent coordComponent = Component.literal(coordText)
@@ -312,11 +421,12 @@ public class TpllCommand {
             TerraDensityFunctions df = getDensityFunctions();
             if (df != null) {
                 try {
-                    TerraDensityFunctions.TerrainColumn col = df.classify((int) mcX, (int) mcZ);
-                    source.sendSuccess(() -> Component.literal(
-                            String.format("  Elevation: %.1fm | Type: %s | Surface Y: %d",
-                                    col.elevationMeters, col.type, col.surfaceY))
-                            .withStyle(ChatFormatting.GRAY), false);
+                    TerraDensityFunctions.TerrainColumn col = classifyBounded((int) mcX, (int) mcZ);
+                    if (col != null)
+                        source.sendSuccess(() -> Component.literal(
+                                String.format("  Elevation: %.1fm | Type: %s | Surface Y: %d",
+                                        col.elevationMeters, col.type, col.surfaceY))
+                                .withStyle(ChatFormatting.GRAY), false);
                 } catch (Exception ignored) {}
             }
 
@@ -376,10 +486,15 @@ public class TpllCommand {
             TerraDensityFunctions df = getDensityFunctions();
             if (df != null) {
                 try {
-                    TerraDensityFunctions.TerrainColumn col = df.classify(bx, bz);
-                    source.sendSuccess(() -> Component.literal(
-                            String.format("  Elevation: %.1fm | Type: %s", col.elevationMeters, col.type))
-                            .withStyle(ChatFormatting.GRAY), false);
+                    TerraDensityFunctions.TerrainColumn col = classifyBounded(bx, bz);
+                    if (col != null)
+                        source.sendSuccess(() -> Component.literal(
+                                String.format("  Elevation: %.1fm | Type: %s", col.elevationMeters, col.type))
+                                .withStyle(ChatFormatting.GRAY), false);
+                    else
+                        source.sendSuccess(() -> Component.literal(
+                                "  Elevation: (loading tiles...)")
+                                .withStyle(ChatFormatting.GRAY), false);
                 } catch (Exception ignored) {}
             }
 
@@ -440,8 +555,9 @@ public class TpllCommand {
                 try {
                     double[] mc = proj.fromGeo(Double.parseDouble(lon), Double.parseDouble(lat));
                     String mcPart = String.format("MC: %.0f, %.0f", mc[0], mc[1]);
-                    if (df != null) {
-                        TerraDensityFunctions.TerrainColumn col = df.classify((int) mc[0], (int) mc[1]);
+                    TerraDensityFunctions.TerrainColumn col =
+                            df != null ? classifyBounded((int) mc[0], (int) mc[1]) : null;
+                    if (col != null) {
                         extraInfo = String.format(" (%s | %.0fm | %s)", mcPart, col.elevationMeters, col.type);
                     } else {
                         extraInfo = String.format(" (%s)", mcPart);

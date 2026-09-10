@@ -212,7 +212,7 @@ public class SourceCooperativeIndex {
     }
 
     /** True when a Microsoft footprint overlaps an already-accepted VIDA building. */
-    public static boolean overlapsVida(OvertureIndex.OvertureBuilding m,
+    public static boolean overlapsVida(MicrosoftIndex.MicrosoftBuilding m,
                                        List<VidaBuilding> vida) {
         if (m == null || vida == null || vida.isEmpty()) return false;
 
@@ -370,7 +370,7 @@ public class SourceCooperativeIndex {
     private final ExecutorService dlPool = Executors.newFixedThreadPool(1, r -> {
         Thread t = new Thread(r, "Terra++VIDA"); t.setDaemon(true); return t;
     });
-    private final Path cacheDir = Paths.get("terra_cache", "vida_buildings");
+    private final Path cacheDir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("vida_buildings");
 
     // ================================================================
     // SINGLETON
@@ -614,7 +614,7 @@ public class SourceCooperativeIndex {
             while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
             return bo.toByteArray();
         } finally {
-            c.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(c);
         }
     }
 

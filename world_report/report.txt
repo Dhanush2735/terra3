@@ -1,0 +1,10 @@
+WORLD CHECK selftest-build: PASS — synthetic region written (24576 bytes, 4 chunks)
+WORLD CHECK region: PASS — r.0.0.mca: 4 chunks parsed, 0 failed
+WORLD CHECK selftest-verify: PASS — all 4 chunks: surface block AND height exactly match ground truth
+WORLD CHECK region: PASS — r.0.0.mca: 4 chunks parsed, 0 failed
+WORLD CHECK surface: PASS — r.0.0.mca: 4 chunks, surface coverage 100% (1024 columns)
+WORLD CHECK colors: PASS — r.0.0.mca: 0% surface blocks without palette color (render magenta) top:
+WORLD CHECK render: PASS — r.0.0.mca: world_report/map_r.0.0.png (512x512, y 62..70)
+WORLD CHECK era: PASS — r.0.0.mca: road-material era census: modern=256  1900s=0  victorian/roman=256  medieval=0 -> dominant: modern
+WORLD CHECK timing: PASS — r.0.0.mca: processed in 0.1s
+WORLD CHECK selftest-census: PASS — all 4 block counts == 256

@@ -1,0 +1,12 @@
+{
+  "type": "terraplusplus:earth_type",
+  "generator": {
+    "type": "terraplusplus:earth",
+    "projection": "bte",
+    "universe": "custom4",
+    "biome_source": {
+      "type": "minecraft:multi_noise",
+      "preset": "minecraft:overworld"
+    }
+  }
+}

@@ -28,6 +28,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.util.zip.GZIPInputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -79,7 +81,19 @@ public class OsmStructureIndex {
         BUILDING, BUILDING_PART, ROAD, RAILWAY, BRIDGE,
         WALL, FENCE, GARDEN, PARK, FARMLAND, FOREST,
         MEADOW, PARKING, FOOTWAY, CYCLEWAY, STREET_LAMP,
-        BARRIER, HEDGE
+        BARRIER, HEDGE,
+        // ── extended OSM coverage ──
+        SAND,      // natural=beach|sand
+        ROCK,      // natural=bare_rock|scree|shingle, landuse=quarry
+        TREE_ROW,  // natural=tree_row (linear)
+        TREE,      // natural=tree (node)
+        PIER,      // man_made=pier|breakwater|groyne
+        TOWER,     // man_made=tower|chimney|water_tower|... (node or small area)
+        PYLON,     // power=tower|pole (node)
+        RUNWAY,    // aeroway=runway|taxiway|helipad
+        APRON,     // aeroway=apron (area)
+        POOL,      // leisure=swimming_pool (area)
+        PLATFORM   // railway=platform (area or line)
     }
 
     public enum BridgeStructure {
@@ -105,6 +119,12 @@ public class OsmStructureIndex {
                 case "movable"            -> MOVABLE;
                 case "trestle"            -> TRESTLE;
                 case "viaduct"            -> VIADUCT;
+                // taginfo: 234 ways say suspension_bridge
+                // directly in the bridge tag
+                case "suspension",
+                     "suspension_bridge"  -> SUSPENSION;
+                // 336 log bridges: felled logs -> wooden deck
+                case "log_bridge"         -> BOARDWALK;
                 default                   -> null;
             };
         }
@@ -112,8 +132,12 @@ public class OsmStructureIndex {
         public static BridgeStructure fromStructureTag(
                 String structureValue) {
             if (structureValue == null) return null;
-            return switch (
-                    structureValue.toLowerCase().trim()) {
+            String v = structureValue.toLowerCase().trim();
+            // taginfo: 40+ multi-values like "beam;arch" —
+            // first token is the dominant structure
+            int semi = v.indexOf(';');
+            if (semi > 0) v = v.substring(0, semi).trim();
+            return switch (v) {
                 case "arch", "arch_bridge"  -> ARCH;
                 case "beam", "girder",
                      "box_girder",
@@ -143,6 +167,10 @@ public class OsmStructureIndex {
                 case "cantilever"           -> CANTILEVER;
                 case "covered"              -> COVERED;
                 case "boardwalk"            -> BOARDWALK;
+                // taginfo additions: wooden variants (~210 uses)
+                // render as plank decks
+                case "log", "simple_wooden",
+                     "wood", "plank"        -> BOARDWALK;
                 default                     -> null;
             };
         }
@@ -172,6 +200,12 @@ public class OsmStructureIndex {
         public final OsmNode[]       nodes;
         /** Courtyard/island rings for area relations; empty for simple ways. */
         public OsmNode[][]           innerRings = new OsmNode[0][];
+        /**
+         * Explicit width=* tag in metres, 0 when untagged. Set
+         * post-construction (like innerRings) so the many existing
+         * constructor call sites stay untouched.
+         */
+        public double                explicitWidth = 0;
         public final boolean         isArea, isOneWay,
                                      isPart, tunnel,
                                      isRailBridge;
@@ -309,12 +343,21 @@ public class OsmStructureIndex {
 
         public double distanceToLine(
                 double lat, double lon) {
+            // Longitude degrees shrink by cos(lat); without this
+            // correction, N-S oriented ways were rendered too
+            // narrow at higher latitudes (previously up to ~36%
+            // at London's latitude).
+            double cosLat = Math.cos(
+                Math.toRadians(lat));
             double minD = Double.MAX_VALUE;
             for (int i = 0; i < nodes.length - 1;
                     i++) {
-                double d = ptSegDist(lat, lon,
-                    nodes[i].lat, nodes[i].lon,
-                    nodes[i+1].lat, nodes[i+1].lon);
+                double d = ptSegDist(
+                    lat, lon * cosLat,
+                    nodes[i].lat,
+                    nodes[i].lon * cosLat,
+                    nodes[i+1].lat,
+                    nodes[i+1].lon * cosLat);
                 if (d < minD) minD = d;
             }
             return minD * 111320.0;
@@ -478,8 +521,7 @@ public class OsmStructureIndex {
                 return t;
             });
 
-        Path dir = Paths.get(
-            "terra_cache", "osm_structures");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("osm_structures_v4"); // v4: +man_made=bridge outlines
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -605,11 +647,19 @@ public class OsmStructureIndex {
                 }
             }
 
-            // Find tiles still missing after disk check
+            // Find tiles still missing after disk check.
+            // Invalid (FAILED) cached tiles count as missing so
+            // a transient bad response can never permanently
+            // stall the refresh pipeline.
             Set<Long> missingKeys = new HashSet<>();
-            for (long key : neededKeys)
-                if (!memCache.containsKey(key))
+            for (long key : neededKeys) {
+                StructureTile t = memCache.get(key);
+                if (t == null) { missingKeys.add(key); continue; }
+                if (!t.valid) {
+                    memCache.remove(key, t);
                     missingKeys.add(key);
+                }
+            }
 
             if (missingKeys.isEmpty())
                 return collectFromKeys(neededKeys,
@@ -618,6 +668,21 @@ public class OsmStructureIndex {
                     minLon - OVERLAP_MARGIN,
                     maxLon + OVERLAP_MARGIN,
                     config, false);
+
+            // COLD-START BATCHING: 2+ missing tiles = one
+            // area request instead of N rate-limited singles.
+            if (missingKeys.size() >= 2) {
+                Set<Long> got =
+                    fetchMissingAsBatches(missingKeys);
+                missingKeys.removeAll(got);
+                if (missingKeys.isEmpty())
+                    return collectFromKeys(neededKeys,
+                        minLat - OVERLAP_MARGIN,
+                        maxLat + OVERLAP_MARGIN,
+                        minLon - OVERLAP_MARGIN,
+                        maxLon + OVERLAP_MARGIN,
+                        config, false);
+            }
 
             // Submit network fetches for missing tiles
             List<CompletableFuture<StructureTile>>
@@ -740,12 +805,13 @@ public class OsmStructureIndex {
     public void prefetchTiles(double minLat,
             double maxLat, double minLon,
             double maxLon) {
+        // Collect genuinely missing tiles (mem + disk checked
+        // first: cache hits never cost a token or a thread).
+        Set<Long> missing = new HashSet<>();
         for (long key : getTileKeysForArea(
                 minLat, maxLat, minLon, maxLon)) {
             if (memCache.containsKey(key)) continue;
             if (pending.containsKey(key)) continue;
-
-            // Disk check before submitting
             if (diskOk) {
                 StructureTile disk = loadDisk(key);
                 if (disk != null) {
@@ -753,7 +819,54 @@ public class OsmStructureIndex {
                     continue;
                 }
             }
+            missing.add(key);
+        }
+        if (missing.isEmpty()) return;
 
+        if (missing.size() >= 2) {
+            // Cold start: one batched area request. Register a
+            // pending future per tile so concurrent callers wait
+            // on the batch instead of firing their own fetches.
+            Map<Long, CompletableFuture<StructureTile>> claimed =
+                new HashMap<>();
+            for (long key : missing) {
+                CompletableFuture<StructureTile> f =
+                    new CompletableFuture<>();
+                if (pending.putIfAbsent(key, f) == null)
+                    claimed.put(key, f);
+            }
+            if (claimed.isEmpty()) return;
+            dlPool.submit(() -> {
+                Set<Long> got = fetchMissingAsBatches(
+                    claimed.keySet());
+                for (var e : claimed.entrySet()) {
+                    if (!got.contains(e.getKey())) {
+                        // fall back to single-tile path
+                        long k = e.getKey();
+                        int tLatI = (int)(k >> 32);
+                        int tLonI = (int) k;
+                        StructureTile st = fetchTile(k,
+                            tLatI * TILE_DEG,
+                            tLonI * TILE_DEG);
+                        e.getValue().complete(st);
+                        pending.remove(k, e.getValue());
+                    } else {
+                        // fetchBatch completed+removed it;
+                        // ensure future is resolved.
+                        StructureTile st =
+                            memCache.get(e.getKey());
+                        if (!e.getValue().isDone())
+                            e.getValue().complete(st != null
+                                ? st : StructureTile.FAILED);
+                        pending.remove(e.getKey(),
+                            e.getValue());
+                    }
+                }
+            });
+            return;
+        }
+
+        for (long key : missing) {
             int tLatI = (int)(key >> 32);
             int tLonI = (int) key;
             double tLat = tLatI * TILE_DEG;
@@ -893,18 +1006,24 @@ public class OsmStructureIndex {
             TerraWorldConfig config) {
         return switch (type) {
             case BUILDING,
-                 BUILDING_PART  -> config.buildings;
+                 BUILDING_PART,
+                 TOWER          -> config.buildings;
             case ROAD, FOOTWAY,
                  CYCLEWAY       -> config.roads;
-            case RAILWAY        -> config.railways;
-            case BRIDGE         -> config.bridges;
+            case RAILWAY,
+                 PLATFORM       -> config.railways;
+            case BRIDGE, PIER   -> config.bridges;
             case WALL, FENCE,
                  BARRIER        -> config.walls;
             case GARDEN, PARK,
-                 HEDGE          -> config.gardens;
+                 HEDGE, POOL    -> config.gardens;
             case FARMLAND, FOREST,
-                 MEADOW, PARKING -> config.landuse;
-            case STREET_LAMP    -> config.streetLights;
+                 MEADOW, PARKING,
+                 SAND, ROCK, TREE_ROW,
+                 TREE, RUNWAY,
+                 APRON          -> config.landuse;
+            case STREET_LAMP,
+                 PYLON          -> config.streetLights;
         };
     }
 
@@ -919,6 +1038,470 @@ public class OsmStructureIndex {
      * fetching from different endpoints are never
      * blocked by each other.
      */
+    /**
+     * Full-coverage query for an arbitrary bbox. Used by both the
+     * single-tile fetch and the cold-start batch fetch.
+     */
+    private static String buildQuery(String bbox, int timeoutSec) {
+        // Full-coverage query. Every tag family the generator can render is
+        // requested here. Values are whitelisted per family (an unfiltered
+        // landuse/natural fetch would return huge residential/industrial
+        // polygons that cannot be rendered meaningfully and would multiply
+        // payload size). Combined with gzip transfer-encoding this stays
+        // cheaper on the wire than the old uncompressed narrow query while
+        // covering roughly twice the feature types.
+        String queryStr = "[out:json][timeout:" + timeoutSec + "];("
+            + "way[\"building\"](" + bbox + ");"
+            + "relation[\"building\"]"
+            + "(" + bbox + ");"
+            + "way[\"building:part\"]"
+            + "(" + bbox + ");"
+            + "relation[\"building:part\"]"
+            + "(" + bbox + ");"
+            + "way[\"highway\"](" + bbox + ");"
+            + "way[\"railway\"~\"^(rail|light_rail"
+            + "|subway|tram|narrow_gauge|funicular"
+            + "|monorail|platform)$\"](" + bbox + ");"
+            + "way[\"bridge\"](" + bbox + ");"
+            // Some mapped bridges are multipolygon/route relations whose
+            // member ways carry no individual bridge tag.
+            + "relation[\"bridge\"](" + bbox + ");"
+            + "way[\"barrier\"~\"^(wall|fence|hedge"
+            + "|retaining_wall|city_wall|guard_rail"
+            + "|handrail)$\"](" + bbox + ");"
+            + "way[\"landuse\"~\"^(farmland|forest"
+            + "|meadow|grass|orchard|vineyard"
+            + "|parking|allotments|cemetery|quarry"
+            + "|recreation_ground|village_green"
+            + "|plant_nursery|flowerbed"
+            + "|farmyard)$\"](" + bbox + ");"
+            + "relation[\"landuse\"~\"^(farmland"
+            + "|forest|meadow|grass|orchard"
+            + "|vineyard|allotments|cemetery"
+            + "|recreation_ground"
+            + "|village_green)$\"](" + bbox + ");"
+            + "way[\"leisure\"~\"^(park|garden"
+            + "|playground|pitch|golf_course"
+            + "|recreation_ground|dog_park"
+            + "|swimming_pool|track"
+            + "|nature_reserve)$\"](" + bbox + ");"
+            + "relation[\"leisure\"~\"^(park|garden"
+            + "|golf_course|nature_reserve"
+            + "|recreation_ground)$\"](" + bbox + ");"
+            + "way[\"natural\"~\"^(wood|scrub|heath"
+            + "|grassland|beach|sand|bare_rock"
+            + "|scree|shingle|tree_row)$\"]"
+            + "(" + bbox + ");"
+            + "relation[\"natural\"~\"^(wood|scrub"
+            + "|heath|grassland|beach"
+            + "|sand)$\"](" + bbox + ");"
+            + "way[\"amenity\"~\"^(parking"
+            + "|marketplace|grave_yard)$\"]"
+            + "(" + bbox + ");"
+            + "way[\"man_made\"~\"^(pier|breakwater"
+            + "|groyne|embankment|dyke|tower"
+            + "|storage_tank|silo|water_tower"
+            + "|chimney|lighthouse)$\"]"
+            + "(" + bbox + ");"
+            + "node[\"man_made\"~\"^(tower|chimney"
+            + "|water_tower|lighthouse|mast"
+            + "|flagpole"
+            + "|communications_tower)$\"]"
+            + "(" + bbox + ");"
+            + "way[\"aeroway\"~\"^(runway|taxiway"
+            + "|apron|helipad)$\"](" + bbox + ");"
+            + "node[\"power\"~\"^(tower|pole)$\"]"
+            + "(" + bbox + ");"
+            + "way[\"waterway\"~\"^(dam"
+            + "|weir)$\"](" + bbox + ");"
+            + "node[\"highway\"=\"street_lamp\"]"
+            + "(" + bbox + ");"
+            + "node[\"natural\"=\"tree\"]"
+            + "(" + bbox + ");"
+            // CONTEXT POIs: point features that carry the IDENTITY of the
+            // structure they stand inside (way 635428057 is an anonymous
+            // building=transportation box; the railway=station node inside
+            // it holds the name, the network and the real type). These are
+            // not rendered directly — enrichFromContext() lets containing
+            // buildings inherit from them.
+            + "node[\"railway\"~\"^(station|halt)$\"]"
+            + "(" + bbox + ");"
+            + "node[\"public_transport\"=\"station\"]"
+            + "(" + bbox + ");"
+            + "node[\"amenity\"=\"place_of_worship\"]"
+            + "(" + bbox + ");"
+            + "node[\"historic\"~\"^(monument|memorial"
+            + "|castle|fort|ruins)$\"]"
+            + "(" + bbox + ");"
+            // BRIDGE OUTLINES: man_made=bridge areas are the
+            // identity carriers of major bridges (Durgam Cheruvu
+            // 761604461: bridge:structure=suspension + name +
+            // wikidata live on the OUTLINE; the two carriageway
+            // ways 852586032/35 inside it carry only geometry).
+            // Not rendered directly — enrichBridgesFromOutlines()
+            // lets contained bridge ways inherit from them.
+            + "way[\"man_made\"=\"bridge\"]"
+            + "(" + bbox + ");"
+            + "relation[\"man_made\"=\"bridge\"]"
+            + "(" + bbox + ");"
+            + ");out body geom;";
+        return queryStr;
+    }
+
+    // ── COLD-START BATCH FETCH ────────────────────────────────
+    // One Overpass request per AREA instead of per tile.
+    // A 5x5-tile batch costs ONE rate-limit token and one HTTP
+    // round-trip; fetched individually the same area costs 25
+    // tokens = 25+ seconds of rate-limit waiting on a cold start.
+    // Measured (dense Hyderabad, 0.05 deg): 1 request, ~6 MB
+    // gzipped stream, ~12 s -- vs 30-80 s tile-by-tile.
+    private static final int BATCH_MAX_TILES   = 30;
+    private static final int BATCH_TIMEOUT_SEC = 60;
+    private static final int BATCH_HTTP_READ_MS = 75000;
+
+    /**
+     * Fetch a rectangle of tiles in one Overpass request and
+     * populate the per-tile caches. Returns the set of tile keys
+     * successfully cached (empty on total failure).
+     *
+     * Correctness: a tile is a subset of the batch bbox, so the
+     * batch result is a superset of every per-tile result.
+     * Elements are assigned to each tile their bounding box
+     * overlaps (plus OVERLAP_MARGIN) -- the same bbox test
+     * collectFromKeys() applies at query time. Tiles with no
+     * elements are cached as EMPTY (valid), so ocean/rural areas
+     * never trigger a refetch.
+     */
+    private Set<Long> fetchBatch(int tLatMin, int tLatMax,
+            int tLonMin, int tLonMax) {
+        Set<Long> done = new HashSet<>();
+        if (System.currentTimeMillis() < pauseUntilMs)
+            return done;
+
+        double minLat = tLatMin * TILE_DEG;
+        double maxLat = (tLatMax + 1) * TILE_DEG;
+        double minLon = tLonMin * TILE_DEG;
+        double maxLon = (tLonMax + 1) * TILE_DEG;
+        String bbox = String.format("%.6f,%.6f,%.6f,%.6f",
+            minLat, minLon, maxLat, maxLon);
+        String queryStr = buildQuery(bbox, BATCH_TIMEOUT_SEC);
+
+        totalQueries.incrementAndGet();
+
+        // ── OSM-BATCH-FIRST (fast-download fix, phase 2) ──────
+        // The whole batch block (max 5x6 tiles = 0.05°x0.06° =
+        // 0.003 deg²) fits api.osm.org's 0.25 deg² cap ~80x
+        // over. One GET replaces an Overpass query that waits
+        // in the busy public queue — measured 86-370s there vs
+        // 1.5-7s on the API. The 50k-node cap can 400 on very
+        // dense multi-tile blocks; that failure falls straight
+        // through to the Overpass path below unchanged.
+        String json = fetchViaOsmApi(minLat, minLon,
+            maxLat, maxLon);
+        if (json != null && json.length() > 40) {
+            LOGGER.info("BATCH via api.osm.org "
+                + "[{}..{},{}..{}]: one request",
+                tLatMin, tLatMax, tLonMin, tLonMax);
+        } else {
+            json = null;
+        }
+
+        // Endpoint order: soonest-available first (same policy
+        // as fetchTile).
+        int lastGood = endpointIdx.get()
+            % OVERPASS_ENDPOINTS.length;
+        Integer[] order =
+            new Integer[OVERPASS_ENDPOINTS.length];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, (a, b) -> {
+            long wa = endpointLimiters[a].msUntilNextToken();
+            long wb = endpointLimiters[b].msUntilNextToken();
+            if (wa != wb) return Long.compare(wa, wb);
+            return Boolean.compare(b == lastGood, a == lastGood);
+        });
+
+        for (int attempt = 0;
+                attempt < OVERPASS_ENDPOINTS.length && json == null;
+                attempt++) {
+            int idx = order[attempt];
+            OverpassRateLimiter limiter = endpointLimiters[idx];
+            HttpURLConnection conn = null;
+            boolean inFlight = false;
+            try {
+                limiter.acquire();
+                limiter.acquireInFlight();
+                inFlight = true;
+                conn = (HttpURLConnection)
+                    new URL(OVERPASS_ENDPOINTS[idx])
+                        .openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(6000);
+                conn.setReadTimeout(BATCH_HTTP_READ_MS);
+                conn.setRequestProperty("Content-Type",
+                    "application/x-www-form-urlencoded");
+                conn.setRequestProperty("User-Agent",
+                    "TerraPlusPlus/2.0 Minecraft");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
+                byte[] body = ("data=" + URLEncoder.encode(
+                    queryStr, StandardCharsets.UTF_8))
+                    .getBytes(StandardCharsets.UTF_8);
+                conn.getOutputStream().write(body);
+                conn.getOutputStream().flush();
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    json = readResponse(conn);
+                    endpointIdx.set(idx);
+                } else if (code == 429 || code == 504) {
+                    limiter.penalize(
+                        code == 429 ? 30_000L : 10_000L);
+                } else {
+                    limiter.penalize(8_000L);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return done;
+            } catch (Exception e) {
+                limiter.penalize(10_000L);
+                LOGGER.debug("Batch fetch failed: {}",
+                    e.getMessage());
+            } finally {
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
+                if (inFlight) limiter.releaseInFlight();
+            }
+        }
+        if (json == null) {
+            consecutiveFailures++;
+            return done;
+        }
+        consecutiveFailures = 0;
+
+        // ── Split the batch into per-tile results ──
+        try {
+            JsonObject root = JsonParser.parseString(json)
+                .getAsJsonObject();
+            JsonArray elements =
+                root.getAsJsonArray("elements");
+
+            int tilesLat = tLatMax - tLatMin + 1;
+            int tilesLon = tLonMax - tLonMin + 1;
+            int nTiles = tilesLat * tilesLon;
+            @SuppressWarnings("unchecked")
+            List<OsmStructure>[] perTile =
+                new List[nTiles];
+            @SuppressWarnings("unchecked")
+            List<JsonElement>[] perTileJson =
+                new List[nTiles];
+
+            List<ContextPoi> batchPois = new ArrayList<>();
+            List<BridgeOutline> batchOutlines = new ArrayList<>();
+            if (elements != null) {
+                for (JsonElement el : elements) {
+                    JsonObject obj = el.getAsJsonObject();
+                    ContextPoi poi = contextPoiOf(obj);
+                    if (poi != null) {
+                        batchPois.add(poi);
+                        // The POI element MUST survive into the
+                        // per-tile disk subset, or enrichment
+                        // silently disappears on disk replay next
+                        // session (parseResponse re-derives it
+                        // from the raw JSON).
+                        int pa = (int) Math.floor(
+                            poi.lat / TILE_DEG);
+                        int po = (int) Math.floor(
+                            poi.lon / TILE_DEG);
+                        for (int ta = Math.max(pa - 1, tLatMin);
+                                ta <= Math.min(pa + 1, tLatMax);
+                                ta++)
+                            for (int to = Math.max(po - 1,
+                                        tLonMin);
+                                    to <= Math.min(po + 1,
+                                        tLonMax); to++) {
+                                int slot = (ta - tLatMin)
+                                    * tilesLon + (to - tLonMin);
+                                if (perTileJson[slot] == null) {
+                                    perTile[slot] =
+                                        new ArrayList<>();
+                                    perTileJson[slot] =
+                                        new ArrayList<>();
+                                }
+                                perTileJson[slot].add(el);
+                            }
+                    }
+                    BridgeOutline bo = bridgeOutlineOf(obj);
+                    if (bo != null) {
+                        batchOutlines.add(bo);
+                        // Same disk-replay rule as POIs: write the
+                        // outline element into every tile its bbox
+                        // touches.
+                        int aLo2 = (int) Math.floor(
+                            bo.minLat / TILE_DEG);
+                        int aHi2 = (int) Math.floor(
+                            bo.maxLat / TILE_DEG);
+                        int oLo2 = (int) Math.floor(
+                            bo.minLon / TILE_DEG);
+                        int oHi2 = (int) Math.floor(
+                            bo.maxLon / TILE_DEG);
+                        for (int ta = Math.max(aLo2, tLatMin);
+                                ta <= Math.min(aHi2, tLatMax);
+                                ta++)
+                            for (int to = Math.max(oLo2, tLonMin);
+                                    to <= Math.min(oHi2, tLonMax);
+                                    to++) {
+                                int slot = (ta - tLatMin)
+                                    * tilesLon + (to - tLonMin);
+                                if (perTileJson[slot] == null) {
+                                    perTile[slot] =
+                                        new ArrayList<>();
+                                    perTileJson[slot] =
+                                        new ArrayList<>();
+                                }
+                                perTileJson[slot].add(el);
+                            }
+                    }
+                    OsmStructure parsed = parseElement(obj);
+                    if (parsed == null) continue;
+                    List<OsmStructure> parts =
+                        splitRelationOuterParts(obj, parsed);
+                    List<OsmStructure> all = parts.isEmpty()
+                        ? List.of(parsed) : parts;
+                    // assign to every tile the bbox overlaps
+                    // (margin matches point-query tolerance)
+                    int aLo = (int) Math.floor(
+                        (parsed.minLat - OVERLAP_MARGIN)
+                            / TILE_DEG);
+                    int aHi = (int) Math.floor(
+                        (parsed.maxLat + OVERLAP_MARGIN)
+                            / TILE_DEG);
+                    int oLo = (int) Math.floor(
+                        (parsed.minLon - OVERLAP_MARGIN)
+                            / TILE_DEG);
+                    int oHi = (int) Math.floor(
+                        (parsed.maxLon + OVERLAP_MARGIN)
+                            / TILE_DEG);
+                    for (int ta = Math.max(aLo, tLatMin);
+                            ta <= Math.min(aHi, tLatMax); ta++)
+                        for (int to = Math.max(oLo, tLonMin);
+                                to <= Math.min(oHi, tLonMax);
+                                to++) {
+                            int slot = (ta - tLatMin) * tilesLon
+                                + (to - tLonMin);
+                            if (perTile[slot] == null) {
+                                perTile[slot] =
+                                    new ArrayList<>();
+                                perTileJson[slot] =
+                                    new ArrayList<>();
+                            }
+                            perTile[slot].addAll(all);
+                            perTileJson[slot].add(el);
+                        }
+                }
+            }
+
+            for (int ta = tLatMin; ta <= tLatMax; ta++) {
+                for (int to = tLonMin; to <= tLonMax; to++) {
+                    int slot = (ta - tLatMin) * tilesLon
+                        + (to - tLonMin);
+                    long key = ((long) ta << 32)
+                        | (to & 0xFFFFFFFFL);
+                    StructureTile tile;
+                    if (perTile[slot] == null
+                            || perTile[slot].isEmpty()) {
+                        tile = StructureTile.EMPTY;
+                    } else {
+                        enrichFromContext(
+                            perTile[slot], batchPois);
+                        enrichBridgesFromOutlines(
+                            perTile[slot], batchOutlines);
+                        tile = new StructureTile(
+                            perTile[slot].toArray(
+                                new OsmStructure[0]), true);
+                    }
+                    memCache.put(key, tile);
+                    // APPETIZER swap hook: a cold batch tile just
+                    // became resident. O(1) no-op when nothing is
+                    // provisional (warm start / no appetizers).
+                    net.buildtheearth.terraplusplus.generator
+                        .historical.ProvisionalServing
+                        .notifyTileArrived(
+                            ta * TILE_DEG + TILE_DEG / 2,
+                            to * TILE_DEG + TILE_DEG / 2);
+                    // Disk: store a per-tile Overpass-shaped
+                    // JSON subset so loadDisk() replays it
+                    // identically on the next cold-ish start.
+                    if (diskOk) {
+                        JsonObject sub = new JsonObject();
+                        JsonArray arr = new JsonArray();
+                        if (perTileJson[slot] != null)
+                            for (JsonElement e :
+                                    perTileJson[slot])
+                                arr.add(e);
+                        sub.add("elements", arr);
+                        saveDisk(key, sub.toString());
+                    }
+                    CompletableFuture<StructureTile> f =
+                        pending.remove(key);
+                    if (f != null && !f.isDone())
+                        f.complete(tile);
+                    done.add(key);
+                }
+            }
+            evictIfNeeded();
+            LOGGER.info("BATCH fetch [{}..{},{}..{}]: "
+                + "{} tiles in one request",
+                tLatMin, tLatMax, tLonMin, tLonMax,
+                done.size());
+        } catch (Exception e) {
+            LOGGER.warn("Batch parse failed: {}",
+                e.getMessage());
+        }
+        return done;
+    }
+
+    /**
+     * Group missing tile keys into bounded rectangles and fetch
+     * each rectangle with one request. Returns keys resolved.
+     */
+    private Set<Long> fetchMissingAsBatches(
+            Set<Long> missingKeys) {
+        Set<Long> resolved = new HashSet<>();
+        if (missingKeys.isEmpty()) return resolved;
+
+        // Bounding rectangle of all missing tiles.
+        int aMin = Integer.MAX_VALUE, aMax = Integer.MIN_VALUE;
+        int oMin = Integer.MAX_VALUE, oMax = Integer.MIN_VALUE;
+        for (long key : missingKeys) {
+            int ta = (int) (key >> 32);
+            int to = (int) key;
+            aMin = Math.min(aMin, ta); aMax = Math.max(aMax, ta);
+            oMin = Math.min(oMin, to); oMax = Math.max(oMax, to);
+        }
+        // Split the rectangle into <= BATCH_MAX_TILES blocks
+        // (blocks of up to 5x6 tiles).
+        final int BLK = 5;
+        for (int a0 = aMin; a0 <= aMax; a0 += BLK) {
+            for (int o0 = oMin; o0 <= oMax; o0 += BLK + 1) {
+                int a1 = Math.min(a0 + BLK - 1, aMax);
+                int o1 = Math.min(o0 + BLK, oMax);
+                // does this block contain any missing tile?
+                boolean any = false;
+                for (long key : missingKeys) {
+                    int ta = (int) (key >> 32);
+                    int to = (int) key;
+                    if (ta >= a0 && ta <= a1
+                            && to >= o0 && to <= o1) {
+                        any = true; break;
+                    }
+                }
+                if (!any) continue;
+                resolved.addAll(
+                    fetchBatch(a0, a1, o0, o1));
+            }
+        }
+        return resolved;
+    }
+
     private StructureTile fetchTile(long key,
             double minLat, double minLon) {
 
@@ -926,6 +1509,37 @@ public class OsmStructureIndex {
                 < pauseUntilMs) {
             pending.remove(key);
             return StructureTile.FAILED;
+        }
+
+        // ── OFFICIAL OSM API FIRST (fast-download fix) ────────
+        // Measured while diagnosing run 13: all 5 Overpass
+        // mirrors were down/erroring (dead, 502, 504, 500@47s)
+        // while api.openstreetmap.org served the same bbox in
+        // 1.5s with full tags. The API has no query engine to
+        // overload — it is a plain bbox dump — so it is both
+        // faster and far more reliable. Overpass remains the
+        // fallback below. Response is converted to Overpass
+        // `out geom` shape so parseResponse/saveDisk/enrichment
+        // stay byte-compatible.
+        String apiJson = fetchViaOsmApi(minLat, minLon,
+            minLat + TILE_DEG, minLon + TILE_DEG);
+        if (apiJson != null) {
+            StructureTile st = parseResponse(apiJson);
+            if (st.valid) {
+                consecutiveFailures = 0;
+                memCache.put(key, st);
+                pending.remove(key);
+                evictIfNeeded();
+                if (diskOk) saveDisk(key, apiJson);
+                if (dbgCount.getAndIncrement() < 20)
+                    LOGGER.info(
+                        "OSM STRUCT [{},{}]:"
+                        + " {} features (api.osm.org)",
+                        String.format("%.4f", minLat),
+                        String.format("%.4f", minLon),
+                        st.structures.length);
+                return st;
+            }
         }
 
         if (consecutiveFailures
@@ -949,45 +1563,36 @@ public class OsmStructureIndex {
             minLat + TILE_DEG,
             minLon + TILE_DEG);
 
-        String queryStr = "[out:json][timeout:25];("
-            + "way[\"building\"](" + bbox + ");"
-            + "relation[\"building\"]"
-            + "(" + bbox + ");"
-            + "way[\"building:part\"]"
-            + "(" + bbox + ");"
-            + "relation[\"building:part\"]"
-            + "(" + bbox + ");"
-            + "way[\"highway\"](" + bbox + ");"
-            + "way[\"railway\"~\"rail|light_rail"
-            + "|subway|tram\"](" + bbox + ");"
-            + "way[\"bridge\"](" + bbox + ");"
-            // Some mapped bridges are multipolygon/route relations whose
-            // member ways carry no individual bridge tag.
-            + "relation[\"bridge\"](" + bbox + ");"
-            + "way[\"barrier\"~\"wall|fence|hedge\"]"
-            + "(" + bbox + ");"
-            + "way[\"landuse\"~\"farmland|forest"
-            + "|meadow|grass|orchard|vineyard"
-            + "|parking\"](" + bbox + ");"
-            + "relation[\"landuse\"~\"farmland"
-            + "|forest|meadow|grass|orchard"
-            + "|vineyard\"](" + bbox + ");"
-            + "way[\"leisure\"~\"park|garden"
-            + "|playground|pitch\"](" + bbox + ");"
-            + "node[\"highway\"=\"street_lamp\"]"
-            + "(" + bbox + ");"
-            + ");out body geom;";
+        String queryStr = buildQuery(bbox, 25);
 
         totalQueries.incrementAndGet();
 
-        int startIdx = endpointIdx.get()
+        // Latency-aware endpoint order: try the endpoint whose rate
+        // limiter is ready soonest, tie-broken towards the last
+        // successful endpoint. Prevents a cold start from queueing
+        // behind an endpoint sitting in a 30s failure cooldown while
+        // another endpoint is idle.
+        int lastGood = endpointIdx.get()
             % OVERPASS_ENDPOINTS.length;
+        Integer[] order =
+            new Integer[OVERPASS_ENDPOINTS.length];
+        for (int i = 0; i < order.length; i++)
+            order[i] = i;
+        java.util.Arrays.sort(order, (a, b) -> {
+            long wa = endpointLimiters[a]
+                .msUntilNextToken();
+            long wb = endpointLimiters[b]
+                .msUntilNextToken();
+            if (wa != wb) return Long.compare(wa, wb);
+            // prefer the endpoint that served us last
+            return Boolean.compare(
+                b == lastGood, a == lastGood);
+        });
 
         for (int attempt = 0;
                 attempt < OVERPASS_ENDPOINTS.length;
                 attempt++) {
-            int idx = (startIdx + attempt)
-                % OVERPASS_ENDPOINTS.length;
+            int idx = order[attempt];
             String ep = OVERPASS_ENDPOINTS[idx];
             OverpassRateLimiter limiter =
                 endpointLimiters[idx];
@@ -1006,8 +1611,9 @@ public class OsmStructureIndex {
                     new URL(ep).openConnection();
                 conn.setRequestMethod("POST");
                 conn.setDoOutput(true);
-                conn.setConnectTimeout(
-                    HTTP_TIMEOUT_MS);
+                // Dead endpoints must fail fast on a cold start;
+                // slow-but-alive responses still get the full window.
+                conn.setConnectTimeout(6000);
                 conn.setReadTimeout(HTTP_TIMEOUT_MS);
                 conn.setRequestProperty(
                     "Content-Type",
@@ -1016,6 +1622,8 @@ public class OsmStructureIndex {
                 conn.setRequestProperty(
                     "User-Agent",
                     "TerraPlusPlus/2.0 Minecraft");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
 
                 byte[] body = ("data="
                     + URLEncoder.encode(queryStr,
@@ -1030,6 +1638,12 @@ public class OsmStructureIndex {
                         readResponse(conn);
                     StructureTile st =
                         parseResponse(json);
+                    // 200 + unparseable body = Overpass busy
+                    // page. Retryable, never cached/saved.
+                    if (!st.valid) {
+                        limiter.penalize(15_000L);
+                        continue;
+                    }
                     endpointIdx.set(idx);
                     consecutiveFailures = 0;
                     memCache.put(key, st);
@@ -1055,6 +1669,9 @@ public class OsmStructureIndex {
                     limiter.penalize(code == 429 ? 30_000L : 10_000L);
                     continue;
                 } else {
+                    // Unexpected status — cool this endpoint briefly
+                    // so latency-aware ordering prefers healthy ones.
+                    limiter.penalize(8_000L);
                     LOGGER.debug(
                         "Endpoint {} returned {}",
                         idx, code);
@@ -1064,18 +1681,234 @@ public class OsmStructureIndex {
                 pending.remove(key);
                 return StructureTile.FAILED;
             } catch (Exception e) {
+                // Connect/read failure — typically a dead or
+                // overloaded endpoint. Penalize so the next tiles
+                // do not each burn a connect timeout on it again.
+                limiter.penalize(10_000L);
                 LOGGER.debug(
                     "Struct fetch failed: {}",
                     e.getMessage());
             } finally {
-                if (conn != null) conn.disconnect();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
                 if (endpointInFlight) limiter.releaseInFlight();
             }
         }
 
         consecutiveFailures++;
+        // health signal: API AND all Overpass endpoints failed
+        // for this tile — OSM is definitively struggling.
+        osmLastFailAt = System.currentTimeMillis();
         pending.remove(key);
         return StructureTile.FAILED;
+    }
+
+    // ── OFFICIAL OSM API (api.openstreetmap.org) ─────────────
+    // Primary structure source since the fast-download fix. The
+    // /api/0.6/map call returns EVERY element in the bbox (raw
+    // nodes + ways with node refs, full tags) in one cheap
+    // request — no query engine, so none of Overpass's
+    // overload/outage behaviour. Constraints respected here:
+    // bbox area well under the 0.25 deg² cap (tiles are 0.01°),
+    // 50k-node cap can 400 on very dense multi-tile boxes which
+    // is why only single tiles use it; polite spacing enforced.
+
+    // ── OSM HEALTH SIGNAL (Overture demotion) ─────────────────
+    // User directive: "If osm is fast there is no need for
+    // overture." Rather than deleting the appetizer (it is the
+    // only cover when EVERYTHING is down), Overture's per-
+    // teleport prefetch is now gated on this signal: while OSM
+    // is fast and healthy, no Overture bandwidth is spent at
+    // all; the appetizer machinery stays dormant and self-
+    // activates only on evidence of OSM struggling.
+    private static volatile long osmLastGoodDurationMs = 0;
+    private static volatile long osmLastFailAt = 0;
+
+    /** True when recent evidence says live OSM is slow or
+     *  failing — the only case Overture still earns its keep. */
+    public static boolean osmStruggling() {
+        long now = System.currentTimeMillis();
+        if (now < osmApiDownUntil) return true;          // API in cooldown
+        if (now - osmLastFailAt < 60_000) return true;   // fail in last minute
+        return osmLastGoodDurationMs > 3_000;            // last success was slow
+    }
+
+    private static final String OSM_API_URL =
+        "https://api.openstreetmap.org/api/0.6/map.json?bbox=";
+    private static final long OSM_API_SPACING_MS = 300;
+    private static final Object OSM_API_GATE = new Object();
+    private static long osmApiLastCall = 0;
+    /** After repeated API failures, skip it for a while so tiles
+     *  fall straight through to Overpass without burning a
+     *  connect timeout each. */
+    private static volatile long osmApiDownUntil = 0;
+    private static final AtomicInteger osmApiFails =
+        new AtomicInteger();
+
+    /** Fetches a bbox from the official OSM API and converts it
+     *  to Overpass `out geom` JSON (ways get inline geometry,
+     *  tagged nodes kept for context-POI enrichment, relations
+     *  get member geometry assembled from their ways). Returns
+     *  null on any failure — caller falls back to Overpass. */
+    private String fetchViaOsmApi(double minLat, double minLon,
+            double maxLat, double maxLon) {
+        if (System.currentTimeMillis() < osmApiDownUntil)
+            return null;
+        // polite spacing across all threads
+        synchronized (OSM_API_GATE) {
+            long wait = osmApiLastCall + OSM_API_SPACING_MS
+                - System.currentTimeMillis();
+            if (wait > 0) {
+                try { Thread.sleep(wait); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+            osmApiLastCall = System.currentTimeMillis();
+        }
+        HttpURLConnection conn = null;
+        long fetchStart = System.currentTimeMillis();
+        try {
+            // API order: left,bottom,right,top (lon,lat)
+            String url = OSM_API_URL + String.format(
+                "%.6f,%.6f,%.6f,%.6f",
+                minLon, minLat, maxLon, maxLat);
+            conn = (HttpURLConnection)
+                new URL(url).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(HTTP_TIMEOUT_MS);
+            conn.setRequestProperty("User-Agent",
+                "TerraPlusPlus/2.0 Minecraft");
+            conn.setRequestProperty("Accept-Encoding", "gzip");
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                // 400 = node cap / bad bbox, 509 = bandwidth
+                // limit; either way count it as a failure.
+                if (osmApiFails.incrementAndGet() >= 3)
+                    osmApiDownUntil =
+                        System.currentTimeMillis() + 120_000L;
+                osmLastFailAt = System.currentTimeMillis();
+                LOGGER.debug("OSM API returned {}", code);
+                return null;
+            }
+            String raw = readResponse(conn);
+            osmApiFails.set(0);
+            // health signal: how fast was this real fetch?
+            osmLastGoodDurationMs =
+                System.currentTimeMillis() - fetchStart;
+            return convertApiToOutGeom(raw);
+        } catch (Exception e) {
+            if (osmApiFails.incrementAndGet() >= 3)
+                osmApiDownUntil =
+                    System.currentTimeMillis() + 120_000L;
+            osmLastFailAt = System.currentTimeMillis();
+            LOGGER.debug("OSM API fetch failed: {}",
+                e.getMessage());
+            return null;
+        } finally {
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
+        }
+    }
+
+    /** API 0.6 map.json -> Overpass `out geom` shape:
+     *  - every node's coords indexed; tagged nodes emitted
+     *    (context POIs need them);
+     *  - ways get a `geometry` array resolved from their node
+     *    refs (all refs are guaranteed present in a map call);
+     *  - relations get member `geometry` assembled so
+     *    multipolygon buildings/bridges keep working. */
+    private static String convertApiToOutGeom(String apiJson) {
+        JsonObject root = JsonParser.parseString(apiJson)
+            .getAsJsonObject();
+        JsonArray in = root.getAsJsonArray("elements");
+        if (in == null) return null;
+
+        // pass 1: node coordinates + way index
+        java.util.HashMap<Long, double[]> nodePos =
+            new java.util.HashMap<>();
+        java.util.HashMap<Long, JsonObject> waysById =
+            new java.util.HashMap<>();
+        for (JsonElement el : in) {
+            JsonObject o = el.getAsJsonObject();
+            String t = o.has("type")
+                ? o.get("type").getAsString() : "";
+            if ("node".equals(t)) {
+                nodePos.put(o.get("id").getAsLong(),
+                    new double[]{
+                        o.get("lat").getAsDouble(),
+                        o.get("lon").getAsDouble()});
+            } else if ("way".equals(t)) {
+                waysById.put(o.get("id").getAsLong(), o);
+            }
+        }
+
+        JsonArray out = new JsonArray();
+        for (JsonElement el : in) {
+            JsonObject o = el.getAsJsonObject();
+            String t = o.has("type")
+                ? o.get("type").getAsString() : "";
+            if ("node".equals(t)) {
+                if (o.has("tags")) out.add(o); // context POIs
+            } else if ("way".equals(t)) {
+                JsonObject w = o.deepCopy();
+                JsonArray geom = new JsonArray();
+                if (o.has("nodes"))
+                    for (JsonElement r
+                            : o.getAsJsonArray("nodes")) {
+                        double[] p =
+                            nodePos.get(r.getAsLong());
+                        if (p == null) continue;
+                        JsonObject pt = new JsonObject();
+                        pt.addProperty("lat", p[0]);
+                        pt.addProperty("lon", p[1]);
+                        geom.add(pt);
+                    }
+                w.add("geometry", geom);
+                out.add(w);
+            } else if ("relation".equals(t)) {
+                JsonObject r = o.deepCopy();
+                if (o.has("members")) {
+                    JsonArray members = new JsonArray();
+                    for (JsonElement mEl
+                            : o.getAsJsonArray("members")) {
+                        JsonObject m = mEl.getAsJsonObject()
+                            .deepCopy();
+                        if ("way".equals(m.has("type")
+                                ? m.get("type").getAsString()
+                                : "")
+                                && m.has("ref")) {
+                            JsonObject w = waysById.get(
+                                m.get("ref").getAsLong());
+                            if (w != null && w.has("nodes")) {
+                                JsonArray geom =
+                                    new JsonArray();
+                                for (JsonElement nr : w
+                                        .getAsJsonArray(
+                                            "nodes")) {
+                                    double[] p = nodePos.get(
+                                        nr.getAsLong());
+                                    if (p == null) continue;
+                                    JsonObject pt =
+                                        new JsonObject();
+                                    pt.addProperty(
+                                        "lat", p[0]);
+                                    pt.addProperty(
+                                        "lon", p[1]);
+                                    geom.add(pt);
+                                }
+                                m.add("geometry", geom);
+                            }
+                        }
+                        members.add(m);
+                    }
+                    r.add("members", members);
+                }
+                out.add(r);
+            }
+        }
+        JsonObject converted = new JsonObject();
+        converted.add("elements", out);
+        return converted.toString();
     }
 
     // ── PARSING ───────────────────────────────────────────────
@@ -1092,14 +1925,33 @@ public class OsmStructureIndex {
                 return StructureTile.EMPTY;
             List<OsmStructure> structures =
                 new ArrayList<>();
+            List<ContextPoi> pois = new ArrayList<>();
+            List<BridgeOutline> outlines = new ArrayList<>();
             for (JsonElement el : elements) {
                 JsonObject obj = el.getAsJsonObject();
+                ContextPoi poi = contextPoiOf(obj);
+                if (poi != null) pois.add(poi);
+                BridgeOutline bo = bridgeOutlineOf(obj);
+                if (bo != null) outlines.add(bo);
                 OsmStructure s = parseElement(obj);
                 if (s == null) continue;
                 List<OsmStructure> parts = splitRelationOuterParts(obj, s);
                 if (parts.isEmpty()) structures.add(s);
                 else structures.addAll(parts);
             }
+            int enriched = enrichFromContext(structures, pois);
+            if (enriched > 0)
+                LOGGER.info("CONTEXT ENRICH: {} buildings "
+                    + "inherited identity from {} contained "
+                    + "POIs (station/worship/historic)",
+                    enriched, pois.size());
+            int bEnriched = enrichBridgesFromOutlines(
+                structures, outlines);
+            if (bEnriched > 0)
+                LOGGER.info("BRIDGE OUTLINE ENRICH: {} bridge "
+                    + "ways inherited name/structure from {} "
+                    + "man_made=bridge outlines",
+                    bEnriched, outlines.size());
             return new StructureTile(
                 structures.toArray(
                     new OsmStructure[0]), true);
@@ -1213,7 +2065,297 @@ public class OsmStructureIndex {
                 b.layer, b.tunnel, b.isRailBridge, b.bridgeStructure,
                 b.startYear, b.endYear);
         copy.innerRings = b.innerRings;
+        copy.explicitWidth = b.explicitWidth;
         return copy;
+    }
+
+    // ── CONTEXT ENRICHMENT ────────────────────────────────────
+    // A structure inherits identity from what is mapped INSIDE it.
+    // Way 635428057 is an anonymous {building=transportation,
+    // layer=3} box — but it contains node 7052069757
+    // {railway=station, name="Secunderabad East",
+    // network="Hyderabad Metro", wikidata=Q58814860}. The way's own
+    // tags say almost nothing; the contained node says everything.
+    // Buildings with no name / generic subtype adopt the name,
+    // subtype and start_date of a context POI they contain, which
+    // then flows into ALL downstream consumers for free:
+    //   - StructureDateEstimator ("station" → SIG_STATION signal)
+    //   - WikiDataLookup (a name to resolve → real opening year)
+    //   - ParadoxMath ("station" weight 1.6, named ×1.5)
+    //   - visibility filtering at time jumps
+
+    /** Point feature that carries identity for its container. */
+    private static final class ContextPoi {
+        final double lat, lon;
+        final String name, subType;
+        final int startYear;
+        ContextPoi(double lat, double lon, String name,
+                String subType, int startYear) {
+            this.lat = lat; this.lon = lon;
+            this.name = name; this.subType = subType;
+            this.startYear = startYear;
+        }
+    }
+
+    /** man_made=bridge outline: the identity carrier of a major
+     *  bridge. Durgam Cheruvu (761604461) holds name, wikidata
+     *  and bridge:structure=suspension on the OUTLINE polygon;
+     *  the carriageway ways inside carry only bridge=yes+layer.
+     *  Never rendered; donates identity to contained bridges. */
+    private static final class BridgeOutline {
+        final OsmNode[] ring;
+        final double minLat, maxLat, minLon, maxLon;
+        final String name;
+        final BridgeStructure structure;
+        final int startYear;
+        BridgeOutline(OsmNode[] ring, String name,
+                BridgeStructure structure, int startYear) {
+            this.ring = ring;
+            this.name = name;
+            this.structure = structure;
+            this.startYear = startYear;
+            double mnLa = 90, mxLa = -90,
+                   mnLo = 180, mxLo = -180;
+            for (OsmNode n : ring) {
+                mnLa = Math.min(mnLa, n.lat);
+                mxLa = Math.max(mxLa, n.lat);
+                mnLo = Math.min(mnLo, n.lon);
+                mxLo = Math.max(mxLo, n.lon);
+            }
+            this.minLat = mnLa; this.maxLat = mxLa;
+            this.minLon = mnLo; this.maxLon = mxLo;
+        }
+        boolean contains(double lat, double lon) {
+            if (lat < minLat || lat > maxLat
+                    || lon < minLon || lon > maxLon)
+                return false;
+            return pointInRing(lat, lon, ring);
+        }
+    }
+
+    /** Parses a man_made=bridge outline, or null. */
+    private BridgeOutline bridgeOutlineOf(JsonObject obj) {
+        JsonObject tags = obj.has("tags")
+            ? obj.getAsJsonObject("tags") : null;
+        if (tags == null) return null;
+        if (!"bridge".equals(getTag(tags, "man_made")))
+            return null;
+        List<OsmNode> ring = new ArrayList<>();
+        if (obj.has("geometry")) {
+            JsonArray geom = obj.getAsJsonArray("geometry");
+            for (int i = 0; i < geom.size(); i++) {
+                JsonObject g = geom.get(i).getAsJsonObject();
+                if (g.has("lat") && g.has("lon"))
+                    ring.add(new OsmNode(
+                        g.get("lat").getAsDouble(),
+                        g.get("lon").getAsDouble()));
+            }
+        } else if (obj.has("members")) {
+            for (JsonElement m : obj.getAsJsonArray("members")) {
+                JsonObject mObj = m.getAsJsonObject();
+                String role = mObj.has("role")
+                    ? mObj.get("role").getAsString() : "";
+                if (!("outer".equals(role) || role.isEmpty())
+                        || !mObj.has("geometry")) continue;
+                for (JsonElement p : mObj.getAsJsonArray("geometry")) {
+                    JsonObject g = p.getAsJsonObject();
+                    if (g.has("lat") && g.has("lon"))
+                        ring.add(new OsmNode(
+                            g.get("lat").getAsDouble(),
+                            g.get("lon").getAsDouble()));
+                }
+            }
+        }
+        if (ring.size() < 3) return null;
+        // structure type: bridge:structure preferred, else the
+        // (unusual but observed) bridge:structure value on the
+        // bridge tag itself
+        BridgeStructure bs = null;
+        String structTag = getTag(tags, "bridge:structure");
+        if (structTag != null)
+            bs = BridgeStructure.fromStructureTag(structTag);
+        return new BridgeOutline(
+            ring.toArray(new OsmNode[0]),
+            getTag(tags, "name"),
+            bs,
+            HistoricalDateParser.parse(
+                getTag(tags, "start_date")));
+    }
+
+    /** Contained bridge ways inherit name/structure/date from a
+     *  man_made=bridge outline covering them. Midpoint decides
+     *  containment (a carriageway may poke past the outline at
+     *  the abutments). */
+    private static int enrichBridgesFromOutlines(
+            List<OsmStructure> structures,
+            List<BridgeOutline> outlines) {
+        if (outlines.isEmpty()) return 0;
+        int enriched = 0;
+        for (int i = 0; i < structures.size(); i++) {
+            OsmStructure s = structures.get(i);
+            if (s.type != StructureType.BRIDGE) continue;
+            if (s.nodes.length < 2) continue;
+            OsmNode mid = s.nodes[s.nodes.length / 2];
+            for (BridgeOutline o : outlines) {
+                if (!o.contains(mid.lat, mid.lon)) continue;
+                String newName = (s.name == null
+                        || s.name.isBlank())
+                    && o.name != null ? o.name : s.name;
+                BridgeStructure newBs =
+                    (s.bridgeStructure == null
+                        || s.bridgeStructure
+                            == BridgeStructure.BEAM)
+                    && o.structure != null
+                    ? o.structure : s.bridgeStructure;
+                int newStart = s.startYear
+                        == HistoricalDateParser.UNKNOWN_YEAR
+                        && o.startYear
+                        != HistoricalDateParser.UNKNOWN_YEAR
+                    ? o.startYear : s.startYear;
+                boolean changed =
+                    !Objects.equals(newName, s.name)
+                    || newBs != s.bridgeStructure
+                    || newStart != s.startYear;
+                if (!changed) continue;
+                OsmStructure copy = new OsmStructure(
+                    s.type, s.subType, newName, s.nodes,
+                    s.isArea, s.osmId, s.material,
+                    s.levels, s.height, s.roofShape,
+                    s.roofMaterial, s.surface, s.lanes,
+                    s.isOneWay, s.minHeight, s.roofHeight,
+                    s.roofDirection, s.colour, s.roofColour,
+                    s.isPart, s.parentOsmId, s.layer,
+                    s.tunnel, s.isRailBridge,
+                    newBs, newStart, s.endYear);
+                copy.innerRings = s.innerRings;
+                copy.explicitWidth = s.explicitWidth;
+                structures.set(i, copy);
+                enriched++;
+                break;
+            }
+        }
+        return enriched;
+    }
+
+    /** Building subtypes vague enough to be overridden by a
+     *  contained POI's more specific identity. */
+    private static final Set<String> GENERIC_BUILDING_SUBTYPES =
+        Set.of("yes", "transportation", "public", "roof");
+
+    /** bridge=* lifecycle values: the bridge does not physically
+     *  exist right now (taginfo worldwide counts in comment at
+     *  the usage site). Distinct from abandoned/ruins, which
+     *  still stand and are rendered. */
+    private static final Set<String> LIFECYCLE_BRIDGE_VALUES =
+        Set.of("razed", "construction", "proposed",
+            "collapsed", "dismantled", "demolished",
+            "destroyed", "removed");
+
+    /** Parses a context POI node, or null if this element is not
+     *  one. These nodes never render directly (parseElement
+     *  returns null for them); they exist to donate identity.
+     *  Instance method: getTag() is an instance member, and this
+     *  is only called from parseResponse()/fetchBatch() anyway. */
+    private ContextPoi contextPoiOf(JsonObject obj) {
+        if (!"node".equals(obj.has("type")
+                ? obj.get("type").getAsString() : ""))
+            return null;
+        if (!obj.has("lat") || !obj.has("lon")) return null;
+        JsonObject tags = obj.has("tags")
+            ? obj.getAsJsonObject("tags") : null;
+        if (tags == null) return null;
+
+        String railway  = getTag(tags, "railway");
+        String pt       = getTag(tags, "public_transport");
+        String amenity  = getTag(tags, "amenity");
+        String historic = getTag(tags, "historic");
+
+        String sub = null;
+        if ("station".equals(railway) || "halt".equals(railway)
+                || "station".equals(pt)) {
+            sub = "station";
+        } else if ("place_of_worship".equals(amenity)) {
+            String rel = getTag(tags, "religion");
+            sub = rel == null ? "church" : switch (rel) {
+                case "christian"           -> "church";
+                case "muslim"              -> "mosque";
+                case "jewish"              -> "synagogue";
+                case "hindu", "buddhist",
+                     "jain", "sikh"        -> "temple";
+                default                    -> "temple";
+            };
+        } else if (historic != null) {
+            sub = switch (historic) {
+                case "monument", "memorial" -> "monument";
+                case "castle", "fort"       -> "castle";
+                case "ruins"                -> "monument";
+                default                     -> null;
+            };
+        }
+        if (sub == null) return null;
+
+        return new ContextPoi(
+            obj.get("lat").getAsDouble(),
+            obj.get("lon").getAsDouble(),
+            getTag(tags, "name"),
+            sub,
+            HistoricalDateParser.parse(
+                getTag(tags, "start_date")));
+    }
+
+    /** Lets anonymous/generic buildings inherit name, subtype and
+     *  start_date from a context POI they geometrically contain.
+     *  Replaces entries in-place; returns how many inherited. */
+    private static int enrichFromContext(
+            List<OsmStructure> structures,
+            List<ContextPoi> pois) {
+        if (pois.isEmpty()) return 0;
+        int enriched = 0;
+        for (int i = 0; i < structures.size(); i++) {
+            OsmStructure s = structures.get(i);
+            if (s.type != StructureType.BUILDING
+                    || !s.isArea) continue;
+            boolean nameless = s.name == null
+                || s.name.isBlank();
+            boolean genericSub = s.subType == null
+                || GENERIC_BUILDING_SUBTYPES
+                    .contains(s.subType);
+            if (!nameless && !genericSub) continue;
+            for (ContextPoi p : pois) {
+                if (!s.containsPoint(p.lat, p.lon)) continue;
+                String newName = (nameless && p.name != null)
+                    ? p.name : s.name;
+                String newSub = (genericSub
+                        && p.subType != null)
+                    ? p.subType : s.subType;
+                int newStart = (s.startYear
+                        == HistoricalDateParser.UNKNOWN_YEAR
+                        && p.startYear
+                        != HistoricalDateParser.UNKNOWN_YEAR)
+                    ? p.startYear : s.startYear;
+                boolean changed =
+                    !Objects.equals(newName, s.name)
+                    || !Objects.equals(newSub, s.subType)
+                    || newStart != s.startYear;
+                if (!changed) continue;
+                OsmStructure copy = new OsmStructure(
+                    s.type, newSub, newName, s.nodes,
+                    s.isArea, s.osmId, s.material,
+                    s.levels, s.height, s.roofShape,
+                    s.roofMaterial, s.surface, s.lanes,
+                    s.isOneWay, s.minHeight, s.roofHeight,
+                    s.roofDirection, s.colour, s.roofColour,
+                    s.isPart, s.parentOsmId, s.layer,
+                    s.tunnel, s.isRailBridge,
+                    s.bridgeStructure, newStart, s.endYear);
+                copy.innerRings = s.innerRings;
+                copy.explicitWidth = s.explicitWidth;
+                structures.set(i, copy);
+                enriched++;
+                break;
+            }
+        }
+        return enriched;
     }
 
     private OsmStructure parseElement(JsonObject obj) {
@@ -1264,7 +2406,15 @@ public class OsmStructureIndex {
             bridgeTagValue != null
             && !bridgeTagValue.isEmpty()
             && !"no".equalsIgnoreCase(
-                bridgeTagValue);
+                bridgeTagValue)
+            // TAGINFO AUDIT: lifecycle values mean the bridge
+            // does NOT physically exist today (~1000 ways
+            // worldwide: razed=339, construction=437,
+            // proposed=127, collapsed/dismantled ~94). They were
+            // rendered as real bridges. abandoned(1523)/ruins
+            // still stand physically -> still rendered.
+            && !LIFECYCLE_BRIDGE_VALUES.contains(
+                bridgeTagValue.toLowerCase().trim());
 
         String buildingPart =
             getTag(tags, "building:part");
@@ -1318,7 +2468,13 @@ public class OsmStructureIndex {
         if (type == null) {
             String railway =
                 getTag(tags, "railway");
-            if (railway != null) {
+            if ("platform".equals(railway)) {
+                type = StructureType.PLATFORM;
+                subType = railway;
+                isArea = "yes".equals(
+                    getTag(tags, "area"))
+                    || getTag(tags, "building") != null;
+            } else if (railway != null) {
                 type = StructureType.RAILWAY;
                 subType = railway;
                 if (hasBridgeTag) {
@@ -1375,7 +2531,9 @@ public class OsmStructureIndex {
                 isArea = true;
                 switch (landuse) {
                     case "farmland", "orchard",
-                         "vineyard" -> {
+                         "vineyard", "farmyard",
+                         "allotments",
+                         "plant_nursery" -> {
                         type = StructureType.FARMLAND;
                         subType = landuse;
                     }
@@ -1383,13 +2541,21 @@ public class OsmStructureIndex {
                         type = StructureType.FOREST;
                         subType = "forest";
                     }
-                    case "meadow", "grass" -> {
+                    case "meadow", "grass",
+                         "village_green",
+                         "recreation_ground",
+                         "cemetery",
+                         "flowerbed" -> {
                         type = StructureType.MEADOW;
                         subType = landuse;
                     }
                     case "parking" -> {
                         type = StructureType.PARKING;
                         subType = "parking";
+                    }
+                    case "quarry" -> {
+                        type = StructureType.ROCK;
+                        subType = "quarry";
                     }
                     default -> {
                         type = StructureType.MEADOW;
@@ -1400,31 +2566,165 @@ public class OsmStructureIndex {
         }
 
         if (type == null) {
+            String natural =
+                getTag(tags, "natural");
+            if (natural != null) {
+                switch (natural) {
+                    case "wood" -> {
+                        type = StructureType.FOREST;
+                        subType = "wood";
+                        isArea = true;
+                    }
+                    case "scrub", "heath",
+                         "grassland" -> {
+                        type = StructureType.MEADOW;
+                        subType = natural;
+                        isArea = true;
+                    }
+                    case "beach", "sand" -> {
+                        type = StructureType.SAND;
+                        subType = natural;
+                        isArea = true;
+                    }
+                    case "bare_rock", "scree",
+                         "shingle" -> {
+                        type = StructureType.ROCK;
+                        subType = natural;
+                        isArea = true;
+                    }
+                    case "tree_row" -> {
+                        type = StructureType.TREE_ROW;
+                        subType = natural;
+                    }
+                    case "tree" -> {
+                        type = StructureType.TREE;
+                        subType = natural;
+                    }
+                    default -> { /* unhandled natural value */ }
+                }
+            }
+        }
+
+        if (type == null) {
+            String manMade =
+                getTag(tags, "man_made");
+            if (manMade != null) {
+                switch (manMade) {
+                    case "pier", "breakwater",
+                         "groyne", "embankment",
+                         "dyke" -> {
+                        type = StructureType.PIER;
+                        subType = manMade;
+                        // piers can be mapped as areas
+                        isArea = "yes".equals(
+                            getTag(tags, "area"));
+                    }
+                    case "tower", "chimney",
+                         "water_tower",
+                         "lighthouse", "mast",
+                         "flagpole",
+                         "communications_tower",
+                         "storage_tank",
+                         "silo" -> {
+                        type = StructureType.TOWER;
+                        subType = manMade;
+                    }
+                    default -> { /* unhandled man_made value */ }
+                }
+            }
+        }
+
+        if (type == null) {
+            String aeroway =
+                getTag(tags, "aeroway");
+            if (aeroway != null) {
+                switch (aeroway) {
+                    case "runway", "taxiway" -> {
+                        type = StructureType.RUNWAY;
+                        subType = aeroway;
+                    }
+                    case "apron", "helipad" -> {
+                        type = StructureType.APRON;
+                        subType = aeroway;
+                        isArea = true;
+                    }
+                    default -> { /* unhandled aeroway value */ }
+                }
+            }
+        }
+
+        if (type == null) {
+            String ww = getTag(tags, "waterway");
+            if ("dam".equals(ww)
+                    || "weir".equals(ww)) {
+                type = StructureType.PIER;
+                subType = ww;
+                isArea = "yes".equals(
+                    getTag(tags, "area"));
+            }
+        }
+
+        if (type == null) {
+            String power = getTag(tags, "power");
+            if ("tower".equals(power)
+                    || "pole".equals(power)) {
+                type = StructureType.PYLON;
+                subType = power;
+            }
+        }
+
+        if (type == null) {
             String leisure =
                 getTag(tags, "leisure");
             if (leisure != null) {
                 isArea = true;
                 switch (leisure) {
-                    case "park" -> {
+                    case "park", "playground",
+                         "pitch", "dog_park",
+                         "golf_course",
+                         "recreation_ground",
+                         "nature_reserve",
+                         "track" -> {
                         type = StructureType.PARK;
-                        subType = "park";
+                        subType = leisure;
                     }
                     case "garden" -> {
                         type = StructureType.GARDEN;
                         subType = "garden";
                     }
-                    case "playground" -> {
-                        type = StructureType.PARK;
-                        subType = "playground";
-                    }
-                    case "pitch" -> {
-                        type = StructureType.PARK;
-                        subType = "pitch";
+                    case "swimming_pool" -> {
+                        type = StructureType.POOL;
+                        subType = "swimming_pool";
                     }
                     default -> {
                         type = StructureType.GARDEN;
                         subType = leisure;
                     }
+                }
+            }
+        }
+
+        if (type == null) {
+            String amenity =
+                getTag(tags, "amenity");
+            if (amenity != null) {
+                switch (amenity) {
+                    case "parking" -> {
+                        type = StructureType.PARKING;
+                        subType = "parking";
+                        isArea = true;
+                    }
+                    case "marketplace" -> {
+                        type = StructureType.PARK;
+                        subType = "marketplace";
+                        isArea = true;
+                    }
+                    case "grave_yard" -> {
+                        type = StructureType.MEADOW;
+                        subType = "grave_yard";
+                        isArea = true;
+                    }
+                    default -> { /* unhandled amenity value */ }
                 }
             }
         }
@@ -1488,8 +2788,14 @@ public class OsmStructureIndex {
         }
 
         if (nodeList.isEmpty()) return null;
-        if (type != StructureType.STREET_LAMP
-                && nodeList.size() < 2) return null;
+        // Point features are valid with a single node.
+        boolean pointFeature =
+            type == StructureType.STREET_LAMP
+            || type == StructureType.TREE
+            || type == StructureType.TOWER
+            || type == StructureType.PYLON;
+        if (!pointFeature && nodeList.size() < 2)
+            return null;
 
         // ── NUMERIC TAGS ──────────────────────────
         String material =
@@ -1581,6 +2887,12 @@ public class OsmStructureIndex {
             tunnel, isRailBridge, bridgeStructure,
             startYear, endYear);
         parsed.innerRings = innerRings.toArray(new OsmNode[0][]);
+        // Mappers' explicit width=* beats any per-highway-type guess.
+        String widthStr = getTag(tags, "width");
+        if (widthStr != null) try {
+            parsed.explicitWidth = Double.parseDouble(
+                widthStr.replaceAll("[^0-9.]", ""));
+        } catch (NumberFormatException ignored) {}
         return parsed;
     }
 
@@ -1655,9 +2967,14 @@ private String getTag(JsonObject tags,
             HttpURLConnection conn)
             throws IOException {
         StringBuilder sb = new StringBuilder(32768);
+        InputStream raw = conn.getInputStream();
+        // Overpass responses gzip ~10-15x; decompress transparently
+        // when the server honoured Accept-Encoding.
+        if ("gzip".equalsIgnoreCase(
+                conn.getContentEncoding()))
+            raw = new GZIPInputStream(raw, 8192);
         try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(
-                    conn.getInputStream(),
+                new InputStreamReader(raw,
                     StandardCharsets.UTF_8))) {
             char[] buf = new char[8192];
             int n;

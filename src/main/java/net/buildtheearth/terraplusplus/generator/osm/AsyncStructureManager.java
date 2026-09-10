@@ -37,7 +37,7 @@ public class AsyncStructureManager {
     private final OhmStructureIndex       ohmIndex;
     private final OsmStructureIndex       osmIndex;
     private final SourceCooperativeIndex  vidaIndex = SourceCooperativeIndex.getInstance();
-    private final OvertureIndex           overtureIndex;
+    private final MicrosoftIndex           overtureIndex;
     private final OsmStructureGenerator   structureGen;
     private final TerraDensityFunctions   tdf;
     private final TerraWorldConfig        config;
@@ -79,7 +79,7 @@ public class AsyncStructureManager {
         OhmStructureIndex.OhmTile          ohmResult;
         OsmStructureIndex.StructureTile   osmResult;
         List<SourceCooperativeIndex.VidaBuilding> vidaResult;
-        OvertureIndex.BuildingTile        overtureResult;
+        MicrosoftIndex.BuildingTile        overtureResult;
 
         RetryTask(long tileKey, double tileLat, double tileLon,
                   int cx, int cz) {
@@ -100,7 +100,7 @@ public class AsyncStructureManager {
 
     public AsyncStructureManager(OhmStructureIndex ohmIndex,
                                   OsmStructureIndex osmIndex,
-                                  OvertureIndex overtureIndex,
+                                  MicrosoftIndex overtureIndex,
                                   OsmStructureGenerator structureGen,
                                   TerraDensityFunctions tdf,
                                   TerraWorldConfig config,
@@ -276,6 +276,15 @@ public class AsyncStructureManager {
                                 String.format("%.4f", task.tileLon),
                                 osmTile.structures.length, task.attempts);
                     }
+                    // APPETIZER -> MAIN COURSE: this tile's OSM
+                    // just landed. Swap any provisional chunks
+                    // served from fast sources while it cooked
+                    // (hops to server thread internally).
+                    net.buildtheearth.terraplusplus.generator
+                            .historical.ProvisionalServing
+                            .notifyTileArrived(
+                                    task.tileLat + 0.005,
+                                    task.tileLon + 0.005);
                 }
             } catch (Exception e) {
                 LOGGER.debug("OSM retry failed: {}", e.getMessage());
@@ -331,7 +340,7 @@ public class AsyncStructureManager {
                 && overtureIndex.isEnabled() && config.overtureBuildings;
         if (!task.overtureDone && overtureRequired) {
             try {
-                OvertureIndex.BuildingTile overtureTile =
+                MicrosoftIndex.BuildingTile overtureTile =
                         overtureIndex.query(task.tileLat, task.tileLon);
                 // A valid empty response is terminal data, not a failed
                 // request. Retrying it forever caused needless cold/warm work.
@@ -451,16 +460,16 @@ public class AsyncStructureManager {
                 // NOTE: BuildingTile.buildings is an ARRAY, not a List.
                 List<FootprintAlignment.Print> mPrints =
                         new ArrayList<>(task.overtureResult.buildings.length);
-                for (OvertureIndex.OvertureBuilding b :
+                for (MicrosoftIndex.MicrosoftBuilding b :
                         task.overtureResult.buildings)
                     mPrints.add(FootprintAlignment.Print.of(b));
                 SourceAlignment.Shift mShift = SourceAlignment.shiftFor(
                         "overture", task.tileLat, task.tileLon,
                         mPrints, combined);
 
-                for (OvertureIndex.OvertureBuilding raw :
+                for (MicrosoftIndex.MicrosoftBuilding raw :
                         task.overtureResult.buildings) {
-                    OvertureIndex.OvertureBuilding ob =
+                    MicrosoftIndex.MicrosoftBuilding ob =
                             raw.shifted(mShift.dLat, mShift.dLon);
                     if (config.timeEnabled) {
                         int start = StructureDateEstimator.estimate(
@@ -623,7 +632,7 @@ public class AsyncStructureManager {
      */
     /** Microsoft rings are double[][] {lat,lon}; convert to the common form. */
     private static OsmStructureIndex.OsmNode[] msftNodes(
-            OvertureIndex.OvertureBuilding m) {
+            MicrosoftIndex.MicrosoftBuilding m) {
         OsmStructureIndex.OsmNode[] n =
                 new OsmStructureIndex.OsmNode[m.polygon.length];
         for (int i = 0; i < m.polygon.length; i++)
@@ -633,7 +642,7 @@ public class AsyncStructureManager {
     }
 
     private static boolean overlapsAnyStructure(
-            OvertureIndex.OvertureBuilding m,
+            MicrosoftIndex.MicrosoftBuilding m,
             List<OsmStructureIndex.OsmStructure> existing) {
         if (m == null || existing == null || existing.isEmpty()) return false;
         FootprintAlignment.Print cand = FootprintAlignment.Print.of(m);

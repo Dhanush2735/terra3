@@ -27,6 +27,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.util.zip.GZIPInputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -151,8 +153,7 @@ public class OhmStructureIndex {
                 return t;
             });
 
-        Path dir = Paths.get(
-            "terra_cache", "ohm_structures");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("ohm_structures_v2"); // v2: widened full-coverage query
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -215,11 +216,21 @@ public class OhmStructureIndex {
                 }
             }
 
-            // Find tiles still missing after disk check
+            // Find tiles still missing after disk check.
+            // An INVALID (FAILED) tile in the cache counts as
+            // missing: leaving it resident meant one bad
+            // response permanently stalled every chunk in the
+            // tile — blocking calls returned retry forever but
+            // nothing ever refetched (the complete=0 stall).
             Set<Long> missingKeys = new HashSet<>();
-            for (long key : neededKeys)
-                if (!memCache.containsKey(key))
+            for (long key : neededKeys) {
+                OhmTile t = memCache.get(key);
+                if (t == null) { missingKeys.add(key); continue; }
+                if (!t.valid) {
+                    memCache.remove(key, t);
                     missingKeys.add(key);
+                }
+            }
 
             if (missingKeys.isEmpty())
                 return collectFromKeys(neededKeys,
@@ -426,18 +437,24 @@ public class OhmStructureIndex {
             TerraWorldConfig config) {
         return switch (type) {
             case BUILDING,
-                 BUILDING_PART  -> config.buildings;
+                 BUILDING_PART,
+                 TOWER          -> config.buildings;
             case ROAD, FOOTWAY,
                  CYCLEWAY       -> config.roads;
-            case RAILWAY        -> config.railways;
-            case BRIDGE         -> config.bridges;
+            case RAILWAY,
+                 PLATFORM       -> config.railways;
+            case BRIDGE, PIER   -> config.bridges;
             case WALL, FENCE,
                  BARRIER        -> config.walls;
             case GARDEN, PARK,
-                 HEDGE          -> config.gardens;
+                 HEDGE, POOL    -> config.gardens;
             case FARMLAND, FOREST,
-                 MEADOW, PARKING -> config.landuse;
-            case STREET_LAMP    -> config.streetLights;
+                 MEADOW, PARKING,
+                 SAND, ROCK, TREE_ROW,
+                 TREE, RUNWAY,
+                 APRON          -> config.landuse;
+            case STREET_LAMP,
+                 PYLON          -> config.streetLights;
         };
     }
 
@@ -483,22 +500,54 @@ public class OhmStructureIndex {
             minLat + TILE_DEG,
             minLon + TILE_DEG);
 
+        // Full-coverage OHM query, mirroring the widened OSM query.
+        // OHM data is far sparser than OSM, so the extra families cost
+        // little; gzip transfer keeps the payload small either way.
         String queryStr = "[out:json][timeout:25];("
             + "way[\"building\"](" + bbox + ");"
             + "relation[\"building\"]"
             + "(" + bbox + ");"
             + "way[\"building:part\"]"
             + "(" + bbox + ");"
+            + "relation[\"building:part\"]"
+            + "(" + bbox + ");"
             + "way[\"highway\"](" + bbox + ");"
-            + "way[\"railway\"~\"rail|light_rail"
-            + "|subway|tram\"](" + bbox + ");"
+            + "way[\"railway\"~\"^(rail|light_rail"
+            + "|subway|tram|narrow_gauge|funicular"
+            + "|monorail|platform)$\"](" + bbox + ");"
             + "way[\"bridge\"](" + bbox + ");"
-            + "way[\"barrier\"~\"wall|fence\"]"
+            + "relation[\"bridge\"](" + bbox + ");"
+            + "way[\"barrier\"~\"^(wall|fence|hedge"
+            + "|retaining_wall|city_wall"
+            + "|guard_rail)$\"](" + bbox + ");"
+            + "way[\"landuse\"~\"^(farmland|forest"
+            + "|meadow|grass|orchard|vineyard"
+            + "|parking|allotments|cemetery|quarry"
+            + "|village_green|farmyard)$\"]"
             + "(" + bbox + ");"
-            + "way[\"landuse\"~\"farmland|forest"
-            + "|meadow\"](" + bbox + ");"
-            + "way[\"leisure\"~\"park|garden\"]"
+            + "relation[\"landuse\"~\"^(farmland"
+            + "|forest|meadow|grass|orchard"
+            + "|vineyard|cemetery"
+            + "|village_green)$\"](" + bbox + ");"
+            + "way[\"leisure\"~\"^(park|garden"
+            + "|playground|pitch"
+            + "|golf_course)$\"](" + bbox + ");"
+            + "way[\"natural\"~\"^(wood|scrub|heath"
+            + "|grassland|beach|sand|bare_rock"
+            + "|scree|tree_row)$\"](" + bbox + ");"
+            + "way[\"amenity\"~\"^(parking"
+            + "|marketplace|grave_yard)$\"]"
             + "(" + bbox + ");"
+            + "way[\"man_made\"~\"^(pier|breakwater"
+            + "|groyne|embankment|dyke|tower"
+            + "|storage_tank|silo|water_tower"
+            + "|chimney|lighthouse)$\"]"
+            + "(" + bbox + ");"
+            + "way[\"aeroway\"~\"^(runway|taxiway"
+            + "|apron|helipad)$\"](" + bbox + ");"
+            + "node[\"man_made\"~\"^(tower|chimney"
+            + "|water_tower|lighthouse"
+            + "|mast)$\"](" + bbox + ");"
             + ");out body geom;";
 
         totalQueries.incrementAndGet();
@@ -523,6 +572,8 @@ public class OhmStructureIndex {
                 "application/x-www-form-urlencoded");
             conn.setRequestProperty("User-Agent",
                 "TerraPlusPlus/2.0 Minecraft OHM");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
 
             byte[] body = ("data="
                 + URLEncoder.encode(queryStr,
@@ -535,6 +586,16 @@ public class OhmStructureIndex {
             if (code == 200) {
                 String json = readResponse(conn);
                 OhmTile tile = parseResponse(json);
+                // A 200 with an unparseable body is an Overpass
+                // rate-limit/busy HTML page, NOT valid data. It
+                // must stay FAILED (retryable) — never cached as
+                // "0 structures", never written to disk where it
+                // would poison the cache for 30 days.
+                if (!tile.valid) {
+                    limiter.penalize(15_000L);
+                    pending.remove(key);
+                    return OhmTile.FAILED;
+                }
                 consecutiveFailures = 0;
                 memCache.put(key, tile);
                 pending.remove(key);
@@ -570,7 +631,7 @@ public class OhmStructureIndex {
                 "OHM fetch failed: {}",
                 e.getMessage());
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             if (endpointInFlight) limiter.releaseInFlight();
         }
 
@@ -706,14 +767,115 @@ public class OhmStructureIndex {
                     case "forest" ->
                         OsmStructureIndex
                             .StructureType.FOREST;
-                    case "farmland" ->
+                    case "farmland", "orchard",
+                         "vineyard", "farmyard",
+                         "allotments" ->
                         OsmStructureIndex
                             .StructureType.FARMLAND;
+                    case "parking" ->
+                        OsmStructureIndex
+                            .StructureType.PARKING;
+                    case "quarry" ->
+                        OsmStructureIndex
+                            .StructureType.ROCK;
                     default ->
                         OsmStructureIndex
                             .StructureType.MEADOW;
                 };
                 subType = lu;
+            }
+        }
+
+        if (type == null) {
+            String nat = getTag(tags, "natural");
+            if (nat != null) {
+                type = switch (nat) {
+                    case "wood" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.FOREST;
+                    }
+                    case "scrub", "heath",
+                         "grassland" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.MEADOW;
+                    }
+                    case "beach", "sand" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.SAND;
+                    }
+                    case "bare_rock", "scree" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.ROCK;
+                    }
+                    case "tree_row" ->
+                        OsmStructureIndex
+                            .StructureType.TREE_ROW;
+                    default -> null;
+                };
+                subType = nat;
+            }
+        }
+
+        if (type == null) {
+            String mm = getTag(tags, "man_made");
+            if (mm != null) {
+                type = switch (mm) {
+                    case "pier", "breakwater",
+                         "groyne", "embankment",
+                         "dyke" ->
+                        OsmStructureIndex
+                            .StructureType.PIER;
+                    case "tower", "chimney",
+                         "water_tower",
+                         "lighthouse", "mast",
+                         "storage_tank", "silo" ->
+                        OsmStructureIndex
+                            .StructureType.TOWER;
+                    default -> null;
+                };
+                subType = mm;
+            }
+        }
+
+        if (type == null) {
+            String aw = getTag(tags, "aeroway");
+            if (aw != null) {
+                type = switch (aw) {
+                    case "runway", "taxiway" ->
+                        OsmStructureIndex
+                            .StructureType.RUNWAY;
+                    case "apron", "helipad" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.APRON;
+                    }
+                    default -> null;
+                };
+                subType = aw;
+            }
+        }
+
+        if (type == null) {
+            String am = getTag(tags, "amenity");
+            if (am != null) {
+                type = switch (am) {
+                    case "parking" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.PARKING;
+                    }
+                    case "grave_yard" -> {
+                        isArea = true;
+                        yield OsmStructureIndex
+                            .StructureType.MEADOW;
+                    }
+                    default -> null;
+                };
+                subType = am;
             }
         }
 
@@ -818,9 +980,17 @@ public class OhmStructureIndex {
         }
 
         if (nodeList.isEmpty()) return null;
-        if (type != OsmStructureIndex
+        boolean pointFeature =
+            type == OsmStructureIndex
                 .StructureType.STREET_LAMP
-                && nodeList.size() < 2) return null;
+            || type == OsmStructureIndex
+                .StructureType.TREE
+            || type == OsmStructureIndex
+                .StructureType.TOWER
+            || type == OsmStructureIndex
+                .StructureType.PYLON;
+        if (!pointFeature && nodeList.size() < 2)
+            return null;
 
         // ── NUMERIC TAGS ──────────────────────────
         String name =
@@ -873,9 +1043,14 @@ public class OhmStructureIndex {
             HttpURLConnection conn)
             throws IOException {
         StringBuilder sb = new StringBuilder(32768);
+        InputStream raw = conn.getInputStream();
+        // Overpass responses gzip ~10-15x; decompress transparently
+        // when the server honoured Accept-Encoding.
+        if ("gzip".equalsIgnoreCase(
+                conn.getContentEncoding()))
+            raw = new GZIPInputStream(raw, 8192);
         try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(
-                    conn.getInputStream(),
+                new InputStreamReader(raw,
                     StandardCharsets.UTF_8))) {
             char[] buf = new char[8192];
             int n;

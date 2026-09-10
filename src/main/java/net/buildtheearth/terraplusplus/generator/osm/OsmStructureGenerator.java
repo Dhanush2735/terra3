@@ -27,6 +27,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class OsmStructureGenerator {
@@ -282,7 +283,32 @@ public class OsmStructureGenerator {
             Blocks.OAK_FENCE.defaultBlockState(),
         PARKING_BLOCK =
             Blocks.SMOOTH_STONE.defaultBlockState(),
-        LANTERN = Blocks.LANTERN.defaultBlockState();
+        LANTERN = Blocks.LANTERN.defaultBlockState(),
+        // ── extended-coverage feature blocks ──
+        STONE_BLOCK =
+            Blocks.STONE.defaultBlockState(),
+        SAND_BLOCK =
+            Blocks.SAND.defaultBlockState(),
+        WATER_BLOCK =
+            Blocks.WATER.defaultBlockState(),
+        POOL_RIM =
+            Blocks.SMOOTH_QUARTZ.defaultBlockState(),
+        PIER_DECK =
+            Blocks.OAK_PLANKS.defaultBlockState(),
+        RUNWAY_SURFACE =
+            Blocks.GRAY_CONCRETE.defaultBlockState(),
+        APRON_SURFACE =
+            Blocks.LIGHT_GRAY_CONCRETE
+                .defaultBlockState(),
+        PLATFORM_SURFACE =
+            Blocks.SMOOTH_STONE.defaultBlockState(),
+        TOWER_WALL =
+            Blocks.STONE_BRICKS.defaultBlockState(),
+        TANK_WALL =
+            Blocks.LIGHT_GRAY_CONCRETE
+                .defaultBlockState(),
+        MAST_FRAME =
+            Blocks.IRON_BARS.defaultBlockState();
 
     private static final BlockState
         OAK_DOOR_L =
@@ -364,6 +390,66 @@ public class OsmStructureGenerator {
     // based on subType and surface tag.
     // Called directly from TerraChunkGenerator.
     public static BlockState roadSurf(
+            String s,String sf){
+        // ── ERA-AWARE MATERIALS ───────────────────────────────
+        // Wires HistoricalStructureManager.getRoadMaterialKey into
+        // actual block selection. Previously that method was dead
+        // code (audit: "never called anywhere"), so a Roman road in
+        // 200 BC rendered in black concrete because OSM tags the
+        // modern road as asphalt. In historical mode the era now
+        // CAPS the material: modern tags are ignored before the
+        // era that introduced them; period-appropriate tags
+        // (dirt, sett, gravel) still show through.
+        if(net.buildtheearth.terraplusplus.generator
+                .historical.TerraTimeManager
+                .isTimeEnabled()){
+            int year=net.buildtheearth.terraplusplus
+                .generator.historical.TerraTimeManager
+                .getCurrentYear();
+            if(year<1950){
+                BlockState era=eraRoadBlock(year);
+                BlockState tagged=roadSurfModern(s,sf);
+                // Let already-primitive tagged surfaces win
+                // (a dirt track stays dirt in 1700), but cap
+                // anything more advanced than the era allows.
+                return roadRank(tagged)<=roadRank(era)
+                    ?tagged:era;
+            }
+        }
+        return roadSurfModern(s,sf);
+    }
+
+    /** Painted road markings appeared ~1918; suppress them earlier. */
+    private static boolean markingsExistNow(){
+        return !net.buildtheearth.terraplusplus.generator
+                .historical.TerraTimeManager.isTimeEnabled()
+            || net.buildtheearth.terraplusplus.generator
+                .historical.TerraTimeManager.getCurrentYear()>=1920;
+    }
+
+    /** Era → material, mirroring
+     *  HistoricalStructureManager.getRoadMaterialKey. */
+    private static BlockState eraRoadBlock(int year){
+        if(year<-500) return ROAD_DIRT;         // dirt_path
+        if(year<500)  return COBBLESTONE;       // Roman roads
+        if(year<1500) return ROAD_GRAVEL;       // medieval
+        if(year<1800) return ROAD_SMOOTH;       // early paving
+        if(year<1900) return COBBLESTONE;       // Victorian sett
+        return ROAD_CONCRETE;                   // 1900-1950
+    }
+
+    /** Crude technology rank so a period-appropriate tag can
+     *  undercut the era cap but never exceed it. */
+    private static int roadRank(BlockState b){
+        if(b==ROAD_DIRT||b==ROAD_SAND) return 0;
+        if(b==ROAD_GRAVEL)             return 1;
+        if(b==COBBLESTONE)             return 2;
+        if(b==ROAD_SMOOTH)             return 3;
+        if(b==ROAD_CONCRETE)           return 4;
+        return 5;                      // asphalt/other
+    }
+
+    private static BlockState roadSurfModern(
             String s,String sf){
         if(sf!=null)return switch(sf.toLowerCase()){
             case "asphalt"->ROAD_ASPHALT;
@@ -459,6 +545,73 @@ public class OsmStructureGenerator {
                  "monorail_station"->true;
             default->false;
         };}
+
+    // ── STATION/VIADUCT VERTICAL ALIGNMENT ────────────────────
+    // OSM `layer` is a STACKING-ORDER hint, never an altitude.
+    // Three real Hyderabad cases proved it:
+    //  - viaduct crossings: Line 2 layer=4 crosses Line 3 layer=2
+    //    (stacking), stations tagged layer=3 / layer=1 arbitrarily;
+    //  - ordinary GROUND buildings tagged layer=1 purely for 2D
+    //    draw order: 357060333 (building=yes), 51327327 "iLabs
+    //    Centre" (10-storey office), 361511089 (building=roof) —
+    //    layer*8 floated all of them 8 blocks in the air.
+    // Evidence rule: a building sits ON THE GROUND unless
+    // something physical proves elevation:
+    //  1. transportation building + a rail viaduct passing
+    //     through its footprint -> snap to that track's deck;
+    //  2. explicit min_height / min_level -> handled separately
+    //     via minHeightBlocks() (real vertical data, kept);
+    //  3. otherwise -> ground. layer alone is never evidence.
+    private final Set<Long> alignLogged =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private int elevatedBuildingOffset(
+            OsmStructureIndex.OsmStructure s,
+            List<OsmStructureIndex.OsmStructure> bridges){
+        if(s.layer<=0)return 0;
+        if(isTransportationBuilding(s)
+                &&bridges!=null&&!bridges.isEmpty()){
+            double cLat=(s.minLat+s.maxLat)/2.0;
+            double cLon=(s.minLon+s.maxLon)/2.0;
+            // footprint radius (m) + margin: the track must
+            // actually pass through/beside the box, not merely
+            // share the bbox
+            double rM=Math.max(
+                (s.maxLat-s.minLat)*111320.0,
+                (s.maxLon-s.minLon)*111320.0
+                    *Math.cos(Math.toRadians(cLat)))/2.0+12.0;
+            OsmStructureIndex.OsmStructure best=null;
+            double bestD=Double.MAX_VALUE;
+            for(OsmStructureIndex.OsmStructure b:bridges){
+                if(!b.isRailBridge)continue;
+                if(b.layer<=0)continue;
+                if(b.maxLat<s.minLat||b.minLat>s.maxLat
+                    ||b.maxLon<s.minLon||b.minLon>s.maxLon)
+                    continue;
+                double d=b.distanceToLine(cLat,cLon);
+                if(d>rM)continue;
+                if(d<bestD){bestD=d;best=b;}
+            }
+            if(best!=null){
+                int snapped=best.layer*BRIDGE_HEIGHT;
+                if(alignLogged.add(s.osmId))
+                    LOGGER.info("STATION ALIGN: building {} "
+                        +"(layer={}) snapped to rail viaduct {} "
+                        +"(layer={}, deck offset {}) — layer "
+                        +"tags are stacking hints, track wins",
+                        s.osmId,s.layer,
+                        best.osmId,best.layer,snapped);
+                return snapped;
+            }
+        }
+        // No physical evidence of elevation: ground it.
+        if(alignLogged.add(s.osmId))
+            LOGGER.info("GROUND ALIGN: building {} layer={} "
+                +"ignored (no viaduct through footprint — "
+                +"layer is 2D draw order, not altitude)",
+                s.osmId,s.layer);
+        return 0;
+    }
 
     private double getAdjustedDistFromEnd(
             double dfn,
@@ -755,7 +908,8 @@ public boolean generateStructuresFromList(
                             cx+lx,cz+lz,
                             solidYs[lx][lz],s,
                             geoLat[lx][lz],
-                            geoLon[lx][lz],roads);}}}
+                            geoLon[lx][lz],roads,
+                            bridges);}}}
 
     if(config.buildings){
         if(!isChunkValid(chunk))return false;
@@ -775,7 +929,8 @@ public boolean generateStructuresFromList(
                         cx+lx,cz+lz,
                         solidYs[lx][lz],s,
                         geoLat[lx][lz],
-                        geoLon[lx][lz],roads);}}}
+                        geoLon[lx][lz],roads,
+                        bridges);}}}
 
     // ── ROADS ─────────────────────────────────────────────
     if(config.roads){
@@ -987,21 +1142,29 @@ public boolean generateStructuresFromList(
             int bx,int bz,int surfaceY,
             OsmStructureIndex.OsmStructure s,
             double lat,double lon,
-            List<OsmStructureIndex.OsmStructure> roads){
+            List<OsmStructureIndex.OsmStructure> roads,
+            List<OsmStructureIndex.OsmStructure> bridges){
         if(!s.containsPoint(lat,lon))return;
         int bh=hashOsmId(s.osmId);
         BuildingStyle style=
             (s.colour!=null&&!s.colour.isEmpty())
             ?colourStyle(s,bh)
             :determineBuildingStyle(s,bh);
-        int layerOffset=s.layer>0
-            ?s.layer*BRIDGE_HEIGHT:0;
+        int layerOffset=elevatedBuildingOffset(s,bridges);
         if(s.layer<0)return;
         int baseY=surfaceY+layerOffset;
         int wallHeight=resolveWallHeight(s);
         int levels=estimateLevels(s);
         int maxY=chunk.getMaxBuildHeight()-2;
         int minBuild=chunk.getMinBuildHeight();
+
+        // building=roof (361511089): a canopy — petrol station,
+        // walkway or parking cover. Solid walls would make it a
+        // sealed box; render a flat deck on corner posts instead.
+        if("roof".equalsIgnoreCase(s.subType)){
+            placeCanopy(chunk,pos,bx,bz,surfaceY,
+                s,lat,lon,style,maxY);
+            return;}
 
         if(layerOffset>0){
             double edgeD=edgeDistMeters(lat,lon,s);
@@ -1048,20 +1211,52 @@ public boolean generateStructuresFromList(
             if(!chunk.getBlockState(pos).isAir())
                 setOwned(chunk, pos,AIR,false);}}
 
+    // Flat covered deck for building=roof canopies: slab roof at
+    // the tagged height (default one storey), corner posts only,
+    // interior kept open so what it shelters stays visible.
+    private void placeCanopy(ChunkAccess chunk,
+            BlockPos.MutableBlockPos pos,
+            int bx,int bz,int surfaceY,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon,
+            BuildingStyle style,int maxY){
+        int h=s.resolvedHeightBlocks();
+        if(h<=0)h=FLOOR_HEIGHT+1;   // typical canopy ~4-5m
+        int roofY=surfaceY+h;
+        if(roofY>maxY)return;
+        double edgeD=edgeDistMeters(lat,lon,s);
+        double cornerD=cornerDistMeters(lat,lon,s);
+        // deck
+        pos.set(bx,roofY,bz);
+        setOwned(chunk, pos,style.roof(),false);
+        // support posts at corners only
+        if(cornerD<CORNER_PILLAR_M
+                &&edgeD<WALL_THICKNESS_M)
+            for(int y=surfaceY;y<roofY;y++){
+                pos.set(bx,y,bz);
+                if(chunk.getBlockState(pos).isAir())
+                    setOwned(chunk, pos,
+                        style.cornerPillar(),false);}
+        // clear anything above the deck (trees etc.)
+        for(int y=roofY+1;y<=roofY+3&&y<=maxY;y++){
+            pos.set(bx,y,bz);
+            if(!chunk.getBlockState(pos).isAir())
+                setOwned(chunk, pos,AIR,false);}}
+
     private void placeBuildingPart(ChunkAccess chunk,
             BlockPos.MutableBlockPos pos,
             int bx,int bz,int surfaceY,
             OsmStructureIndex.OsmStructure s,
             double lat,double lon,
-            List<OsmStructureIndex.OsmStructure> roads){
+            List<OsmStructureIndex.OsmStructure> roads,
+            List<OsmStructureIndex.OsmStructure> bridges){
         if(!s.containsPoint(lat,lon))return;
         int bh=hashOsmId(s.osmId);
         BuildingStyle style=
             (s.colour!=null&&!s.colour.isEmpty())
             ?colourStyle(s,bh)
             :determineBuildingStyle(s,bh);
-        int layerOffset=s.layer>0
-            ?s.layer*BRIDGE_HEIGHT:0;
+        int layerOffset=elevatedBuildingOffset(s,bridges);
         if(s.layer<0)return;
         int minHeightBlocks=s.minHeightBlocks();
         int baseY=surfaceY+layerOffset
@@ -1285,9 +1480,11 @@ public boolean generateStructuresFromList(
             railways,
             List<OsmStructureIndex.OsmStructure>
             allBridges){
-        double hw=roadHW(
-            s.subType!=null?s.subType:"secondary",
-            s.lanes)*config.roadWidthScale;
+        double hw=(s.explicitWidth>0
+            ?Math.min(s.explicitWidth/2.0,30.0)
+            :roadHW(
+                s.subType!=null?s.subType:"secondary",
+                s.lanes))*config.roadWidthScale;
         double dist=s.distanceToLine(lat,lon);
         if(dist>hw+2.0)return;
 
@@ -1301,18 +1498,144 @@ public boolean generateStructuresFromList(
 
         int maxRise=s.layer>0
             ?s.layer*BRIDGE_HEIGHT:BRIDGE_HEIGHT;
-        int deckRise=computeDeckRise(
-            dfn,totalLen,maxRise);
+        int deckRise;
+        // ── ENDPOINT ANCHORS (all bridges) ───────────────────
+        // A way end sharing a node with another elevated bridge
+        // is a CONTINUATION or JUNCTION, not a place to ramp
+        // down. Three cases from real Hyderabad Metro data:
+        //  - segmented viaduct (Line 3 = many ways, same layer):
+        //    without anchors every segment boundary dipped the
+        //    deck to the ground and short (<10 m) segments
+        //    dropped to rise 0 entirely;
+        //  - connector ramp 850869297 (no layer): interpolate
+        //    between the two anchor decks (16b -> 32b);
+        //  - genuine bridge end (no shared node): ramp to
+        //    ground as always.
+        int[] anchors=connectorAnchors(s,allBridges);
+        boolean aS=anchors[0]>=0,aE=anchors[1]>=0;
+        if(s.layer<=0&&(aS||aE)){
+            // unlayered connector: deck interpolates between
+            // anchor heights (unanchored end ramps from ground)
+            int rStart=Math.max(0,anchors[0]);
+            int rEnd=Math.max(0,anchors[1]);
+            double t=totalLen>0
+                ?Math.max(0,Math.min(1,
+                    dfnStart/totalLen)):0;
+            deckRise=(int)Math.round(
+                rStart+(rEnd-rStart)*t);
+            maxRise=Math.max(Math.max(rStart,rEnd),
+                BRIDGE_HEIGHT);
+            if(crossLogged.add(s.osmId*31))
+                LOGGER.info("CONNECTOR BRIDGE: {} "
+                    +"(no layer) anchored {}b -> {}b "
+                    +"via shared nodes — deck "
+                    +"interpolated between decks",
+                    s.osmId,rStart,rEnd);
+        }else if(aS&&aE){
+            // continuation segment: full rise end to end,
+            // even for tiny (<10 m) segments
+            deckRise=maxRise;
+            if(crossLogged.add(s.osmId*31))
+                LOGGER.info("BRIDGE CONTINUATION: {} "
+                    +"anchored at both ends — no "
+                    +"mid-viaduct dip",s.osmId);
+        }else{
+            // ramp only at UNANCHORED ends
+            double dS=aS?Double.MAX_VALUE:dfnStart;
+            double dE=aE?Double.MAX_VALUE:dfnEnd;
+            double dfnEff=Math.min(dS,dE);
+            if(dfnEff==Double.MAX_VALUE)dfnEff=totalLen;
+            dfnEff=getAdjustedDistFromEnd(
+                dfnEff,s,allBridges);
+            deckRise=computeDeckRise(
+                dfnEff,Math.max(totalLen,10.5),maxRise);
+            if((aS||aE)&&crossLogged.add(s.osmId*31))
+                LOGGER.info("BRIDGE CONTINUATION: {} "
+                    +"anchored at {} end — ramp only "
+                    +"at the free end",s.osmId,
+                    aS?"start":"end");
+        }
         int deckY=sy+deckRise;
         int deckBase=deckY-1;
         if(deckY>maxY)return;
 
+        // ── CROSSING PROTECTION ───────────────────────────────
+        // The corridor pre-clear below removes "stale" building/
+        // road blocks — but a CROSSING bridge's deck IS road+
+        // smoothstone, so a layer-2 bridge was slicing the
+        // layer-1 deck out of the overlap (and the lower bridge
+        // was cutting the upper one's pillars). Compute the deck
+        // bands of every other bridge crossing this column and
+        // treat them as untouchable. Endpoint merges were already
+        // handled (LAYER_END_SEPARATION_M); this covers mid-span
+        // crossings like green-over-blue at Parade Ground.
+        List<int[]> guard=new ArrayList<>();
+        List<Integer> rises=new ArrayList<>();
+        boolean higherCrossing=false;
+        if(allBridges!=null)
+            for(OsmStructureIndex.OsmStructure b:
+                    allBridges){
+                if(b.osmId==s.osmId)continue;
+                double bHw=(b.explicitWidth>0
+                    ?Math.min(b.explicitWidth/2.0,30.0)
+                    :roadHW(b.subType!=null
+                        ?b.subType:"secondary",
+                        b.lanes))*config.roadWidthScale;
+                if(b.distanceToLine(lat,lon)>bHw+1.5)
+                    continue;
+                int bRise;
+                if(b.layer>0){
+                    bRise=b.layer*BRIDGE_HEIGHT;
+                }else{
+                    // Unlayered crossing bridge may be a
+                    // connector ramp — its deck here is the
+                    // anchor interpolation, not the default 8.
+                    int[] bAnch=connectorAnchors(b,allBridges);
+                    if(bAnch[0]>=0||bAnch[1]>=0){
+                        double bLen=bridgeTotalLength(b);
+                        double bt=bLen>0
+                            ?Math.max(0,Math.min(1,
+                                distAlongLine(lat,lon,b,true)
+                                    /bLen)):0;
+                        bRise=(int)Math.round(
+                            Math.max(0,bAnch[0])
+                            +(Math.max(0,bAnch[1])
+                                -Math.max(0,bAnch[0]))*bt);
+                    }else{
+                        bRise=BRIDGE_HEIGHT;
+                    }
+                }
+                // deckBase-1 .. deck+rail/railing headroom
+                guard.add(new int[]{
+                    sy+bRise-2,sy+bRise+2});
+                rises.add(bRise);
+                if(bRise>deckRise)higherCrossing=true;
+                if(crossLogged.add(
+                        Math.min(s.osmId,b.osmId)*31
+                        +Math.max(s.osmId,b.osmId)))
+                    LOGGER.info("BRIDGE CROSSING: {} "
+                        +"(layer={}) and {} (layer={}) "
+                        +"share a column — decks "
+                        +"mutually protected",
+                        s.osmId,s.layer,
+                        b.osmId,b.layer);
+            }
+        deckGuard.set(guard);
+        crossingRises.set(rises);
+        try{
+
         if(deckRise>0)
             for(int y=sy;y<=deckY+6;y++){
                 if(y>maxY)break;
+                if(inGuardBands(y,guard))continue;
                 pos.set(bx,y,bz);
                 BlockState existing=
                     chunk.getBlockState(pos);
+                // A higher bridge crosses here: its stone-brick
+                // pillars pass through our corridor — spare them.
+                if(higherCrossing
+                        &&existing.is(Blocks.STONE_BRICKS))
+                    continue;
                 if(isBuildingBlock(existing))
                     setOwned(chunk, pos,AIR,false);
                 else if(isRoadBlock(existing))
@@ -1343,17 +1666,120 @@ public boolean generateStructuresFromList(
             case SIMPLE_SUSPENSION->placeBridgeSimpleSuspension(chunk,pos,bx,bz,sy,deckY,deckBase,dist,hw,totalLen,dfn,maxRise,deckRise,maxY,s,lat,lon,towerH);
             case HUMPBACK->placeBridgeHumpback(chunk,pos,bx,bz,sy,deckY,deckBase,dist,hw,totalLen,dfn,maxRise,deckRise,maxY,s,lat,lon,roads,railways,pillarSpacing);
             case CLAPPER->placeBridgeClapper(chunk,pos,bx,bz,sy,deckY,deckBase,dist,hw,totalLen,dfn,maxRise,deckRise,maxY,s,lat,lon);
-            default->placeBridgeBeam(chunk,pos,bx,bz,sy,deckY,deckBase,dist,hw,totalLen,dfn,maxRise,deckRise,maxY,s,lat,lon,roads,railways,pillarSpacing);}}
+            default->placeBridgeBeam(chunk,pos,bx,bz,sy,deckY,deckBase,dist,hw,totalLen,dfn,maxRise,deckRise,maxY,s,lat,lon,roads,railways,pillarSpacing);}
+        }finally{deckGuard.remove();crossingRises.remove();}}
+
+    // ── CROSSING GUARD STATE ──────────────────────────────────
+    // Deck bands (y ranges) of OTHER bridges crossing the column
+    // currently being placed. Set by placeBridge, honoured by
+    // clearAboveDeck so neither deck erases the other.
+    private final ThreadLocal<List<int[]>> deckGuard =
+        ThreadLocal.withInitial(ArrayList::new);
+    /** Rises (blocks above ground) of bridges crossing the
+     *  current column — lets pillar placement dodge lower decks. */
+    private final ThreadLocal<List<Integer>> crossingRises =
+        ThreadLocal.withInitial(ArrayList::new);
+    private final Set<Long> crossLogged =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private static boolean inGuardBands(
+            int y,List<int[]> bands){
+        for(int[] b:bands)
+            if(y>=b[0]&&y<=b[1])return true;
+        return false;}
+
+    // ── CONNECTOR BRIDGES (interchange ramps) ─────────────────
+    // Way 850869297: bridge, railway=subway, service=siding, NO
+    // layer tag — but its first node sits ON Line 3 (layer=2) and
+    // its last node ON Line 2 (layer=4). It is the ramp between
+    // the two decks. Untagged it defaulted to rise 8: below both,
+    // connected to neither. Evidence rule again — the deck height
+    // comes from the bridges it TOUCHES: anchor each endpoint to
+    // the layered bridge sharing that node, then interpolate the
+    // deck linearly along the way (+16 at one end -> +32 at the
+    // other). An endpoint with no anchor ramps from ground (0).
+    private final java.util.concurrent.ConcurrentHashMap<Long,int[]>
+        connectorAnchorCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private int[] connectorAnchors(
+            OsmStructureIndex.OsmStructure s,
+            List<OsmStructureIndex.OsmStructure> allBridges){
+        int[] c=connectorAnchorCache.get(s.osmId);
+        if(c!=null)return c;
+        int[] r=new int[]{
+            endpointAnchorRise(s.startNode(),s,allBridges),
+            endpointAnchorRise(s.endNode(),s,allBridges)};
+        // RUN-10 FIX: cache only COMPLETE results. An anchor can
+        // be "missing" merely because the neighbour bridge is not
+        // in this chunk's local list yet — 850869297 got 16b->0b
+        // frozen because Line 2 (611277268) arrived two minutes
+        // later. Absence is PENDING, never truth: incomplete
+        // results are recomputed until both ends resolve.
+        if(r[0]>=0&&r[1]>=0)
+            connectorAnchorCache.put(s.osmId,r);
+        return r;}
+
+    /** Rise (blocks) of another bridge sharing this node's
+     *  coordinates, or -1. The shared node may be ANYWHERE in the
+     *  other way (junctions are usually mid-way). Unlayered
+     *  neighbours anchor at the default deck height, so ordinary
+     *  road bridges split into several ways stay level across
+     *  segment boundaries too. */
+    private int endpointAnchorRise(
+            OsmStructureIndex.OsmNode n,
+            OsmStructureIndex.OsmStructure s,
+            List<OsmStructureIndex.OsmStructure> allBridges){
+        if(n==null||allBridges==null)return -1;
+        final double EPS=2e-6; // ~0.2 m: same OSM node
+        int best=-1;
+        for(OsmStructureIndex.OsmStructure b:allBridges){
+            if(b.osmId==s.osmId)continue;
+            if(n.lat<b.minLat-EPS||n.lat>b.maxLat+EPS
+                ||n.lon<b.minLon-EPS||n.lon>b.maxLon+EPS)
+                continue;
+            for(OsmStructureIndex.OsmNode bn:b.nodes)
+                if(Math.abs(bn.lat-n.lat)<EPS
+                        &&Math.abs(bn.lon-n.lon)<EPS){
+                    best=Math.max(best,
+                        b.layer>0
+                            ?b.layer*BRIDGE_HEIGHT
+                            :BRIDGE_HEIGHT);
+                    break;}
+        }
+        return best;}
 
     // ================================================================
     // BRIDGE COMMON HELPERS
     // ================================================================
 
-    private void placeDeckSurface(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,OsmStructureIndex.OsmStructure s,double dist,double hw){if(deckY>maxY)return;pos.set(bx,deckY,bz);if(s.isRailBridge){setOwned(chunk, pos,ROAD_GRAVEL,false);if(dist<0.8&&deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,RAIL,false);}}else{setOwned(chunk, pos,roadSurf(s.subType,s.surface),false);if(config.buildingDetail>=2&&isMain(s.subType)){if(dist<0.3){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_YELLOW,false);}else if(Math.abs(dist-hw)<0.4){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_WHITE,false);}}}}
-    private void clearAboveDeck(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,boolean isRail,int clearHeight){int from=isRail?deckY+2:deckY+1;for(int h=from;h<=deckY+clearHeight;h++){if(h>maxY)break;pos.set(bx,h,bz);if(!chunk.getBlockState(pos).isAir())setOwned(chunk, pos,AIR,false);}}
+    private void placeDeckSurface(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,OsmStructureIndex.OsmStructure s,double dist,double hw){if(deckY>maxY)return;pos.set(bx,deckY,bz);if(s.isRailBridge){setOwned(chunk, pos,ROAD_GRAVEL,false);if(dist<0.8&&deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,RAIL,false);}}else{setOwned(chunk, pos,roadSurf(s.subType,s.surface),false);if(config.buildingDetail>=2&&isMain(s.subType)&&markingsExistNow()){if(dist<0.3){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_YELLOW,false);}else if(Math.abs(dist-hw)<0.4){pos.set(bx,deckY,bz);setOwned(chunk, pos,ROAD_MARKING_WHITE,false);}}}}
+    private void clearAboveDeck(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int deckY,int maxY,boolean isRail,int clearHeight){
+        // Headroom carve for THIS deck — but a crossing bridge's
+        // deck band overhead is not "obstruction", it is the other
+        // bridge. Skip guarded y-bands (see placeBridge).
+        List<int[]> guard=deckGuard.get();
+        int from=isRail?deckY+2:deckY+1;
+        for(int h=from;h<=deckY+clearHeight;h++){
+            if(h>maxY)break;
+            if(inGuardBands(h,guard))continue;
+            pos.set(bx,h,bz);
+            if(!chunk.getBlockState(pos).isAir())
+                setOwned(chunk, pos,AIR,false);}}
     private void fillRampSolid(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int deckRise,int maxRise){if(deckRise>0&&deckRise<maxRise)for(int y=sy;y<deckBase;y++){pos.set(bx,y,bz);BlockState e=chunk.getBlockState(pos);if(e.isAir())setOwned(chunk, pos,y<=0?Blocks.DEEPSLATE.defaultBlockState():Blocks.STONE.defaultBlockState(),false);}}
     private void placeStandardRailing(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckY,int deckBase,int maxY,int deckRise,BlockState railingBlock,BlockState deckBlock){if(deckRise>=2){if(deckBase>sy&&deckBase<=maxY){pos.set(bx,deckBase,bz);setOwned(chunk, pos,deckBlock,false);}if(deckY<=maxY){pos.set(bx,deckY,bz);setOwned(chunk, pos,deckBlock,false);}if(deckY+1<=maxY){pos.set(bx,deckY+1,bz);setOwned(chunk, pos,railingBlock,false);}}else{pos.set(bx,sy,bz);setOwned(chunk, pos,SIDEWALK,false);clearSafe(chunk,pos,bx,bz,sy,1);}}
-    private boolean isPillarBlocked(double lat,double lon,OsmStructureIndex.OsmStructure s,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways){for(OsmStructureIndex.OsmStructure road:roads){if(road.osmId==s.osmId)continue;if(road.distanceToLine(lat,lon)<=roadHW(road.subType,road.lanes)*config.roadWidthScale)return true;}for(OsmStructureIndex.OsmStructure rail:railways){if(rail.osmId==s.osmId)continue;if(rail.distanceToLine(lat,lon)<=2.5)return true;}return false;}
+    private boolean isPillarBlocked(double lat,double lon,OsmStructureIndex.OsmStructure s,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways){
+        for(OsmStructureIndex.OsmStructure road:roads){if(road.osmId==s.osmId)continue;if(road.distanceToLine(lat,lon)<=roadHW(road.subType,road.lanes)*config.roadWidthScale)return true;}
+        for(OsmStructureIndex.OsmStructure rail:railways){if(rail.osmId==s.osmId)continue;if(rail.distanceToLine(lat,lon)<=2.5)return true;}
+        // A pillar may not land on a LOWER crossing bridge's deck
+        // (upper metro line's pillar punching through the lower
+        // line at an interchange). Real engineering puts the pier
+        // beside the lower deck; we simply skip that column — the
+        // next spacing slot lands clear of the crossing.
+        int ownRise=s.layer>0?s.layer*BRIDGE_HEIGHT:BRIDGE_HEIGHT;
+        for(int r:crossingRises.get())
+            if(r<ownRise)return true;
+        return false;}
     private void placeThickPillar(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int maxY,BlockState pillarBlock,boolean isMajor){for(int y=sy;y<=deckBase;y++){pos.set(bx,y,bz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,pillarBlock,false);}if(isMajor){int cx2=chunk.getPos().getMinBlockX(),cz2=chunk.getPos().getMinBlockZ();for(int dx=-1;dx<=0;dx++)for(int dz=-1;dz<=0;dz++){if(dx==0&&dz==0)continue;int nx=bx+dx,nz=bz+dz;int lx=nx-cx2,lz=nz-cz2;if(lx<0||lx>=16||lz<0||lz>=16)continue;for(int y=sy;y<=deckBase;y++){pos.set(nx,y,nz);if(isWaterOrAir(chunk.getBlockState(pos)))setOwned(chunk, pos,pillarBlock,false);}}}}
     private void placeStandardPillars(ChunkAccess chunk,BlockPos.MutableBlockPos pos,int bx,int bz,int sy,int deckBase,int maxY,double dist,double totalLen,int deckRise,int maxRise,OsmStructureIndex.OsmStructure s,double lat,double lon,List<OsmStructureIndex.OsmStructure> roads,List<OsmStructureIndex.OsmStructure> railways,int pillarSpacing,BlockState pillarBlock){if(deckRise!=maxRise||totalLen<=10.0||dist>0.8)return;double along=distAlongLine(lat,lon,s,true);if((along%pillarSpacing)>=1.5)return;if(isPillarBlocked(lat,lon,s,roads,railways))return;int pilH=deckBase-sy;if(pilH<dynamicMinPillarHeight(deckBase,sy))return;boolean isMajor=isMain(s.subType)&&s.lanes>=4;placeThickPillar(chunk,pos,bx,bz,sy,deckBase,maxY,pillarBlock,isMajor);}
 
@@ -1557,7 +1983,7 @@ public boolean generateStructuresFromList(
                 placeFootway(chunk,pos,bx,bz,sy,
                     nearest,lat,lon);
             return;}
-        double hw=roadHW(nearest.subType,nearest.lanes)
+        double hw=roadHWFor(nearest)
             *config.roadWidthScale;
         if(nearestDist>hw+1.5)return;
         if(nearestDist<=hw){
@@ -1567,7 +1993,8 @@ public boolean generateStructuresFromList(
                     nearest.surface),false);
             clearSafe(chunk,pos,bx,bz,sy,1);
             if(config.buildingDetail>=2
-                    &&isMain(nearest.subType)){
+                    &&isMain(nearest.subType)
+                    &&markingsExistNow()){
                 if(nearestDist<0.3){
                     pos.set(bx,sy,bz);
                     setOwned(chunk, pos,
@@ -1704,7 +2131,8 @@ public boolean generateStructuresFromList(
                         &&(!underBridge
                         ||isTransportationBuilding(s)))
                     placeBuilding(chunk,pos,bx,bz,
-                        groundY,s,lat,lon,roads);}
+                        groundY,s,lat,lon,roads,
+                        bridges);}
             case BUILDING_PART->{
                 boolean underBridge=
                     isUnderBridgeZone(
@@ -1713,7 +2141,8 @@ public boolean generateStructuresFromList(
                         &&(!underBridge
                         ||isTransportationBuilding(s)))
                     placeBuildingPart(chunk,pos,bx,bz,
-                        groundY,s,lat,lon,roads);}
+                        groundY,s,lat,lon,roads,
+                        bridges);}
             case BRIDGE->{
                 if(config.bridges)
                     placeBridge(chunk,pos,bx,bz,
@@ -1776,6 +2205,55 @@ public boolean generateStructuresFromList(
                 if(config.streetLights)
                     placeStreetLamp(chunk,pos,bx,bz,
                         groundY,s,lat,lon);}
+            case SAND->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeSand(chunk,pos,bx,bz,
+                        groundY);}
+            case ROCK->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeRock(chunk,pos,bx,bz,
+                        groundY);}
+            case TREE_ROW->{
+                if(config.landuse)
+                    placeTreeRow(chunk,pos,bx,bz,
+                        groundY,s,lat,lon,
+                        roads,bridges);}
+            case TREE->{
+                if(config.landuse)
+                    placeSingleTree(chunk,pos,bx,bz,
+                        groundY,s,lat,lon,
+                        roads,bridges);}
+            case PIER->{
+                if(config.bridges)
+                    placePier(chunk,pos,bx,bz,
+                        groundY,bridgeY,s,lat,lon);}
+            case TOWER->{
+                if(config.buildings)
+                    placeTower(chunk,pos,bx,bz,
+                        groundY,s,lat,lon);}
+            case PYLON->{
+                if(config.streetLights)
+                    placePylon(chunk,pos,bx,bz,
+                        groundY,s,lat,lon);}
+            case RUNWAY->{
+                if(config.landuse)
+                    placeRunway(chunk,pos,bx,bz,
+                        groundY,s,lat,lon);}
+            case APRON->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeApron(chunk,pos,bx,bz,
+                        groundY);}
+            case POOL->{
+                if(config.gardens)
+                    placePool(chunk,pos,bx,bz,
+                        groundY,s,lat,lon);}
+            case PLATFORM->{
+                if(config.railways)
+                    placePlatform(chunk,pos,bx,bz,
+                        groundY,s,lat,lon);}
         }}
 
     // ================================================================
@@ -1829,6 +2307,52 @@ public boolean generateStructuresFromList(
             case STREET_LAMP->{
                 if(config.streetLights)
                     placeStreetLamp(chunk,pos,bx,bz,sy,
+                        s,lat,lon);}
+            case SAND->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeSand(chunk,pos,bx,bz,sy);}
+            case ROCK->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeRock(chunk,pos,bx,bz,sy);}
+            case TREE_ROW->{
+                if(config.landuse)
+                    placeTreeRow(chunk,pos,bx,bz,sy,
+                        s,lat,lon,roads,bridges);}
+            case TREE->{
+                if(config.landuse)
+                    placeSingleTree(chunk,pos,bx,bz,sy,
+                        s,lat,lon,roads,bridges);}
+            case PIER->{
+                if(config.bridges)
+                    placePier(chunk,pos,bx,bz,sy,
+                        findWaterSurface(chunk,pos,
+                            bx,bz,sy),
+                        s,lat,lon);}
+            case TOWER->{
+                if(config.buildings)
+                    placeTower(chunk,pos,bx,bz,sy,
+                        s,lat,lon);}
+            case PYLON->{
+                if(config.streetLights)
+                    placePylon(chunk,pos,bx,bz,sy,
+                        s,lat,lon);}
+            case RUNWAY->{
+                if(config.landuse)
+                    placeRunway(chunk,pos,bx,bz,sy,
+                        s,lat,lon);}
+            case APRON->{
+                if(config.landuse
+                        &&s.containsPoint(lat,lon))
+                    placeApron(chunk,pos,bx,bz,sy);}
+            case POOL->{
+                if(config.gardens)
+                    placePool(chunk,pos,bx,bz,sy,
+                        s,lat,lon);}
+            case PLATFORM->{
+                if(config.railways)
+                    placePlatform(chunk,pos,bx,bz,sy,
                         s,lat,lon);}
             default->{}
         }}
@@ -2032,6 +2556,16 @@ public boolean generateStructuresFromList(
             default->3.0;};
         if(l>2)w=Math.max(w,l*1.8);
         return w;}
+
+    /**
+     * Half-width for a structure, honouring an explicit width=* tag
+     * when the mapper provided one; falls back to the per-type guess.
+     */
+    private double roadHWFor(
+            OsmStructureIndex.OsmStructure s){
+        if(s.explicitWidth>0)
+            return Math.min(s.explicitWidth/2.0,30.0);
+        return roadHW(s.subType,s.lanes);}
 
     private boolean isMain(String s){
         return s!=null&&(s.equals("motorway")
@@ -2315,7 +2849,7 @@ public boolean generateStructuresFromList(
         p.set(bx,sy,bz);
         setOwned(c, p,PARKING_BLOCK,false);
         clearSafe(c,p,bx,bz,sy,1);
-        if(h%8==0){
+        if(h%8==0&&markingsExistNow()){
             p.set(bx,sy,bz);
             setOwned(c, p,
                 ROAD_MARKING_WHITE,false);}}
@@ -2332,12 +2866,287 @@ public boolean generateStructuresFromList(
         if(Math.sqrt(dL*dL+dN*dN)>1.0)return;
         if(hasBuildingAbove(c,p,bx,bz,sy))return;
         int my=c.getMaxBuildHeight()-2;
+        // Era-aware street lighting:
+        //   before 1800 — no street lamps at all
+        //   1800-1880   — gas lamps: short oak post + lantern
+        //   after 1880  — electric: iron pole + sea lantern
+        int lampYear=net.buildtheearth.terraplusplus
+            .generator.historical.TerraTimeManager
+            .isTimeEnabled()
+            ?net.buildtheearth.terraplusplus.generator
+                .historical.TerraTimeManager
+                .getCurrentYear()
+            :9999;
+        if(lampYear<1800)return;
+        if(lampYear<1880){
+            for(int y=1;y<=2&&sy+y<=my;y++){
+                p.set(bx,sy+y,bz);
+                setOwned(c, p,OAK_FENCE,false);}
+            if(sy+3<=my){
+                p.set(bx,sy+3,bz);
+                setOwned(c, p,LANTERN,false);}
+            return;}
         for(int y=1;y<=4&&sy+y<=my;y++){
             p.set(bx,sy+y,bz);
             setOwned(c, p,IRON_BARS,false);}
         if(sy+5<=my){
             p.set(bx,sy+5,bz);
             setOwned(c, p,SEA_LANTERN,false);}}
+
+    // ================================================================
+    // EXTENDED COVERAGE PLACEMENT
+    // (natural / man_made / aeroway / power / leisure extras)
+    // ================================================================
+
+    /** natural=beach|sand — sand surface. */
+    private void placeSand(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy){
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        p.set(bx,sy,bz);
+        setOwned(c, p,SAND_BLOCK,false);}
+
+    /** natural=bare_rock|scree|shingle, landuse=quarry. */
+    private void placeRock(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy){
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        int h=TerraDensityFunctions.blockHash(bx,bz);
+        p.set(bx,sy,bz);
+        setOwned(c, p,
+            h%3==0?COBBLESTONE:STONE_BLOCK,false);}
+
+    /** natural=tree_row — trees along a line. */
+    private void placeTreeRow(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon,
+            List<OsmStructureIndex.OsmStructure> roads,
+            List<OsmStructureIndex.OsmStructure>
+            bridges){
+        if(s.distanceToLine(lat,lon)>1.5)return;
+        int h=TerraDensityFunctions.blockHash(bx,bz);
+        // one tree roughly every 5th column on the line
+        if(h%5!=0)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        placeTree(c,p,bx,bz,sy,h,lat,lon,
+            roads,bridges);}
+
+    /** natural=tree — a single mapped tree node. */
+    private void placeSingleTree(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon,
+            List<OsmStructureIndex.OsmStructure> roads,
+            List<OsmStructureIndex.OsmStructure>
+            bridges){
+        if(s.nodes.length==0)return;
+        double cosLat=Math.cos(Math.toRadians(lat));
+        double dL=(lat-s.nodes[0].lat)*111320.0;
+        double dN=(lon-s.nodes[0].lon)*111320.0*cosLat;
+        if(Math.sqrt(dL*dL+dN*dN)>1.0)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        placeTree(c,p,bx,bz,sy,
+            TerraDensityFunctions.blockHash(bx,bz),
+            lat,lon,roads,bridges);}
+
+    /** man_made=pier|breakwater|groyne|embankment|dyke. */
+    private void placePier(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,int waterY,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        boolean stone=s.subType!=null
+            &&!s.subType.equals("pier");
+        double hw=s.explicitWidth>0
+            ?Math.min(s.explicitWidth/2.0,10.0)
+            :(stone?2.0:1.5);
+        boolean inside=s.isArea
+            ?s.containsPoint(lat,lon)
+            :s.distanceToLine(lat,lon)<=hw;
+        if(!inside)return;
+        int my=c.getMaxBuildHeight()-2;
+        // deck sits just above the water surface (or ground on land)
+        int deckY=Math.min(my,
+            Math.max(sy,waterY)+1);
+        p.set(bx,deckY,bz);
+        setOwned(c, p,
+            stone?STONE_BRICK:PIER_DECK,false);
+        if(stone){
+            // solid fill down to the sea/river bed
+            for(int y=deckY-1;y>=sy&&y>=c
+                    .getMinBuildHeight();y--){
+                p.set(bx,y,bz);
+                setOwned(c, p,COBBLESTONE,false);}
+        }else{
+            // wooden piles on a sparse grid
+            int h=TerraDensityFunctions
+                .blockHash(bx,bz);
+            if(h%9==0)
+                for(int y=deckY-1;y>=sy&&y>=c
+                        .getMinBuildHeight();y--){
+                    p.set(bx,y,bz);
+                    setOwned(c, p,OAK_LOG,false);}
+        }
+        // keep the deck walkable
+        for(int y=deckY+1;y<=deckY+2&&y<=my;y++){
+            p.set(bx,y,bz);
+            if(!c.getBlockState(p).isAir())
+                setOwned(c, p,AIR,false);}}
+
+    /** man_made towers, tanks, chimneys, masts (node or small way). */
+    private void placeTower(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        // Areas (e.g. storage tanks mapped as ways) fill their
+        // polygon; node features build at the node position.
+        double r;
+        boolean inside;
+        if(s.isArea&&s.nodes.length>=3){
+            inside=s.containsPoint(lat,lon);
+            r=-1;
+        }else{
+            if(s.nodes.length==0)return;
+            double cosLat=Math.cos(
+                Math.toRadians(lat));
+            double dL=(lat-s.nodes[0].lat)*111320.0;
+            double dN=(lon-s.nodes[0].lon)
+                *111320.0*cosLat;
+            r=Math.sqrt(dL*dL+dN*dN);
+            String st=s.subType!=null?s.subType:"";
+            double rad=switch(st){
+                case "storage_tank","silo"->4.0;
+                case "water_tower","tower",
+                     "communications_tower",
+                     "lighthouse","chimney"->2.0;
+                default->0.6;};       // mast/flagpole: single column
+            inside=r<=rad;
+        }
+        if(!inside)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        String st=s.subType!=null?s.subType:"";
+        int hgt=s.resolvedHeightBlocks();
+        if(hgt<=0)hgt=switch(st){
+            case "communications_tower"->40;
+            case "chimney"->25;
+            case "tower","lighthouse"->18;
+            case "water_tower"->14;
+            case "mast"->16;
+            case "flagpole"->8;
+            case "storage_tank","silo"->10;
+            default->12;};
+        int my=c.getMaxBuildHeight()-2;
+        BlockState wall=switch(st){
+            case "storage_tank","silo"->TANK_WALL;
+            case "mast","flagpole",
+                 "communications_tower"->MAST_FRAME;
+            case "chimney"->BRICK;
+            case "lighthouse"->WHITE_CONCRETE;
+            default->TOWER_WALL;};
+        for(int y=1;y<=hgt&&sy+y<=my;y++){
+            p.set(bx,sy+y,bz);
+            setOwned(c, p,wall,false);}
+        // beacon on lighthouses and comms towers
+        if((st.equals("lighthouse")
+                ||st.equals("communications_tower"))
+                &&sy+hgt+1<=my){
+            p.set(bx,sy+hgt+1,bz);
+            setOwned(c, p,SEA_LANTERN,false);}}
+
+    /** power=tower|pole — pylon lattice column. */
+    private void placePylon(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        if(s.nodes.length==0)return;
+        double cosLat=Math.cos(Math.toRadians(lat));
+        double dL=(lat-s.nodes[0].lat)*111320.0;
+        double dN=(lon-s.nodes[0].lon)*111320.0*cosLat;
+        if(Math.sqrt(dL*dL+dN*dN)>1.0)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        int hgt="pole".equals(s.subType)?8:22;
+        int my=c.getMaxBuildHeight()-2;
+        for(int y=1;y<=hgt&&sy+y<=my;y++){
+            p.set(bx,sy+y,bz);
+            setOwned(c, p,MAST_FRAME,false);}}
+
+    /** aeroway=runway|taxiway — wide paved strip. */
+    private void placeRunway(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        boolean runway=
+            "runway".equals(s.subType);
+        double hw=s.explicitWidth>0
+            ?Math.min(s.explicitWidth/2.0,40.0)
+            :(runway?22.0:11.0);
+        hw*=config.roadWidthScale;
+        double dist=s.distanceToLine(lat,lon);
+        if(dist>hw)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        p.set(bx,sy,bz);
+        setOwned(c, p,RUNWAY_SURFACE,false);
+        clearSafe(c,p,bx,bz,sy,2);
+        // centreline markings on runways
+        if(runway&&dist<0.6){
+            int h=TerraDensityFunctions
+                .blockHash(bx,bz);
+            if(h%2==0){
+                p.set(bx,sy,bz);
+                setOwned(c, p,
+                    ROAD_MARKING_WHITE,false);}}}
+
+    /** aeroway=apron|helipad — paved area. */
+    private void placeApron(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy){
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        p.set(bx,sy,bz);
+        setOwned(c, p,APRON_SURFACE,false);
+        clearSafe(c,p,bx,bz,sy,1);}
+
+    /** leisure=swimming_pool — water with a light rim. */
+    private void placePool(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        if(!s.containsPoint(lat,lon))return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        double ed=edgeDistMeters(lat,lon,s);
+        p.set(bx,sy,bz);
+        if(ed<1.0)
+            setOwned(c, p,POOL_RIM,false);
+        else{
+            setOwned(c, p,WATER_BLOCK,false);
+            p.set(bx,sy-1,bz);
+            setOwned(c, p,POOL_RIM,false);}}
+
+    /** railway=platform — raised platform strip/area. */
+    private void placePlatform(ChunkAccess c,
+            BlockPos.MutableBlockPos p,
+            int bx,int bz,int sy,
+            OsmStructureIndex.OsmStructure s,
+            double lat,double lon){
+        boolean inside=s.isArea&&s.nodes.length>=3
+            ?s.containsPoint(lat,lon)
+            :s.distanceToLine(lat,lon)
+                <=(s.explicitWidth>0
+                    ?Math.min(s.explicitWidth/2.0,6.0)
+                    :2.0);
+        if(!inside)return;
+        if(hasBuildingAbove(c,p,bx,bz,sy))return;
+        int my=c.getMaxBuildHeight()-2;
+        if(sy+1<=my){
+            p.set(bx,sy+1,bz);
+            setOwned(c, p,PLATFORM_SURFACE,false);
+            clearSafe(c,p,bx,bz,sy+1,1);}}
 
     // ================================================================
     // HEIGHT / LEVEL

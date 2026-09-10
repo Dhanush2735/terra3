@@ -214,7 +214,7 @@ public class EsaWorldCoverIndex {
             return t;
         });
 
-        Path dir = Paths.get("terra_cache", "worldcover");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("worldcover");
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -554,7 +554,7 @@ public class EsaWorldCoverIndex {
                 LOGGER.debug("WorldCover header [{}] attempt {}: {}",
                         tileKey, attempt, e.getMessage());
             } finally {
-                if (conn != null) conn.disconnect();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             }
 
             if (attempt < MAX_RETRY) {
@@ -632,7 +632,7 @@ public class EsaWorldCoverIndex {
                 LOGGER.debug("WorldCover iTile [{}/{}] attempt {}: {}",
                         tileKey, iTile, attempt, e.getMessage());
             } finally {
-                if (conn != null) conn.disconnect();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             }
 
             if (attempt < MAX_RETRY) {

@@ -24,6 +24,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.util.zip.GZIPInputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -34,6 +36,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -499,8 +502,7 @@ public class OsmWaterIndex {
                 return t;
             });
 
-        Path dir = Paths.get(
-            "terra_cache", "osm_water");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("osm_water");
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -694,6 +696,13 @@ public class OsmWaterIndex {
      */
     public void prefetch(double lat, double lon) {
         if (!enabled) return;
+        // COLD-START BATCHING (ported from OsmStructureIndex):
+        // collect genuinely missing tiles of the 3x3 area first,
+        // then fetch them as ONE Overpass area request instead of
+        // up to 9 rate-limited singles. On the shared public
+        // endpoints the batch costs one token + one round trip —
+        // measured 3-6x faster on cold arrival for structures.
+        Map<Long, double[]> missing = new HashMap<>();
         for (int dlat = -1; dlat <= 1; dlat++)
             for (int dlon = -1; dlon <= 1; dlon++) {
                 double tLat = lat + dlat * TILE_DEG;
@@ -710,10 +719,224 @@ public class OsmWaterIndex {
                         continue;
                     }
                 }
-
-                pending.computeIfAbsent(key,
-                    k -> submitFetch(k, tLat, tLon));
+                missing.put(key, new double[]{
+                    Math.floor(tLat / TILE_DEG) * TILE_DEG,
+                    Math.floor(tLon / TILE_DEG) * TILE_DEG});
             }
+        if (missing.isEmpty()) return;
+        if (missing.size() == 1) {
+            var e = missing.entrySet().iterator().next();
+            pending.computeIfAbsent(e.getKey(),
+                k -> submitFetch(k,
+                    e.getValue()[0], e.getValue()[1]));
+            return;
+        }
+        // Claim all tiles with futures so concurrent callers
+        // wait on the batch instead of firing their own.
+        Map<Long, CompletableFuture<WaterTile>> claimed =
+            new HashMap<>();
+        for (long key : missing.keySet()) {
+            CompletableFuture<WaterTile> f =
+                new CompletableFuture<>();
+            if (pending.putIfAbsent(key, f) == null)
+                claimed.put(key, f);
+        }
+        if (claimed.isEmpty()) return;
+        dlPool.submit(() -> fetchWaterBatch(claimed, missing));
+    }
+
+    /** One area request covering every claimed tile; response
+     *  split per-tile (feature bbox overlap, matching the
+     *  per-tile expand margin) and cached under each key. Tiles
+     *  the batch could not serve fall back to single fetch. */
+    private void fetchWaterBatch(
+            Map<Long, CompletableFuture<WaterTile>> claimed,
+            Map<Long, double[]> origins) {
+        double minLat = 90, maxLat = -90,
+               minLon = 180, maxLon = -180;
+        for (double[] o : origins.values()) {
+            minLat = Math.min(minLat, o[0]);
+            maxLat = Math.max(maxLat, o[0] + TILE_DEG);
+            minLon = Math.min(minLon, o[1]);
+            maxLon = Math.max(maxLon, o[1] + TILE_DEG);
+        }
+        double expand = TILE_DEG * 0.1;
+        String bbox = String.format("%.6f,%.6f,%.6f,%.6f",
+            minLat - expand, minLon - expand,
+            maxLat + expand, maxLon + expand);
+        String json = executeWaterQuery(bbox, 40);
+        if (json == null) {
+            // batch failed: single-tile fallback per claim
+            for (var e : claimed.entrySet()) {
+                double[] o = origins.get(e.getKey());
+                WaterTile t = fetchTile(e.getKey(), o[0], o[1]);
+                e.getValue().complete(t);
+                pending.remove(e.getKey(), e.getValue());
+            }
+            return;
+        }
+        WaterTile all = parseResponse(json);
+        int served = 0;
+        for (var e : claimed.entrySet()) {
+            double[] o = origins.get(e.getKey());
+            WaterTile sub = all.valid
+                ? subsetTile(all,
+                    o[0] - expand, o[0] + TILE_DEG + expand,
+                    o[1] - expand, o[1] + TILE_DEG + expand)
+                : WaterTile.FAILED;
+            if (sub.valid) {
+                memCache.put(e.getKey(), sub);
+                evictIfNeeded();
+                // Disk: store the raw batch JSON under each tile
+                // key. loadDisk->parseResponse replays it; the
+                // extra out-of-tile features are harmless (all
+                // queries distance-filter) and it keeps disk
+                // replay byte-faithful to what the network said.
+                if (diskOk) saveDisk(e.getKey(), json);
+                served++;
+            }
+            e.getValue().complete(sub);
+            pending.remove(e.getKey(), e.getValue());
+        }
+        LOGGER.info("WATER BATCH [{}]: {} tiles in one "
+            + "request ({} features total)",
+            bbox, served,
+            all.valid ? all.features.length : -1);
+    }
+
+    /** The full water/coastline Overpass query for a bbox —
+     *  shared by single-tile fetch and the cold-start batch. */
+    private static String waterQueryFor(String bbox,
+            int timeoutSec) {
+        return "[out:json][timeout:" + timeoutSec + "];("
+            + "way[\"waterway\"~"
+            + "\"river|stream|canal\"]"
+            + "(" + bbox + ");"
+            + "way[\"waterway\"="
+            + "\"riverbank\"](" + bbox + ");"
+            + "way[\"natural\"=\"water\"]"
+            + "(" + bbox + ");"
+            + "relation[\"natural\"=\"water\"]"
+            + "(" + bbox + ");"
+            + "relation[\"waterway\"=\"riverbank\"]"
+            + "(" + bbox + ");"
+            + "relation[\"water\"~\"lake|reservoir|pond"
+            + "|oxbow|basin|drain|river|canal"
+            + "|ditch|moat\"](" + bbox + ");"
+            + "relation[\"landuse\"=\"reservoir\"]"
+            + "(" + bbox + ");"
+            + "relation[\"natural\"=\"wetland\"]"
+            + "(" + bbox + ");"
+            + "relation[\"wetland\"~"
+            + "\"swamp|marsh|bog|fen\"]"
+            + "(" + bbox + ");"
+            + "way[\"water\"~\"lake|reservoir|pond"
+            + "|oxbow|basin|drain|river|canal"
+            + "|ditch|moat\"](" + bbox + ");"
+            + "way[\"landuse\"=\"reservoir\"]"
+            + "(" + bbox + ");"
+            + "way[\"natural\"=\"wetland\"]"
+            + "(" + bbox + ");"
+            + "way[\"wetland\"~"
+            + "\"swamp|marsh|bog|fen\"]"
+            + "(" + bbox + ");"
+            + "way[\"natural\"=\"coastline\"]"
+            + "(" + bbox + ");"
+            + ");out body geom;";
+    }
+
+    /** Endpoint-rotating POST of a water query; null on total
+     *  failure (all endpoints down/paused). Mirrors fetchTile's
+     *  rotation but returns the raw JSON for batch splitting. */
+    private String executeWaterQuery(String bbox,
+            int timeoutSec) {
+        if (System.currentTimeMillis() < pauseUntilMs)
+            return null;
+        String query = waterQueryFor(bbox, timeoutSec);
+        totalQueries.incrementAndGet();
+        int startIdx =
+            endpointIdx.get() % OVERPASS_ENDPOINTS.length;
+        for (int attempt = 0;
+                attempt < OVERPASS_ENDPOINTS.length;
+                attempt++) {
+            int idx = (startIdx + attempt)
+                % OVERPASS_ENDPOINTS.length;
+            if (System.currentTimeMillis()
+                    < endpointPauseUntil[idx]) continue;
+            String ep = OVERPASS_ENDPOINTS[idx];
+            OverpassRateLimiter limiter =
+                endpointLimiters[idx];
+            HttpURLConnection conn = null;
+            boolean inFlight = false;
+            try {
+                limiter.acquire();
+                limiter.acquireInFlight();
+                inFlight = true;
+                conn = (HttpURLConnection)
+                    new URL(ep).openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+                conn.setReadTimeout(
+                    Math.max(HTTP_TIMEOUT_MS,
+                        timeoutSec * 1000 + 5000));
+                conn.setRequestProperty("Content-Type",
+                    "application/x-www-form-urlencoded");
+                conn.setRequestProperty("User-Agent",
+                    "TerraPlusPlus/2.0 Minecraft");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
+                byte[] body = ("data="
+                    + URLEncoder.encode(query,
+                        StandardCharsets.UTF_8))
+                    .getBytes(StandardCharsets.UTF_8);
+                conn.getOutputStream().write(body);
+                conn.getOutputStream().flush();
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    String json = readResponse(conn);
+                    endpointIdx.set(idx);
+                    consecutiveFailures = 0;
+                    return json;
+                } else if (code == 429 || code == 504) {
+                    limiter.penalize(
+                        code == 429 ? 30_000L : 10_000L);
+                } else {
+                    LOGGER.warn("{} returned {} (batch)",
+                        epName(ep), code);
+                    limiter.penalize(8_000L);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                LOGGER.debug("water batch {}: {}",
+                    epName(ep), e.getMessage());
+            } finally {
+                if (inFlight) limiter.releaseInFlight();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
+            }
+        }
+        return null;
+    }
+
+    /** Features/coastline whose bbox overlaps the window. */
+    private WaterTile subsetTile(WaterTile all,
+            double aLat, double bLat,
+            double aLon, double bLon) {
+        List<WaterFeature> fs = new ArrayList<>();
+        for (WaterFeature f : all.features)
+            if (f.maxLat >= aLat && f.minLat <= bLat
+                    && f.maxLon >= aLon && f.minLon <= bLon)
+                fs.add(f);
+        List<CoastlineSegment> cs = new ArrayList<>();
+        for (CoastlineSegment c : all.coastline)
+            if (c.maxLat >= aLat && c.minLat <= bLat
+                    && c.maxLon >= aLon && c.minLon <= bLon)
+                cs.add(c);
+        return new WaterTile(
+            fs.toArray(new WaterFeature[0]),
+            cs.toArray(new CoastlineSegment[0]), true);
     }
 
     public int  getMemCacheSize()  { return memCache.size(); }
@@ -953,41 +1176,7 @@ public class OsmWaterIndex {
             minLat + TILE_DEG + expand,
             minLon + TILE_DEG + expand);
 
-        String query = "[out:json][timeout:20];("
-            + "way[\"waterway\"~"
-            + "\"river|stream|canal\"]"
-            + "(" + bbox + ");"
-            + "way[\"waterway\"="
-            + "\"riverbank\"](" + bbox + ");"
-            + "way[\"natural\"=\"water\"]"
-            + "(" + bbox + ");"
-            + "relation[\"natural\"=\"water\"]"
-            + "(" + bbox + ");"
-            + "relation[\"waterway\"=\"riverbank\"]"
-            + "(" + bbox + ");"
-            + "relation[\"water\"~\"lake|reservoir|pond"
-            + "|oxbow|basin|drain|river|canal"
-            + "|ditch|moat\"](" + bbox + ");"
-            + "relation[\"landuse\"=\"reservoir\"]"
-            + "(" + bbox + ");"
-            + "relation[\"natural\"=\"wetland\"]"
-            + "(" + bbox + ");"
-            + "relation[\"wetland\"~"
-            + "\"swamp|marsh|bog|fen\"]"
-            + "(" + bbox + ");"
-            + "way[\"water\"~\"lake|reservoir|pond"
-            + "|oxbow|basin|drain|river|canal"
-            + "|ditch|moat\"](" + bbox + ");"
-            + "way[\"landuse\"=\"reservoir\"]"
-            + "(" + bbox + ");"
-            + "way[\"natural\"=\"wetland\"]"
-            + "(" + bbox + ");"
-            + "way[\"wetland\"~"
-            + "\"swamp|marsh|bog|fen\"]"
-            + "(" + bbox + ");"
-            + "way[\"natural\"=\"coastline\"]"
-            + "(" + bbox + ");"
-            + ");out body geom;";
+        String query = waterQueryFor(bbox, 20);
 
         totalQueries.incrementAndGet();
 
@@ -1027,6 +1216,8 @@ public class OsmWaterIndex {
                     "application/x-www-form-urlencoded");
                 conn.setRequestProperty("User-Agent",
                     "TerraPlusPlus/2.0 Minecraft");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
 
                 byte[] body = ("data="
                     + URLEncoder.encode(query,
@@ -1081,7 +1272,7 @@ public class OsmWaterIndex {
                 LOGGER.debug("{} failed: {}",
                     epName(ep), e.getMessage());
             } finally {
-                if (conn != null) conn.disconnect();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
                 if (endpointInFlight) limiter.releaseInFlight();
             }
         }
@@ -1094,12 +1285,18 @@ public class OsmWaterIndex {
         return WaterTile.FAILED;
     }
 
-    private String readResponse(HttpURLConnection conn)
+    private String readResponse(
+            HttpURLConnection conn)
             throws IOException {
-        StringBuilder sb = new StringBuilder(16384);
+        StringBuilder sb = new StringBuilder(32768);
+        InputStream raw = conn.getInputStream();
+        // Overpass responses gzip ~10-15x; decompress transparently
+        // when the server honoured Accept-Encoding.
+        if ("gzip".equalsIgnoreCase(
+                conn.getContentEncoding()))
+            raw = new GZIPInputStream(raw, 8192);
         try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(
-                    conn.getInputStream(),
+                new InputStreamReader(raw,
                     StandardCharsets.UTF_8))) {
             char[] buf = new char[8192];
             int n;

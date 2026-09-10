@@ -1,0 +1,10 @@
+-nowarn
+-encoding
+UTF-8
+-Xmaxerrs
+20000
+-cp
+/tmp/libs/gson-2.10.1.jar
+-d
+/tmp/out
+@/tmp/sources.txt

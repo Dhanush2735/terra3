@@ -25,7 +25,7 @@ package net.buildtheearth.terraplusplus.generator.historical;
 
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.buildtheearth.terraplusplus.generator.osm.OsmStructureIndex;
-import net.buildtheearth.terraplusplus.generator.osm.OvertureIndex;
+import net.buildtheearth.terraplusplus.generator.osm.MicrosoftIndex;
 import net.buildtheearth.terraplusplus.generator.osm.SourceCooperativeIndex;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -52,7 +52,7 @@ public class HistoricalStructureManager {
     private final OhmStructureIndex  ohmIndex;
     private final OsmStructureIndex  osmIndex;
     private final SourceCooperativeIndex vidaIndex;
-    private final OvertureIndex      overtureIndex;
+    private final MicrosoftIndex      overtureIndex;
     private final TerraWorldConfig   config;
     private final WikiDataLookup     wikiData;
 
@@ -65,7 +65,7 @@ public class HistoricalStructureManager {
         this.ohmIndex      = ohmIndex;
         this.osmIndex      = osmIndex;
         this.vidaIndex     = SourceCooperativeIndex.getInstance();
-        this.overtureIndex = OvertureIndex.getInstance();
+        this.overtureIndex = MicrosoftIndex.getInstance();
         this.config        = config;
         this.wikiData      = WikiDataLookup
             .getInstance();
@@ -169,7 +169,11 @@ public class HistoricalStructureManager {
                     if (s.base.osmId != 0)
                         ohmOsmIds.add(s.base.osmId);
 
-                    if (s.isVisibleAt(currentYear)) {
+                    if (s.isVisibleAt(currentYear)
+                            && WorldLineRegistry.structureAllowed(
+                                s.base.osmId,
+                                (s.base.minLat + s.base.maxLat) / 2.0,
+                                (s.base.minLon + s.base.maxLon) / 2.0)) {
                         visible.add(s.base);
 
                         // OHM visible structures
@@ -297,7 +301,11 @@ public class HistoricalStructureManager {
                         effectiveStart,
                         effectiveEnd,
                         currentYear,
-                        false))
+                        false)
+                        && WorldLineRegistry.structureAllowed(
+                            s.osmId,
+                            (s.minLat + s.maxLat) / 2.0,
+                            (s.minLon + s.maxLon) / 2.0))
                     visible.add(s);
             }
 
@@ -370,7 +378,9 @@ public class HistoricalStructureManager {
                         HistoricalDateParser
                             .UNKNOWN_YEAR,
                         currentYear,
-                        false)) {
+                        false)
+                        && WorldLineRegistry.structureAllowed(
+                            0L, b.centerLat, b.centerLon)) {
                     vidaAccepted.add(b);
                     visible.add(b.toOsmStructure());
                 }
@@ -395,7 +405,7 @@ public class HistoricalStructureManager {
                 && overtureIndex.isEnabled()
                 && lowerTierYearEligible && microsoftGap) {
 
-            List<OvertureIndex.OvertureBuilding>
+            List<MicrosoftIndex.MicrosoftBuilding>
                 ovAll = overtureIndex
                 .getBuildingsForChunkBlocking(
                     minLat, maxLat,
@@ -412,7 +422,7 @@ public class HistoricalStructureManager {
                     existingFootprints =
                     new ArrayList<>(visible);
 
-                for (OvertureIndex.OvertureBuilding b
+                for (MicrosoftIndex.MicrosoftBuilding b
                         : ovAll) {
 
                     // Skip if overlaps existing
@@ -492,7 +502,11 @@ public class HistoricalStructureManager {
                         OsmStructureIndex.OsmStructure
                             osmForm =
                             b.toOsmStructure();
-                        visible.add(osmForm);
+                        if (WorldLineRegistry.structureAllowed(
+                                osmForm.osmId,
+                                (osmForm.minLat + osmForm.maxLat) / 2.0,
+                                (osmForm.minLon + osmForm.maxLon) / 2.0))
+                            visible.add(osmForm);
                     }
                 }
             }
@@ -524,7 +538,7 @@ public class HistoricalStructureManager {
     // ── OVERLAP DETECTION ────────────────────────────────────
 
     private static boolean overlapsExisting(
-            OvertureIndex.OvertureBuilding b,
+            MicrosoftIndex.MicrosoftBuilding b,
             List<OsmStructureIndex.OsmStructure>
                 existing) {
         for (OsmStructureIndex.OsmStructure s

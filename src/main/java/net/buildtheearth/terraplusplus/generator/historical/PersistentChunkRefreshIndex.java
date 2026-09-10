@@ -664,6 +664,23 @@ public final class PersistentChunkRefreshIndex {
                 && level.dimension()
                 == Level.OVERWORLD) {
             stopping = false;
+            // Axis 5: restore branch registry before any chunk
+            // staleness check computes a fingerprint.
+            try {
+                WorldLineRegistry.load(level.getServer()
+                    .getWorldPath(net.minecraft.world.level
+                        .storage.LevelResource.ROOT));
+                // Axis 6: restore forged universe parameters
+                // before any custom-slot dimension generates.
+                net.buildtheearth.terraplusplus.generator
+                    .UniverseTransforms.loadForged(
+                        level.getServer().getWorldPath(
+                            net.minecraft.world.level
+                                .storage.LevelResource.ROOT));
+            } catch (Exception e) {
+                LOGGER.warn("worldline load failed: {}",
+                    e.getMessage());
+            }
             ensureInitialized(level);
         }
     }
@@ -683,6 +700,7 @@ public final class PersistentChunkRefreshIndex {
                 GeneratedBlockOwnershipIndex.flush();
                 DeferredChunkRefreshLedger.flush();
                 BoundaryPairRefreshLedger.flush();
+                ProvisionalServing.clear();
                 clearRuntimeOnly();
                 initialized = false;
             }
@@ -1200,8 +1218,15 @@ public final class PersistentChunkRefreshIndex {
     // --------------------------------------------------
 
     private static short currentYearShort() {
-        return clampYearToShort(
-            TerraTimeManager.getCurrentYear());
+        // World-line fingerprint: the stored short encodes
+        // year + active timeline branch. Switching branch makes
+        // every previously-refreshed chunk read as stale — the
+        // same mechanism a year jump uses. On the main timeline
+        // this is the plain year short, so existing region files
+        // stay valid.
+        return WorldLineRegistry.fingerprintShort(
+            clampYearToShort(
+                TerraTimeManager.getCurrentYear()));
     }
 
     private static short clampYearToShort(

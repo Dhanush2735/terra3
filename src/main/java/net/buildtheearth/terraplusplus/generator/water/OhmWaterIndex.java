@@ -27,6 +27,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.util.zip.GZIPInputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -162,8 +164,7 @@ public class OhmWaterIndex {
                 return t;
             });
 
-        Path dir = Paths.get(
-            "terra_cache", "ohm_water");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("ohm_water");
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -623,6 +624,8 @@ public class OhmWaterIndex {
                 "application/x-www-form-urlencoded");
             conn.setRequestProperty("User-Agent",
                 "TerraPlusPlus/2.0 Minecraft OHM");
+                conn.setRequestProperty(
+                    "Accept-Encoding", "gzip");
 
             byte[] body = ("data="
                 + URLEncoder.encode(query,
@@ -673,7 +676,7 @@ public class OhmWaterIndex {
                 "OHM water fetch failed: {}",
                 e.getMessage());
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             if (endpointInFlight) limiter.releaseInFlight();
         }
 
@@ -972,13 +975,16 @@ public class OhmWaterIndex {
     private String readResponse(
             HttpURLConnection conn)
             throws IOException {
-        StringBuilder sb =
-            new StringBuilder(16384);
-        try (BufferedReader br =
-                new BufferedReader(
-                new InputStreamReader(
-                conn.getInputStream(),
-                StandardCharsets.UTF_8))) {
+        StringBuilder sb = new StringBuilder(32768);
+        InputStream raw = conn.getInputStream();
+        // Overpass responses gzip ~10-15x; decompress transparently
+        // when the server honoured Accept-Encoding.
+        if ("gzip".equalsIgnoreCase(
+                conn.getContentEncoding()))
+            raw = new GZIPInputStream(raw, 8192);
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(raw,
+                    StandardCharsets.UTF_8))) {
             char[] buf = new char[8192];
             int n;
             while ((n = br.read(buf)) != -1)

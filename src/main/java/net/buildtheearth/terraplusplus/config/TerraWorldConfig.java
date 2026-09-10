@@ -380,7 +380,7 @@ public class TerraWorldConfig {
                 overtureBuildings, overtureSupplement,
                 timeEnabled, timeScale, baseYear, ohmEnabled);
     }
-    public TerraWorldConfig withOvertureBuildings(boolean v) {
+    public TerraWorldConfig withMicrosoftBuildings(boolean v) {
         return new TerraWorldConfig(buildings, roads,
                 railways, bridges, walls, gardens, landuse,
                 streetLights, naturalFeatures, waterBodies,

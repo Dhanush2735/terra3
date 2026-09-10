@@ -109,13 +109,32 @@ public class TerraDensityFunctions {
     private final ExecutorService dlPool;
     private final String tileUrl;
 
-    private final AtomicInteger elevDebug     = new AtomicInteger(0);
-    private final AtomicInteger bathyDebug    = new AtomicInteger(0);
-    private final AtomicInteger belowSeaDebug = new AtomicInteger(0);
-    private final AtomicInteger classifyDebug = new AtomicInteger(0);
+    // LOADING-SCREEN FIX: these debug gates were per-INSTANCE,
+    // and 11 universes create 11 instances -> ~900 INFO lines
+    // during boot (console I/O on Windows is slow and these run
+    // inside the hot terrain path). Static = global gates: same
+    // diagnostic value, ~1/11th the spam.
+    private static final AtomicInteger elevDebug     = new AtomicInteger(0);
+    private static final AtomicInteger bathyDebug    = new AtomicInteger(0);
+    private static final AtomicInteger belowSeaDebug = new AtomicInteger(0);
+    private static final AtomicInteger classifyDebug = new AtomicInteger(0);
+
+    // ── UNIVERSE (axis 6) ─────────────────────────────────────
+    // Pure transform applied at the geography/elevation
+    // chokepoints; everything downstream inherits it.
+    private final UniverseTransforms.Universe universe;
+
+    public UniverseTransforms.Universe getUniverse() {
+        return universe;
+    }
 
     // ── CONSTRUCTOR ───────────────────────────────────────────
     public TerraDensityFunctions(int zoom) {
+        this(zoom, UniverseTransforms.PRIME);
+    }
+
+    public TerraDensityFunctions(int zoom, String universeId) {
+        this.universe = UniverseTransforms.get(universeId);
         this.zoom = zoom;
         GeographicProjection proj = null;
         boolean ok = false;
@@ -145,7 +164,7 @@ public class TerraDensityFunctions {
         this.pendingTiles = new ConcurrentHashMap<>();
         this.elevCache    = new ConcurrentHashMap<>(8192);
 
-        Path dir = Paths.get("terra_cache", "tiles");
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("tiles");
         boolean diskOk = false;
         try {
             Files.createDirectories(dir);
@@ -164,9 +183,9 @@ public class TerraDensityFunctions {
                     return t;
                 });
         LOGGER.info("TerraDensityFunctions: zoom={} projection={} "
-                        + "coastLand={}m coastOcean={}m snap={}m",
+                        + "coastLand={}m coastOcean={}m snap={}m universe={}",
                 zoom, ok, COAST_LAND_THRESHOLD,
-                COAST_OCEAN_THRESHOLD, SEA_LEVEL_SNAP);
+                COAST_OCEAN_THRESHOLD, SEA_LEVEL_SNAP, universe.id());
     }
 
     public TerraDensityFunctions() { this(15); }
@@ -180,7 +199,8 @@ public class TerraDensityFunctions {
     public double[] toGeo(int blockX, int blockZ) {
         if (projection == null) return null;
         try {
-            return projection.toGeo((double) blockX, (double) blockZ);
+            return universe.mapGeo(
+                projection.toGeo((double) blockX, (double) blockZ));
         } catch (OutOfProjectionBoundsException e) {
             return null;
         }
@@ -189,7 +209,8 @@ public class TerraDensityFunctions {
     public double[] fromGeo(double lat, double lon) {
         if (projection == null) return null;
         try {
-            return projection.fromGeo(lon, lat);
+            double[] ll = universe.unmapGeo(lat, lon);
+            return projection.fromGeo(ll[1], ll[0]);
         } catch (OutOfProjectionBoundsException e) {
             return null;
         }
@@ -299,8 +320,8 @@ public class TerraDensityFunctions {
 
         double longitude, latitude;
         try {
-            double[] ll = projection.toGeo(
-                    (double) blockX, (double) blockZ);
+            double[] ll = universe.mapGeo(projection.toGeo(
+                    (double) blockX, (double) blockZ));
             longitude = ll[0];
             latitude  = ll[1];
         } catch (OutOfProjectionBoundsException e) {
@@ -685,6 +706,13 @@ public class TerraDensityFunctions {
     }
 
     public double getElevationInterpolated(double latitude, double longitude) {
+        double raw = getElevationInterpolatedRaw(latitude, longitude);
+        // Universe transform: applied to every consumer uniformly
+        // (terrain, coastlines, rivers, structure ground checks).
+        return universe.mapElevation(raw, latitude, longitude);
+    }
+
+    private double getElevationInterpolatedRaw(double latitude, double longitude) {
         if (Double.isNaN(latitude)  || Double.isNaN(longitude)
                 || latitude  <= -85 || latitude  >= 85
                 || longitude < -180 || longitude > 180) return -50;
@@ -844,6 +872,79 @@ public class TerraDensityFunctions {
         return (r * 256.0 + g + b / 256.0) - 32768.0;
     }
 
+    // ── ELEVATION PREFETCH (teleport/terrain fast-path) ──────
+    // Terrain generation speed IS elevation-tile speed: every
+    // column asks getElevation*, and on a cold cache each
+    // missing tile blocked a worker for up to 3s (f.get(3s)),
+    // one tile at a time. This warms every tile covering the
+    // bbox (terrain zoom + first bathy zoom) in parallel on
+    // dlPool, fire-and-forget. Called from warmDestination at
+    // /tpll time, so by the time chunk workers need heights the
+    // answers are memory hits. Dedup via pendingTiles/tileCache.
+    public int prefetchArea(double minLat, double maxLat,
+                            double minLon, double maxLon) {
+        int fired = 0;
+        try {
+            int[] zooms = { this.zoom, BATHY_ZOOM_CHAIN[0] };
+            for (int zl : zooms) {
+                int n = 1 << zl;
+                int txMin = lonToTileX(minLon, n), txMax = lonToTileX(maxLon, n);
+                int tyMin = latToTileY(maxLat, n), tyMax = latToTileY(minLat, n);
+                // clamp runaway boxes (projection edge cases)
+                if ((long)(txMax - txMin + 1) * (tyMax - tyMin + 1) > 128) continue;
+                for (int tx = txMin; tx <= txMax; tx++) {
+                    for (int ty = tyMin; ty <= tyMax; ty++) {
+                        String key = zl + "/" + tx + "/" + ty;
+                        if (tileCache.containsKey(key)) continue;
+                        if (useDiskCache && diskHasTile(key)) continue;
+                        final String k = key;
+                        pendingTiles.computeIfAbsent(k,
+                                kk -> {
+                                    CompletableFuture<BufferedImage> f =
+                                        CompletableFuture.supplyAsync(
+                                            () -> downloadTile(kk), dlPool);
+                                    // self-clean: prefetch futures may never
+                                    // be get()-ed by getTile, so remove on
+                                    // completion (downloadTile already put
+                                    // the result into tileCache).
+                                    f.whenComplete((img, ex) ->
+                                        pendingTiles.remove(kk, f));
+                                    return f;
+                                });
+                        fired++;
+                    }
+                }
+            }
+            if (fired > 0)
+                LOGGER.info("ELEV PREFETCH [{}..{},{}..{}]: {} height tiles "
+                        + "dispatched in parallel",
+                        String.format("%.4f", minLat), String.format("%.4f", maxLat),
+                        String.format("%.4f", minLon), String.format("%.4f", maxLon),
+                        fired);
+        } catch (Exception ignored) {}
+        return fired;
+    }
+
+    private static int lonToTileX(double lon, int n) {
+        int t = (int) Math.floor((lon + 180.0) / 360.0 * n);
+        return Math.max(0, Math.min(n - 1, t));
+    }
+
+    private static int latToTileY(double lat, int n) {
+        double latRad = Math.toRadians(Math.max(-85, Math.min(85, lat)));
+        int t = (int) Math.floor((1.0 - Math.log(Math.tan(latRad)
+                + 1.0 / Math.cos(latRad)) / Math.PI) / 2.0 * n);
+        return Math.max(0, Math.min(n - 1, t));
+    }
+
+    private boolean diskHasTile(String key) {
+        try {
+            File f = diskCacheDir.resolve(
+                    key.replace('/', File.separatorChar) + ".png").toFile();
+            return f.exists() && f.length() > 0;
+        } catch (Exception e) { return false; }
+    }
+
     private BufferedImage getTile(int zl, int tx, int ty) {
         String key = zl + "/" + tx + "/" + ty;
         BufferedImage c = tileCache.get(key);
@@ -901,7 +1002,7 @@ public class TerraDensityFunctions {
             } catch (Exception e) {
                 LOGGER.debug("Tile {} att {}: {}", key, att, e.getMessage());
             } finally {
-                if (conn != null) conn.disconnect();
+                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             }
             if (att < MAX_RETRY) {
                 try { Thread.sleep(500L * att); }

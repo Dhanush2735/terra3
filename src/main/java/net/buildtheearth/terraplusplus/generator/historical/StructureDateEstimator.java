@@ -114,8 +114,74 @@ public class StructureDateEstimator {
             anchors, populationFloor);
 
         // Population floor is a hard minimum —
-        // even if gravity says earlier, we clamp
-        return Math.max(gravityYear, populationFloor);
+        // even if gravity says earlier, we clamp.
+        // Technology floor is a second hard minimum:
+        // gravity anchors near a medieval cathedral
+        // must not date a railway to 1300.
+        int estimated = Math.max(
+            Math.max(gravityYear, populationFloor),
+            getTechnologyFloor(
+                targetType, targetSubType));
+
+        // ── WORLD-LINE (axis 5) ───────────────────
+        // On an alternative timeline, ESTIMATED dates shift by
+        // the branch's development offset (event-driven when an
+        // Eternal Engine provider is registered, seeded
+        // otherwise). Explicit start_date tags never reach this
+        // method, so history's fixed points stay fixed. Floors
+        // still apply after the shift — no branch can create
+        // railways before 1825.
+        estimated = WorldLineRegistry.adjustEstimatedYear(
+            estimated, targetLat, targetLon);
+        return Math.max(
+            Math.max(estimated, populationFloor),
+            getTechnologyFloor(
+                targetType, targetSubType));
+    }
+
+    /**
+     * Earliest year a structure of this type can exist,
+     * regardless of what nearby anchors suggest.
+     * Prevents anachronisms: no railways before 1825,
+     * no motorways before 1930, no airports before 1909.
+     */
+    public static int getTechnologyFloor(
+            OsmStructureIndex.StructureType type,
+            String subType) {
+        if (type == null) return Integer.MIN_VALUE;
+        String st = subType == null ? "" : subType;
+        return switch (type) {
+            case RAILWAY -> switch (st) {
+                case "subway"          -> 1863; // London Underground
+                case "tram"            -> 1881; // electric tram
+                case "light_rail",
+                     "monorail"        -> 1901;
+                case "funicular"       -> 1825;
+                default                -> 1825; // Stockton & Darlington
+            };
+            case PLATFORM              -> 1825;
+            case ROAD -> switch (st) {
+                case "motorway",
+                     "motorway_link"   -> 1930; // autobahn era
+                case "trunk",
+                     "trunk_link"      -> 1920;
+                case "cycleway"        -> 1885; // safety bicycle
+                default -> Integer.MIN_VALUE;   // roads are ancient
+            };
+            case CYCLEWAY               -> 1885;
+            case RUNWAY, APRON          -> 1909; // first airfields
+            case STREET_LAMP            -> 1800; // gas lighting
+            case PYLON                  -> 1880; // power transmission
+            case BRIDGE -> switch (st) {
+                case "suspension"       -> 1820;
+                case "cable-stayed",
+                     "cable_stayed"     -> 1950;
+                default -> Integer.MIN_VALUE;   // bridges are ancient
+            };
+            case PARKING                -> 1900; // motor car
+            case POOL                   -> 1830; // public baths era
+            default -> Integer.MIN_VALUE;
+        };
     }
 
     /**

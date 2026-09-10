@@ -3,10 +3,13 @@
   "minVersion": "0.8",
   "package": "net.buildtheearth.terraplusplus.mixin",
   "compatibilityLevel": "JAVA_17",
-  "mixins": [],
+  "mixins": [
+    "MixinSpawnPrep"
+  ],
   "client": [],
   "server": [],
   "injectors": {
     "defaultRequire": 0
-  }
+  },
+  "refmap": "cubicworldgen.refmap.json"
 }

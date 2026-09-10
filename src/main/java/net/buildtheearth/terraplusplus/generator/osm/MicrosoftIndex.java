@@ -1,5 +1,5 @@
 // ============================================================
-// FILE: OvertureIndex.java (FULL — Microsoft Footprints only, OSM removed)
+// FILE: MicrosoftIndex.java (FULL — Microsoft Footprints only, OSM removed)
 // ============================================================
 package net.buildtheearth.terraplusplus.generator.osm;
 
@@ -39,9 +39,9 @@ import java.util.zip.GZIPInputStream;
  * OSM buildings are handled separately by OsmStructureIndex.
  * This class provides only Microsoft ML building footprints.
  */
-public class OvertureIndex {
+public class MicrosoftIndex {
 
-    private static final Logger LOGGER = LogManager.getLogger("Terra++Overture");
+    private static final Logger LOGGER = LogManager.getLogger("Terra++Microsoft");
 
     // ================================================================
     // CONSTANTS
@@ -81,7 +81,7 @@ public class OvertureIndex {
     // OVERTURE BUILDING
     // ================================================================
 
-    public static class OvertureBuilding {
+    public static class MicrosoftBuilding {
         public final double[][] polygon;
         public final double centerLat;
         public final double centerLon;
@@ -100,7 +100,7 @@ public class OvertureIndex {
         public final String name;
         public final long   osmId;
 
-        public OvertureBuilding(double[][] polygon, double height, int numFloors,
+        public MicrosoftBuilding(double[][] polygon, double height, int numFloors,
                                 String buildingClass, String subtype,
                                 String roofShape, String roofMaterial,
                                 String wallMaterial, double confidence,
@@ -141,13 +141,13 @@ public class OvertureIndex {
          * See {@link SourceAlignment} for why the shift is measured per region
          * at runtime rather than hardcoded. Polygon points are {lat, lon}.
          */
-        public OvertureBuilding shifted(double dLat, double dLon) {
+        public MicrosoftBuilding shifted(double dLat, double dLon) {
             if (dLat == 0.0 && dLon == 0.0) return this;
             double[][] moved = new double[polygon.length][];
             for (int i = 0; i < polygon.length; i++)
                 moved[i] = new double[]{ polygon[i][0] - dLat,
                                          polygon[i][1] - dLon };
-            return new OvertureBuilding(moved, height, numFloors,
+            return new MicrosoftBuilding(moved, height, numFloors,
                     buildingClass, subtype, roofShape, roofMaterial,
                     wallMaterial, confidence, overtureId, primarySource,
                     name, osmId);
@@ -232,14 +232,14 @@ public class OvertureIndex {
     // ================================================================
 
     public static class BuildingTile {
-        public final OvertureBuilding[] buildings;
+        public final MicrosoftBuilding[] buildings;
         public final boolean    valid;
         public final long       fetchTimeMs;
         public final DataSource source;
         public int msftCount;
         public int otherCount;
 
-        public BuildingTile(OvertureBuilding[] buildings, boolean valid,
+        public BuildingTile(MicrosoftBuilding[] buildings, boolean valid,
                             DataSource source) {
             this.buildings   = buildings;
             this.valid       = valid;
@@ -248,12 +248,12 @@ public class OvertureIndex {
             countSources();
         }
 
-        public BuildingTile(OvertureBuilding[] buildings, boolean valid) {
+        public BuildingTile(MicrosoftBuilding[] buildings, boolean valid) {
             this(buildings, valid, DataSource.MEMORY_CACHE);
         }
 
         private void countSources() {
-            for (OvertureBuilding b : buildings) {
+            for (MicrosoftBuilding b : buildings) {
                 if (b.isFromMicrosoft()) msftCount++;
                 else                     otherCount++;
             }
@@ -269,11 +269,11 @@ public class OvertureIndex {
 
         /** A completed source lookup containing no buildings. */
         public static final BuildingTile EMPTY =
-                new BuildingTile(new OvertureBuilding[0], true,
+                new BuildingTile(new MicrosoftBuilding[0], true,
                         DataSource.MEMORY_CACHE);
         /** Download/index state is unavailable; callers must retry. */
         public static final BuildingTile FAILED =
-                new BuildingTile(new OvertureBuilding[0], false,
+                new BuildingTile(new MicrosoftBuilding[0], false,
                         DataSource.MEMORY_CACHE);
     }
 
@@ -298,7 +298,7 @@ public class OvertureIndex {
     private final java.util.concurrent.Semaphore msftParsePermit =
         new java.util.concurrent.Semaphore(1, true);
 
-    private final ConcurrentHashMap<String, List<OvertureBuilding>> msftQuadkeyCache =
+    private final ConcurrentHashMap<String, List<MicrosoftBuilding>> msftQuadkeyCache =
             new ConcurrentHashMap<>();
 
     private volatile boolean msftIndexLoaded  = false;
@@ -333,19 +333,19 @@ public class OvertureIndex {
      * Shared instance.
      *
      * TerraChunkGenerator and HistoricalStructureManager each used to construct
-     * their own OvertureIndex. Both then downloaded the 25,606-entry Microsoft
+     * their own MicrosoftIndex. Both then downloaded the 25,606-entry Microsoft
      * quadkey index and both kept independent tile caches and download pools,
      * doubling memory and network for identical data. One instance only.
      */
-    private static volatile OvertureIndex INSTANCE;
+    private static volatile MicrosoftIndex INSTANCE;
 
-    public static OvertureIndex getInstance() {
-        OvertureIndex local = INSTANCE;
+    public static MicrosoftIndex getInstance() {
+        MicrosoftIndex local = INSTANCE;
         if (local == null) {
-            synchronized (OvertureIndex.class) {
+            synchronized (MicrosoftIndex.class) {
                 local = INSTANCE;
                 if (local == null) {
-                    local = new OvertureIndex();
+                    local = new MicrosoftIndex();
                     INSTANCE = local;
                 }
             }
@@ -353,15 +353,15 @@ public class OvertureIndex {
         return local;
     }
 
-    private OvertureIndex() {
+    private MicrosoftIndex() {
         this.dlPool = Executors.newFixedThreadPool(DL_THREADS, r -> {
-            Thread t = new Thread(r, "Terra++Overture");
+            Thread t = new Thread(r, "Terra++Microsoft");
             t.setDaemon(true);
             return t;
         });
 
-        Path dir     = Paths.get("terra_cache", "overture_buildings");
-        Path msftDir = Paths.get("terra_cache", "msft_buildings");
+        Path dir     = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("overture_buildings");
+        Path msftDir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("msft_buildings");
         Path regionDir = msftDir.resolve("regions");
         boolean ok   = false;
         try {
@@ -377,7 +377,7 @@ public class OvertureIndex {
         this.msftRegionCacheDir = regionDir;
         this.diskOk       = ok;
 
-        LOGGER.info("OvertureIndex initialized");
+        LOGGER.info("MicrosoftIndex initialized");
         LOGGER.info("  Source: Microsoft Global ML Building Footprints (~1.2B)");
         LOGGER.info("  OSM buildings handled separately by OsmStructureIndex");
 
@@ -452,7 +452,7 @@ public class OvertureIndex {
             LOGGER.warn("Microsoft index download failed: {}", e.getMessage());
             msftAvailable = false;
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
             msftIndexLoading = false;
         }
     }
@@ -529,7 +529,7 @@ public class OvertureIndex {
         catch (Exception e) { return BuildingTile.FAILED; }
     }
 
-    public List<OvertureBuilding> getBuildingsAt(double lat, double lon) {
+    public List<MicrosoftBuilding> getBuildingsAt(double lat, double lon) {
         if (!enabled) return List.of();
         try {
             Set<Long> keys = getTileKeysForPoint(lat, lon);
@@ -539,7 +539,7 @@ public class OvertureIndex {
         } catch (Exception e) { return List.of(); }
     }
 
-    public List<OvertureBuilding> getBuildingsForChunk(
+    public List<MicrosoftBuilding> getBuildingsForChunk(
             double minLat, double maxLat, double minLon, double maxLon) {
         if (!enabled) return List.of();
         try {
@@ -550,7 +550,7 @@ public class OvertureIndex {
         } catch (Exception e) { return List.of(); }
     }
 
-    public List<OvertureBuilding> getBuildingsInChunk(double centerLat,
+    public List<MicrosoftBuilding> getBuildingsInChunk(double centerLat,
                                                        double centerLon) {
         if (!enabled) return List.of();
         try {
@@ -570,7 +570,7 @@ public class OvertureIndex {
     // BLOCKING QUERY
     // ================================================================
 
-    public List<OvertureBuilding> getBuildingsForChunkBlocking(
+    public List<MicrosoftBuilding> getBuildingsForChunkBlocking(
             double minLat, double maxLat, double minLon, double maxLon,
             TerraWorldConfig config, long timeoutMs) {
         if (!enabled) return List.of();
@@ -621,7 +621,7 @@ public class OvertureIndex {
         } catch (Exception e) { return List.of(); }
     }
 
-    public List<OvertureBuilding> getBuildingsForChunkBlocking(
+    public List<MicrosoftBuilding> getBuildingsForChunkBlocking(
             double minLat, double maxLat, double minLon, double maxLon,
             long timeoutMs) {
         return getBuildingsForChunkBlocking(
@@ -734,11 +734,11 @@ public class OvertureIndex {
         return keys;
     }
 
-    private List<OvertureBuilding> collectFromKeys(Set<Long> tileKeys,
+    private List<MicrosoftBuilding> collectFromKeys(Set<Long> tileKeys,
                                                     double qMinLat, double qMaxLat,
                                                     double qMinLon, double qMaxLon,
                                                     boolean triggerFetch) {
-        List<OvertureBuilding> result = new ArrayList<>();
+        List<MicrosoftBuilding> result = new ArrayList<>();
         Set<Long> seenIds = new HashSet<>();
         for (long key : tileKeys) {
             BuildingTile tile = memCache.get(key);
@@ -749,13 +749,13 @@ public class OvertureIndex {
             }
             if (tile == null || !tile.valid || tile.buildings.length == 0)
                 continue;
-            for (OvertureBuilding b : tile.buildings) {
+            for (MicrosoftBuilding b : tile.buildings) {
                 if (b.maxLat < qMinLat || b.minLat > qMaxLat
                         || b.maxLon < qMinLon || b.minLon > qMaxLon) continue;
                 long dedupId = b.osmId != 0 ? b.osmId :
                         (b.overtureId != null
-                                ? OvertureBuilding.stableHash(b.overtureId)
-                                : OvertureBuilding.stableHash(
+                                ? MicrosoftBuilding.stableHash(b.overtureId)
+                                : MicrosoftBuilding.stableHash(
                                         b.centerLat, b.centerLon));
                 if (!seenIds.add(dedupId)) continue;
                 result.add(b);
@@ -823,12 +823,12 @@ public class OvertureIndex {
         double centerLat = minLat + TILE_DEG / 2;
         double centerLon = minLon + TILE_DEG / 2;
 
-        List<OvertureBuilding> allBuildings = new ArrayList<>();
+        List<MicrosoftBuilding> allBuildings = new ArrayList<>();
 
         // Microsoft ML Building Footprints. A null list means the index or
         // source is still unavailable, which must not be cached as a valid
         // empty result.
-        List<OvertureBuilding> msftBuildings = null;
+        List<MicrosoftBuilding> msftBuildings = null;
         if (msftAvailable) {
             try {
                 msftBuildings = fetchMicrosoftBuildings(centerLat, centerLon,
@@ -858,7 +858,7 @@ public class OvertureIndex {
         if (allBuildings.isEmpty()) {
             emptyTiles.incrementAndGet();
             BuildingTile empty = new BuildingTile(
-                    new OvertureBuilding[0], true, DataSource.MICROSOFT_ML);
+                    new MicrosoftBuilding[0], true, DataSource.MICROSOFT_ML);
             memCache.put(key, empty);
             pending.remove(key);
             if (diskOk) saveDiskBuildings(key, empty);
@@ -867,7 +867,7 @@ public class OvertureIndex {
 
         consecutiveFailures = 0;
         BuildingTile tile = new BuildingTile(
-                allBuildings.toArray(new OvertureBuilding[0]),
+                allBuildings.toArray(new MicrosoftBuilding[0]),
                 true, DataSource.MICROSOFT_ML);
         memCache.put(key, tile);
         pending.remove(key);
@@ -891,7 +891,7 @@ public class OvertureIndex {
     // MICROSOFT BUILDING FOOTPRINTS FETCH
     // ================================================================
 
-    private List<OvertureBuilding> fetchMicrosoftBuildings(
+    private List<MicrosoftBuilding> fetchMicrosoftBuildings(
             double centerLat, double centerLon,
             double minLat, double minLon, double maxLat, double maxLon) {
 
@@ -902,7 +902,7 @@ public class OvertureIndex {
 
         String quadkey = latLonToQuadkey(centerLat, centerLon, 9);
 
-        List<OvertureBuilding> cached = msftQuadkeyCache.get(
+        List<MicrosoftBuilding> cached = msftQuadkeyCache.get(
                 regionCacheKey(quadkey, minLat, minLon));
         if (cached != null)
             return filterByBbox(cached, minLat, minLon, maxLat, maxLon);
@@ -950,12 +950,12 @@ public class OvertureIndex {
     private static final double MSFT_REGION_DEG = 0.01;
 
     /** Download+parse one quadkey. Caller holds the in-flight marker. */
-    private List<OvertureBuilding> fetchMicrosoftQuadkey(String quadkey,
+    private List<MicrosoftBuilding> fetchMicrosoftQuadkey(String quadkey,
             double minLat, double minLon, double maxLat, double maxLon) {
 
         // Re-check: another thread may have finished while we waited.
         final String rKey = regionCacheKey(quadkey, minLat, minLon);
-        List<OvertureBuilding> cached = msftQuadkeyCache.get(rKey);
+        List<MicrosoftBuilding> cached = msftQuadkeyCache.get(rKey);
         if (cached != null)
             return filterByBbox(cached, minLat, minLon, maxLat, maxLon);
 
@@ -970,7 +970,7 @@ public class OvertureIndex {
             Path regionFile = microsoftRegionFile(quadkey, minLat, minLon);
             if (Files.exists(regionFile)) {
                 try {
-                    List<OvertureBuilding> buildings = parseMicrosoftFile(
+                    List<MicrosoftBuilding> buildings = parseMicrosoftFile(
                             regionFile, minLat, maxLat, minLon, maxLon);
                     msftQuadkeyCache.put(rKey, buildings);
                     LOGGER.info("MSFT region cache {}: {} buildings", quadkey, buildings.size());
@@ -985,17 +985,36 @@ public class OvertureIndex {
                     long age = System.currentTimeMillis() -
                             Files.getLastModifiedTime(qkFile).toMillis();
                     if (age < DISK_TTL_MS) {
-                        // Parse ONLY this region's window out of the cached
-                        // file; the file itself stays whole on disk.
-                        List<OvertureBuilding> buildings =
+                        // RUN-3 FIX: neighbouring regions each rescanned the
+                        // whole 628k-line file within seconds (5 rescans in
+                        // 6 s observed). Scan ONCE with a widened window
+                        // (~5x5 regions) and pre-populate every region key
+                        // the scan covers, so the burst hits memory.
+                        double wide = MSFT_REGION_DEG * 2.5;
+                        double wMinLat = minLat - wide, wMaxLat = maxLat + wide;
+                        double wMinLon = minLon - wide, wMaxLon = maxLon + wide;
+                        List<MicrosoftBuilding> wideList =
                                 parseMicrosoftFile(qkFile,
-                                        minLat, maxLat, minLon, maxLon,
+                                        wMinLat, wMaxLat, wMinLon, wMaxLon,
                                         regionFile);
+                        int seeded = 0;
+                        for (double la = wMinLat; la < wMaxLat; la += MSFT_REGION_DEG) {
+                            for (double lo = wMinLon; lo < wMaxLon; lo += MSFT_REGION_DEG) {
+                                String k = regionCacheKey(quadkey, la, lo);
+                                double rLat0 = Math.floor(la / MSFT_REGION_DEG) * MSFT_REGION_DEG;
+                                double rLon0 = Math.floor(lo / MSFT_REGION_DEG) * MSFT_REGION_DEG;
+                                List<MicrosoftBuilding> sub = filterByBbox(wideList,
+                                        rLat0, rLon0,
+                                        rLat0 + MSFT_REGION_DEG, rLon0 + MSFT_REGION_DEG);
+                                if (msftQuadkeyCache.putIfAbsent(k, sub) == null) seeded++;
+                            }
+                        }
+                        List<MicrosoftBuilding> buildings = filterByBbox(wideList,
+                                minLat, minLon, maxLat, maxLon);
                         msftQuadkeyCache.put(rKey, buildings);
-                        LOGGER.info("MSFT quadkey {} from disk: {} buildings",
-                                quadkey, buildings.size());
-                        return filterByBbox(buildings, minLat, minLon,
-                                maxLat, maxLon);
+                        LOGGER.info("MSFT quadkey {} from disk: {} in window, {} region keys pre-seeded (one scan serves the burst)",
+                                quadkey, buildings.size(), seeded);
+                        return buildings;
                     }
                 } catch (Exception e) {
                     LOGGER.debug("MSFT disk cache read failed: {}",
@@ -1045,7 +1064,7 @@ public class OvertureIndex {
             final double loLat = minLat - pad, hiLat = maxLat + pad;
             final double loLon = minLon - pad, hiLon = maxLon + pad;
 
-            List<OvertureBuilding> buildings = new ArrayList<>();
+            List<MicrosoftBuilding> buildings = new ArrayList<>();
             StringBuilder diskContent = new StringBuilder(1024 * 1024);
             // Persist a compact local 0.01-degree region sidecar while the
             // full quadkey is already being streamed for the first time.
@@ -1069,7 +1088,7 @@ public class OvertureIndex {
                     continue;
                 parsedCount++;
                 try {
-                    OvertureBuilding b = parseMicrosoftLine(line);
+                    MicrosoftBuilding b = parseMicrosoftLine(line);
                     if (b != null) buildings.add(b);
                 } catch (Exception e) {
                     if (lineCount <= 3)
@@ -1103,7 +1122,7 @@ public class OvertureIndex {
                     quadkey, e.getMessage());
             return null;
         } finally {
-            if (conn != null) conn.disconnect();
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
         }
     }
 
@@ -1128,12 +1147,12 @@ public class OvertureIndex {
     // MICROSOFT GEOJSON-LINES PARSING
     // ================================================================
 
-    private OvertureBuilding parseMicrosoftLine(String line) {
+    private MicrosoftBuilding parseMicrosoftLine(String line) {
         return parseMicrosoftFeature(
                 JsonParser.parseString(line).getAsJsonObject());
     }
 
-    private OvertureBuilding parseMicrosoftFeature(JsonObject feature) {
+    private MicrosoftBuilding parseMicrosoftFeature(JsonObject feature) {
         if (!feature.has("geometry")) return null;
         JsonObject geometry = feature.getAsJsonObject("geometry");
         if (!"Polygon".equals(getStr(geometry, "type"))) return null;
@@ -1156,14 +1175,14 @@ public class OvertureIndex {
         double height     = getDouble(props, "height", 0);
         double confidence = getDouble(props, "confidence", 0.85);
 
-        return new OvertureBuilding(
+        return new MicrosoftBuilding(
                 coords.toArray(new double[0][]),
                 height, 0, null, "yes",
                 null, null, null,
                 confidence, null, "Microsoft", null, 0);
     }
 
-    private List<OvertureBuilding> parseMicrosoftFile(Path file)
+    private List<MicrosoftBuilding> parseMicrosoftFile(Path file)
             throws IOException {
         return parseMicrosoftFile(file,
                 -90.0, 90.0, -180.0, 180.0);
@@ -1197,7 +1216,7 @@ public class OvertureIndex {
      * The pad is deliberately generous: the test uses the FIRST vertex, not
      * the centroid, so a building straddling the window edge must not be lost.
      */
-    private List<OvertureBuilding> parseMicrosoftFile(Path file,
+    private List<MicrosoftBuilding> parseMicrosoftFile(Path file,
             double minLat, double maxLat, double minLon, double maxLon)
             throws IOException {
         return parseMicrosoftFile(file, minLat, maxLat, minLon, maxLon, null);
@@ -1209,7 +1228,7 @@ public class OvertureIndex {
      * following warm start then reads that small sidecar rather than rescanning
      * the complete Microsoft file.
      */
-    private List<OvertureBuilding> parseMicrosoftFile(Path file,
+    private List<MicrosoftBuilding> parseMicrosoftFile(Path file,
             double minLat, double maxLat, double minLon, double maxLon,
             Path regionSidecar)
             throws IOException {
@@ -1219,7 +1238,7 @@ public class OvertureIndex {
         final boolean windowed =
                 !(minLat <= -90.0 && maxLat >= 90.0);
 
-        List<OvertureBuilding> buildings = new ArrayList<>();
+        List<MicrosoftBuilding> buildings = new ArrayList<>();
         StringBuilder regionLines = regionSidecar == null ? null : new StringBuilder(64 * 1024);
         double regionLat = Math.floor(minLat / MSFT_REGION_DEG) * MSFT_REGION_DEG;
         double regionLon = Math.floor(minLon / MSFT_REGION_DEG) * MSFT_REGION_DEG;
@@ -1239,7 +1258,7 @@ public class OvertureIndex {
                     continue;
                 parsed++;
                 try {
-                    OvertureBuilding b = parseMicrosoftLine(line.trim());
+                    MicrosoftBuilding b = parseMicrosoftLine(line.trim());
                     if (b != null) buildings.add(b);
                 } catch (Exception ignored) {}
             }
@@ -1302,12 +1321,12 @@ public class OvertureIndex {
     // POLYGON HELPER
     // ================================================================
 
-    private static List<OvertureBuilding> filterByBbox(
-            List<OvertureBuilding> buildings,
+    private static List<MicrosoftBuilding> filterByBbox(
+            List<MicrosoftBuilding> buildings,
             double minLat, double minLon,
             double maxLat, double maxLon) {
-        List<OvertureBuilding> result = new ArrayList<>();
-        for (OvertureBuilding b : buildings) {
+        List<MicrosoftBuilding> result = new ArrayList<>();
+        for (MicrosoftBuilding b : buildings) {
             if (b.maxLat >= minLat && b.minLat <= maxLat
                     && b.maxLon >= minLon && b.minLon <= maxLon)
                 result.add(b);
@@ -1327,7 +1346,7 @@ public class OvertureIndex {
               .append(tile.source.displayName)
               .append("\",\"features\":[");
             boolean first = true;
-            for (OvertureBuilding b : tile.buildings) {
+            for (MicrosoftBuilding b : tile.buildings) {
                 if (!first) sb.append(",");
                 first = false;
                 sb.append("{\"type\":\"Feature\","
@@ -1384,10 +1403,10 @@ public class OvertureIndex {
             if (age > DISK_TTL_MS) { Files.deleteIfExists(file); return null; }
 
             String json = Files.readString(file, StandardCharsets.UTF_8);
-            List<OvertureBuilding> buildings =
+            List<MicrosoftBuilding> buildings =
                     parseGeoJsonFeatureCollection(json);
             return new BuildingTile(
-                    buildings.toArray(new OvertureBuilding[0]),
+                    buildings.toArray(new MicrosoftBuilding[0]),
                     true, DataSource.DISK_CACHE);
         } catch (Exception e) {
             LOGGER.debug("Disk load failed: {}", e.getMessage());
@@ -1395,8 +1414,8 @@ public class OvertureIndex {
         return null;
     }
 
-    private List<OvertureBuilding> parseGeoJsonFeatureCollection(String json) {
-        List<OvertureBuilding> buildings = new ArrayList<>();
+    private List<MicrosoftBuilding> parseGeoJsonFeatureCollection(String json) {
+        List<MicrosoftBuilding> buildings = new ArrayList<>();
         try {
             JsonObject root = JsonParser.parseString(json).getAsJsonObject();
             JsonArray features = root.getAsJsonArray("features");
@@ -1441,7 +1460,7 @@ public class OvertureIndex {
                     String roofShape     = getStr(props, "roof:shape");
                     String wallMaterial  = getStr(props, "building:material");
 
-                    buildings.add(new OvertureBuilding(
+                    buildings.add(new MicrosoftBuilding(
                             coords.toArray(new double[0][]),
                             height, floors, buildingClass, subtype,
                             roofShape, null, wallMaterial,
@@ -1523,7 +1542,7 @@ public class OvertureIndex {
             dlPool.shutdownNow();
             Thread.currentThread().interrupt();
         }
-        LOGGER.info("OvertureIndex shutdown — FINAL STATS:");
+        LOGGER.info("MicrosoftIndex shutdown — FINAL STATS:");
         LOGGER.info("  Queries: {} | Buildings: {}",
                 totalQueries.get(), totalBuildings.get());
         LOGGER.info("  Hits — MSFT: {} | Disk: {} | Empty: {}",

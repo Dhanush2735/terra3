@@ -50,6 +50,20 @@ mixin {
     add sourceSets.main, "cubicworldgen.refmap.json"
     config "cubicchunks.mixins.json"
     config "cubicworldgen.mixins.json"
+    // LOADING-SCREEN FIX (run 16): MixinSpawnPrep was written two
+    // sessions ago but this config was never registered — the
+    // mixin silently never applied (27s spawn prep unchanged).
+    //
+    // CRASH FIX (run 17): do NOT `add` a third refmap here! The
+    // mixin plugin keeps ONE refmap per source set — the last
+    // `add` wins. Adding terraplusplus.refmap.json stole the slot
+    // from cubicworldgen.refmap.json, so the rebuild stopped
+    // generating it and CubicWorldGen's buildSurface injection
+    // crashed the boot ("No refMap loaded"). terraplusplus.mixins
+    // instead SHARES cubicworldgen.refmap.json via its own
+    // "refmap" key; MixinSpawnPrep also lists SRG names directly
+    // and is require=0, so it needs no remapping at all.
+    config "terraplusplus.mixins.json"
 }
 
 repositories {
@@ -187,7 +201,7 @@ tasks.named('jar', Jar).configure {
             "Implementation-Title"    : project.name,
             "Implementation-Version"  : project.jar.archiveVersion,
             "Implementation-Vendor"   : "BuildTheEarth",
-            "MixinConfigs"            : "cubicchunks.mixins.json,cubicworldgen.mixins.json"
+            "MixinConfigs"            : "cubicchunks.mixins.json,cubicworldgen.mixins.json,terraplusplus.mixins.json"
         ])
     }
 }

@@ -80,7 +80,7 @@ public class TerraCreateWorldScreen extends Screen {
                 v -> config = config.withCleanupArtifacts(v));
         addToggle(col2, startY + SPACING * row++, "Microsoft Buildings",
                 config.overtureBuildings,
-                v -> config = config.withOvertureBuildings(v));
+                v -> config = config.withMicrosoftBuildings(v));
 
         // Building detail — col1 row 6
         row = 6;

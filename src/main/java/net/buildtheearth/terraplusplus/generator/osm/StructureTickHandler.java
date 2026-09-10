@@ -228,6 +228,13 @@ public class StructureTickHandler {
         ServerLevel level = getOverworld();
         if (level == null) return;
 
+        // Complete /tpll teleports whose destination chunks finished
+        // generating on worker threads (async-teleport fix, run 3).
+        try {
+            net.buildtheearth.terraplusplus.commands.TpllCommand
+                .tickPendingTeleports(level.getServer());
+        } catch (Exception ignored) {}
+
         // ── ALWAYS DRAIN LOADED-CHUNK REFRESH QUEUE ───────────
         // This MUST run before the placement queue null
         // check. If it runs after, loaded chunks never
@@ -522,57 +529,28 @@ public class StructureTickHandler {
             ServerLevel level, LevelChunk chunk) {
         try {
             chunk.setUnsaved(true);
-            int cmx = chunk.getPos().getMinBlockX();
-            int cmz = chunk.getPos().getMinBlockZ();
-            BlockPos.MutableBlockPos pos =
-                new BlockPos.MutableBlockPos();
 
-            int globalMinY = level.getMaxBuildHeight();
-            int globalMaxY = level.getMinBuildHeight();
-
-            for (int lx = 0; lx < 16; lx++) {
-                for (int lz = 0; lz < 16; lz++) {
-                    int sy;
-                    try {
-                        sy = chunk.getHeight(
-                            Heightmap.Types
-                                .WORLD_SURFACE,
-                            lx, lz);
-                    } catch (Exception e) {
-                        continue;
-                    }
-                    if (sy - 2 < globalMinY)
-                        globalMinY = sy - 2;
-                    if (sy + 60 > globalMaxY)
-                        globalMaxY = sy + 60;
-                }
-            }
-
-            globalMinY = Math.max(globalMinY,
-                level.getMinBuildHeight());
-            globalMaxY = Math.min(globalMaxY,
-                level.getMaxBuildHeight() - 1);
-
-            for (int lx = 0; lx < 16; lx++) {
-                for (int lz = 0; lz < 16; lz++) {
-                    int bx = cmx + lx;
-                    int bz = cmz + lz;
-                    for (int y = globalMinY;
-                            y <= globalMaxY; y++) {
-                        pos.set(bx, y, bz);
-                        BlockState st =
-                            chunk.getBlockState(pos);
-                        if (st.isAir()) continue;
-                        level.sendBlockUpdated(
-                            pos, st, st, 3);
-                    }
-                }
-            }
-
-            for (var be : chunk.getBlockEntities()
-                    .values()) {
-                level.blockEntityChanged(
-                    be.getBlockPos());
+            // ONE packet for the whole chunk (audit FINDING 3).
+            //
+            // The old loop here scanned 16x16x(surface span) and called
+            // level.sendBlockUpdated() once per non-air block — up to
+            // ~15,000 packets per chunk, each with server-side lighting
+            // and neighbour-shape work, on the main thread. The identical
+            // bug was already fixed in TerraChunkGenerator; this was the
+            // second, forgotten copy.
+            //
+            // ClientboundLevelChunkWithLightPacket resends the entire
+            // chunk (sections, block entities, light) in a single packet.
+            var pkt = new net.minecraft.network.protocol.game
+                .ClientboundLevelChunkWithLightPacket(
+                    chunk, level.getLightEngine(), null, null);
+            int cx = chunk.getPos().x, cz = chunk.getPos().z;
+            int vd = level.getServer().getPlayerList()
+                .getViewDistance() + 1;
+            for (ServerPlayer p : level.players()) {
+                if (Math.abs((p.blockPosition().getX() >> 4) - cx) <= vd
+                        && Math.abs((p.blockPosition().getZ() >> 4) - cz) <= vd)
+                    p.connection.send(pkt);
             }
         } catch (Exception e) {
             LOGGER.debug(
@@ -1112,23 +1090,31 @@ public class StructureTickHandler {
             TerraWorldConfig cfg) {
         return switch (type) {
             case BUILDING,
-                 BUILDING_PART -> cfg.buildings;
+                 BUILDING_PART,
+                 TOWER        -> cfg.buildings;
             case ROAD,
                  FOOTWAY,
                  CYCLEWAY     -> cfg.roads;
-            case RAILWAY      -> cfg.railways;
-            case BRIDGE       -> cfg.bridges;
+            case RAILWAY,
+                 PLATFORM     -> cfg.railways;
+            case BRIDGE,
+                 PIER         -> cfg.bridges;
             case WALL,
                  FENCE,
                  BARRIER      -> cfg.walls;
             case GARDEN,
                  PARK,
-                 HEDGE        -> cfg.gardens;
+                 HEDGE,
+                 POOL         -> cfg.gardens;
             case FARMLAND,
                  FOREST,
                  MEADOW,
-                 PARKING      -> cfg.landuse;
-            case STREET_LAMP  -> cfg.streetLights;
+                 PARKING,
+                 SAND, ROCK,
+                 TREE_ROW, TREE,
+                 RUNWAY, APRON -> cfg.landuse;
+            case STREET_LAMP,
+                 PYLON        -> cfg.streetLights;
         };
     }
 
