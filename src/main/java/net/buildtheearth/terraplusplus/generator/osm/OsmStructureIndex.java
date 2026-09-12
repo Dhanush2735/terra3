@@ -999,6 +999,7 @@ public class OsmStructureIndex {
                 result.add(s);
             }
         }
+        dropCoveredCarriageways(result);
         return result;
     }
 
@@ -2057,6 +2058,86 @@ public class OsmStructureIndex {
         return Math.abs(a.lat - b.lat) < 1e-9 && Math.abs(a.lon - b.lon) < 1e-9;
     }
 
+    /**
+     * Long-axis centerline of a closed man_made=bridge ring.
+     * metrics[0] = length metres, metrics[1] = width metres.
+     */
+    static OsmNode[] centerlineFromRing(
+            OsmNode[] ring, double[] metrics) {
+        int n = ring.length;
+        if (n >= 2 && sameNode(ring[0], ring[n - 1])) n--;
+        if (n < 3) return null;
+        double clat = 0, clon = 0;
+        for (int i = 0; i < n; i++) {
+            clat += ring[i].lat;
+            clon += ring[i].lon;
+        }
+        clat /= n;
+        clon /= n;
+        double cos = Math.cos(Math.toRadians(clat));
+        double m = 111320.0;
+        double xx = 0, xz = 0, zz = 0;
+        double[] dx = new double[n];
+        double[] dz = new double[n];
+        for (int i = 0; i < n; i++) {
+            dx[i] = (ring[i].lon - clon) * m * cos;
+            dz[i] = (ring[i].lat - clat) * m;
+            xx += dx[i] * dx[i];
+            xz += dx[i] * dz[i];
+            zz += dz[i] * dz[i];
+        }
+        xx /= n; xz /= n; zz /= n;
+        double disc = Math.sqrt(
+            (xx - zz) * (xx - zz) + 4 * xz * xz);
+        double l1 = (xx + zz + disc) / 2;
+        double vx = xz, vz = l1 - xx;
+        if (Math.hypot(vx, vz) < 1e-9) {
+            vx = l1 - zz;
+            vz = xz;
+        }
+        double vlen = Math.hypot(vx, vz);
+        if (vlen < 1e-9) return null;
+        vx /= vlen;
+        vz /= vlen;
+        double tMin = Double.POSITIVE_INFINITY;
+        double tMax = Double.NEGATIVE_INFINITY;
+        double wMax = 0;
+        for (int i = 0; i < n; i++) {
+            double t = dx[i] * vx + dz[i] * vz;
+            if (t < tMin) tMin = t;
+            if (t > tMax) tMax = t;
+            double w = Math.abs(-vz * dx[i] + vx * dz[i]);
+            if (w > wMax) wMax = w;
+        }
+        double length = tMax - tMin;
+        if (length < 8) return null;
+        if (metrics != null && metrics.length >= 2) {
+            metrics[0] = length;
+            metrics[1] = Math.max(8, wMax * 2);
+        }
+        OsmNode start = new OsmNode(
+            clat + (tMin * vz) / m,
+            clon + (tMin * vx) / (m * cos));
+        OsmNode end = new OsmNode(
+            clat + (tMax * vz) / m,
+            clon + (tMax * vx) / (m * cos));
+        return new OsmNode[] { start, end };
+    }
+
+    private static final Set<Long> droppedCarriagewayLog =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Highway bridge=yes ways that sit inside a man_made=bridge
+     * (761604461 vs 852586032/035) are the same physical span.
+     * The outline owns placement.
+     */
+    private static void dropCoveredCarriageways(
+            List<OsmStructure> structures) {
+        // Keep both highway carriageways (852586032 / 035).
+        // man_made=bridge is towers/cables, not a third road.
+    }
+
     private static OsmStructure copyWithNodes(OsmStructure b, OsmNode[] nodes, long osmId) {
         OsmStructure copy = new OsmStructure(b.type, b.subType, b.name, nodes, b.isArea, osmId,
                 b.material, b.levels, b.height, b.roofShape, b.roofMaterial,
@@ -2103,13 +2184,16 @@ public class OsmStructureIndex {
      *  the carriageway ways inside carry only bridge=yes+layer.
      *  Never rendered; donates identity to contained bridges. */
     private static final class BridgeOutline {
+        final long osmId;
         final OsmNode[] ring;
         final double minLat, maxLat, minLon, maxLon;
         final String name;
         final BridgeStructure structure;
         final int startYear;
         BridgeOutline(OsmNode[] ring, String name,
-                BridgeStructure structure, int startYear) {
+                BridgeStructure structure, int startYear,
+                long osmId) {
+            this.osmId = osmId;
             this.ring = ring;
             this.name = name;
             this.structure = structure;
@@ -2174,12 +2258,15 @@ public class OsmStructureIndex {
         String structTag = getTag(tags, "bridge:structure");
         if (structTag != null)
             bs = BridgeStructure.fromStructureTag(structTag);
+        long id = obj.has("id")
+            ? obj.get("id").getAsLong() : 0;
         return new BridgeOutline(
             ring.toArray(new OsmNode[0]),
             getTag(tags, "name"),
             bs,
             HistoricalDateParser.parse(
-                getTag(tags, "start_date")));
+                getTag(tags, "start_date")),
+            id);
     }
 
     /** Contained bridge ways inherit name/structure/date from a
@@ -2231,6 +2318,12 @@ public class OsmStructureIndex {
                 copy.explicitWidth = s.explicitWidth;
                 structures.set(i, copy);
                 enriched++;
+                if (newBs != null
+                        && newBs != BridgeStructure.BEAM)
+                    LOGGER.info("BRIDGE OUTLINE ENRICH: way {} "
+                        + "inherited {} from outline {} ({})",
+                        s.osmId, newBs, o.osmId,
+                        o.name != null ? o.name : "?");
                 break;
             }
         }
@@ -2610,6 +2703,19 @@ public class OsmStructureIndex {
                 getTag(tags, "man_made");
             if (manMade != null) {
                 switch (manMade) {
+                    case "bridge" -> {
+                        // Durgam Cheruvu 761604461: man_made=bridge
+                        // + bridge:structure, no highway / bridge=yes.
+                        // Was outline-only (never placed). Now a real
+                        // BRIDGE; closed rings collapse to a centerline
+                        // after geometry is read.
+                        type = StructureType.BRIDGE;
+                        subType = "bridge";
+                        isArea = true;
+                        bridgeStructure = resolveBridgeType(
+                            bridgeTagValue,
+                            bridgeStructureTag);
+                    }
                     case "pier", "breakwater",
                          "groyne", "embankment",
                          "dyke" -> {
@@ -2788,6 +2894,40 @@ public class OsmStructureIndex {
         }
 
         if (nodeList.isEmpty()) return null;
+
+        // Closed man_made=bridge areas (761604461) are a deck
+        // footprint, not a loop to walk. Collapse to the long-axis
+        // centerline so length + heading come from the way nodes.
+        double areaWidth = 0;
+        if (type == StructureType.BRIDGE
+                && nodeList.size() >= 4) {
+            OsmNode first = nodeList.get(0);
+            OsmNode last = nodeList.get(
+                nodeList.size() - 1);
+            if (sameNode(first, last)) {
+                double[] metrics = new double[2];
+                OsmNode[] cl = centerlineFromRing(
+                    nodeList.toArray(new OsmNode[0]),
+                    metrics);
+                if (cl != null && cl.length >= 2) {
+                    LOGGER.info("BRIDGE AREA: {} '{}' "
+                        + "ring {} verts -> {}m x {}m "
+                        + "centerline structure={}",
+                        osmId,
+                        getTag(tags, "name") != null
+                            ? getTag(tags, "name") : "?",
+                        nodeList.size(),
+                        (int) Math.round(metrics[0]),
+                        (int) Math.round(metrics[1]),
+                        bridgeStructure);
+                    nodeList = new ArrayList<>(
+                        java.util.Arrays.asList(cl));
+                    isArea = false;
+                    areaWidth = metrics[1];
+                }
+            }
+        }
+
         // Point features are valid with a single node.
         boolean pointFeature =
             type == StructureType.STREET_LAMP
@@ -2893,6 +3033,8 @@ public class OsmStructureIndex {
             parsed.explicitWidth = Double.parseDouble(
                 widthStr.replaceAll("[^0-9.]", ""));
         } catch (NumberFormatException ignored) {}
+        if (parsed.explicitWidth <= 0 && areaWidth > 0)
+            parsed.explicitWidth = areaWidth;
         return parsed;
     }
 

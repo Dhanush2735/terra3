@@ -89,6 +89,320 @@ public class BridgeGeometryTest {
         BOARDWALK, COVERED, FLOATING, SIMPLE_SUSPENSION, MOVABLE
     }
 
+    /**
+     * Writes one world column. OsmStructureGenerator supplies an
+     * implementation that goes through setOwned so historical
+     * refresh still tracks the blocks.
+     */
+    public interface BlockWriter {
+        void set(int x, int y, int z, BlockState state);
+        int minY();
+        int maxY();
+    }
+
+    /** OSM bridge:structure / outline tag → demo type. */
+    public static BridgeType fromOsm(
+            OsmStructureIndex.BridgeStructure bs) {
+        if (bs == null) return null;
+        return switch (bs) {
+            case SUSPENSION        -> BridgeType.SUSPENSION;
+            case CABLE_STAYED      -> BridgeType.CABLE_STAYED;
+            case ARCH              -> BridgeType.ARCH;
+            case BEAM              -> BridgeType.BEAM;
+            case TRUSS             -> BridgeType.TRUSS;
+            case VIADUCT           -> BridgeType.VIADUCT;
+            case TRESTLE           -> BridgeType.TRESTLE;
+            case CANTILEVER        -> BridgeType.CANTILEVER;
+            case HUMPBACK          -> BridgeType.HUMPBACK;
+            case CLAPPER           -> BridgeType.CLAPPER;
+            case BOARDWALK         -> BridgeType.BOARDWALK;
+            case COVERED           -> BridgeType.COVERED;
+            case FLOATING          -> BridgeType.FLOATING;
+            case SIMPLE_SUSPENSION -> BridgeType.SIMPLE_SUSPENSION;
+            case MOVABLE           -> BridgeType.MOVABLE;
+            default                -> null;
+        };
+    }
+
+    /**
+     * One column of demo geometry on a real OSM way.
+     *
+     * Length = polyline length of {@code nodes}.
+     * Orientation = heading of the closest node-to-node segment
+     * (left/right = signed cross-track). Never the spawn canal's
+     * 100-block Z axis.
+     *
+     * Returns false if this type has no OSM placer yet.
+     */
+    public static boolean placeOsmWayColumn(
+            BlockWriter w,
+            BridgeType type,
+            int bx, int bz,
+            int footingY,
+            int surfaceY,
+            int deckY,
+            OsmStructureIndex.OsmNode[] nodes,
+            double lat, double lon,
+            double hw,
+            boolean superstructure) {
+        return placeOsmWayColumn(w, type, bx, bz, footingY,
+                surfaceY, deckY, nodes, lat, lon, hw,
+                superstructure, true, null);
+    }
+
+    public static boolean placeOsmWayColumn(
+            BlockWriter w,
+            BridgeType type,
+            int bx, int bz,
+            int footingY,
+            int surfaceY,
+            int deckY,
+            OsmStructureIndex.OsmNode[] nodes,
+            double lat, double lon,
+            double hw,
+            boolean superstructure,
+            boolean placeDeck) {
+        return placeOsmWayColumn(w, type, bx, bz, footingY,
+                surfaceY, deckY, nodes, lat, lon, hw,
+                superstructure, placeDeck, null);
+    }
+
+    /**
+     * @param atCarriagewayEdge null = use outline pylon offset;
+     *        true = this column is a highway parapet (place
+     *        pylons/cables here); false = skip pylons/cables.
+     */
+    public static boolean placeOsmWayColumn(
+            BlockWriter w,
+            BridgeType type,
+            int bx, int bz,
+            int footingY,
+            int surfaceY,
+            int deckY,
+            OsmStructureIndex.OsmNode[] nodes,
+            double lat, double lon,
+            double hw,
+            boolean superstructure,
+            boolean placeDeck,
+            Boolean atCarriagewayEdge) {
+        if (w == null || type == null || nodes == null
+                || nodes.length < 2) return false;
+        WayFrame f = projectOnWay(nodes, lat, lon);
+        if (f == null || f.totalLen < 4.0) return false;
+        if (hw < 1.0) hw = 1.5;
+        switch (type) {
+            case SUSPENSION -> {
+                placeOsmSuspension(w, bx, bz, footingY, surfaceY,
+                        deckY, f.signedDist, hw, f.along, f.totalLen,
+                        superstructure, placeDeck, atCarriagewayEdge);
+                return true;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    /** along-track (m from first node) + signed cross-track (m). */
+    private static final class WayFrame {
+        final double along, signedDist, totalLen;
+        WayFrame(double along, double signedDist, double totalLen) {
+            this.along = along;
+            this.signedDist = signedDist;
+            this.totalLen = totalLen;
+        }
+    }
+
+    /**
+     * Project a geographic point onto the way node chain.
+     * Closest segment wins: t in [0,1] along that segment,
+     * signedDist is left/right of that segment's heading.
+     */
+    static WayFrame projectOnWay(
+            OsmStructureIndex.OsmNode[] nodes,
+            double lat, double lon) {
+        double total = 0;
+        double bestD2 = Double.MAX_VALUE;
+        double bestAlong = 0;
+        double bestSigned = 0;
+        double acc = 0;
+        for (int i = 0; i < nodes.length - 1; i++) {
+            OsmStructureIndex.OsmNode a = nodes[i];
+            OsmStructureIndex.OsmNode b = nodes[i + 1];
+            double meanLat = (a.lat + b.lat) * 0.5;
+            double cos = Math.cos(Math.toRadians(meanLat));
+            double m = 111320.0;
+            double vx = (b.lon - a.lon) * m * cos;
+            double vz = (b.lat - a.lat) * m;
+            double px = (lon - a.lon) * m * cos;
+            double pz = (lat - a.lat) * m;
+            double seg2 = vx * vx + vz * vz;
+            double seg = Math.sqrt(seg2);
+            double t = 0;
+            if (seg2 > 1e-12)
+                t = Math.max(0, Math.min(1,
+                        (px * vx + pz * vz) / seg2));
+            double dx = px - t * vx;
+            double dz = pz - t * vz;
+            double d2 = dx * dx + dz * dz;
+            double signed = seg > 1e-9
+                    ? (vx * pz - vz * px) / seg : 0;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                bestAlong = acc + t * seg;
+                bestSigned = signed;
+            }
+            acc += seg;
+        }
+        total = acc;
+        if (total <= 0) return null;
+        return new WayFrame(bestAlong, bestSigned, total);
+    }
+
+    /**
+     * Parametric copy of {@link #buildSuspensionBridge}: iron
+     * deck, pylons at 20%/80%, catenary + backstays, suspenders.
+     * along / signedDist are metres along and across the OSM way.
+     */
+    private static void placeOsmSuspension(
+            BlockWriter w,
+            int bx, int bz,
+            int footingY, int surfaceY, int deckY,
+            double signedDist, double hw,
+            double along, double totalLen,
+            boolean superstructure,
+            boolean placeDeck,
+            Boolean atCarriagewayEdge) {
+
+        int minY = w.minY();
+        int maxY = w.maxY() - 1;
+        if (deckY < minY || deckY > maxY) return;
+
+        double absD = Math.abs(signedDist);
+        boolean onDeck = placeDeck && absD <= hw + 0.05;
+        boolean atEdge = Math.abs(absD - hw) < 1.6;
+        boolean nearInner = Math.abs(absD
+                - Math.max(0.5, hw - 1.0)) < 0.6;
+        boolean center = absD < 0.45;
+        boolean whiteLine = hw > 2.4
+                && Math.abs(absD - (hw - 2.0)) < 0.55;
+        // man_made=bridge outlines are fatter than the driving
+        // deck (Durgam Cheruvu 761604461: 37 m outline vs 25.8 m
+        // real deck). Pylon legs + cables sit on the deck edge,
+        // not the outline edge — otherwise the south pillar
+        // stands in the water beside the roadway.
+        double pylonHw = hw > 14.0
+                ? Math.min(hw * 0.70, 13.0)
+                : hw;
+        boolean atPylon = atCarriagewayEdge != null
+                ? atCarriagewayEdge
+                : Math.abs(absD - pylonHw) < 1.6;
+        boolean outsideAnchor = Math.abs(absD
+                - (pylonHw + 1.0)) < 0.8;
+
+        int towerH = (int) Math.max(16,
+                Math.min(28, totalLen / 15.0 + 10));
+        int towerTopY = deckY + towerH;
+        if (towerTopY > maxY) {
+            towerH = Math.max(8, maxY - deckY - 2);
+            towerTopY = deckY + towerH;
+        }
+
+        double tower1 = totalLen * 0.20;
+        double tower2 = totalLen * 0.80;
+        double anchor1 = totalLen * 0.03;
+        double anchor2 = totalLen * 0.97;
+        double towerHalf = 3.0;
+
+        if (onDeck) {
+            if (deckY - 2 >= minY)
+                w.set(bx, deckY - 2, bz, IRON_BLOCK);
+            if (deckY - 1 >= minY)
+                w.set(bx, deckY - 1, bz, GRAY_CONCRETE);
+            if (atEdge) {
+                w.set(bx, deckY, bz, GRAY_CONCRETE);
+                if (deckY + 1 <= maxY)
+                    w.set(bx, deckY + 1, bz, IRON_BARS);
+            } else if (nearInner) {
+                w.set(bx, deckY, bz, SMOOTH_STONE);
+            } else {
+                w.set(bx, deckY, bz, BLACK_CONCRETE);
+            }
+            if (center && ((int) along) % 4 < 2)
+                w.set(bx, deckY, bz, YELLOW_CONCRETE);
+            if (whiteLine)
+                w.set(bx, deckY, bz, WHITE_CONCRETE);
+        }
+
+        if (!superstructure) return;
+
+        boolean atTower = Math.abs(along - tower1) <= towerHalf
+                || Math.abs(along - tower2) <= towerHalf;
+        boolean towerCenter = Math.abs(along - tower1) < 1.0
+                || Math.abs(along - tower2) < 1.0;
+
+        if (atTower && atPylon) {
+            int bot = Math.max(minY, footingY);
+            for (int y = bot; y <= towerTopY && y <= maxY; y++)
+                w.set(bx, y, bz, IRON_BLOCK);
+            if (towerTopY + 1 <= maxY)
+                w.set(bx, towerTopY + 1, bz, IRON_BLOCK);
+            if (towerTopY + 2 <= maxY)
+                w.set(bx, towerTopY + 2, bz, SEA_LANTERN);
+        }
+        if (towerCenter && onDeck) {
+            if (towerTopY <= maxY)
+                w.set(bx, towerTopY, bz, IRON_BLOCK);
+            if (towerTopY - 5 > deckY && towerTopY - 5 <= maxY)
+                w.set(bx, towerTopY - 5, bz, IRON_BLOCK);
+            if (towerTopY - 10 > deckY && towerTopY - 10 <= maxY)
+                w.set(bx, towerTopY - 10, bz, IRON_BLOCK);
+        }
+
+        boolean atAnchor = Math.abs(along - anchor1) <= 2.5
+                || Math.abs(along - anchor2) <= 2.5;
+        if (atAnchor && outsideAnchor) {
+            int top = Math.min(maxY, surfaceY + 3);
+            for (int y = surfaceY; y <= top; y++)
+                w.set(bx, y, bz, STONE_BRICK);
+        }
+
+        if (!atPylon) return;
+
+        int cableY = -1;
+        if (along >= anchor1 && along <= tower1) {
+            double den = Math.max(1.0, tower1 - anchor1);
+            double frac = (along - anchor1) / den;
+            cableY = surfaceY + 3
+                    + (int) (frac * (towerTopY - surfaceY - 3));
+        } else if (along >= tower1 && along <= tower2) {
+            double span = Math.max(1.0, tower2 - tower1);
+            double mid  = (tower1 + tower2) / 2.0;
+            double t    = (along - mid) / (span / 2.0);
+            t = Math.max(-1.0, Math.min(1.0, t));
+            double sag  = towerH * 0.7;
+            cableY = towerTopY
+                    - (int) Math.round(sag * (1.0 - t * t));
+        } else if (along >= tower2 && along <= anchor2) {
+            double den = Math.max(1.0, anchor2 - tower2);
+            double frac = (along - tower2) / den;
+            cableY = towerTopY
+                    - (int) (frac * (towerTopY - surfaceY - 3));
+        }
+
+        if (cableY >= minY && cableY <= maxY)
+            w.set(bx, cableY, bz, CHAIN);
+
+        if (along > tower1 && along < tower2
+                && ((int) along) % 2 == 0
+                && cableY > deckY + 1) {
+            int from = deckY + 2;
+            int to = Math.min(cableY, maxY);
+            for (int y = from; y < to; y++)
+                w.set(bx, y, bz, CHAIN);
+        }
+    }
+
     // ================================================================
     // MAIN ENTRY
     // ================================================================
