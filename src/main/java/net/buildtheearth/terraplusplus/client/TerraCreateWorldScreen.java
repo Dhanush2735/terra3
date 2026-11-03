@@ -3,10 +3,12 @@
 // ============================================================
 package net.buildtheearth.terraplusplus.client;
 
+import net.buildtheearth.terraplusplus.config.TerraSpawnSettings;
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
@@ -19,6 +21,7 @@ public class TerraCreateWorldScreen extends Screen {
     private final Consumer<TerraWorldConfig> callback;
     private TerraWorldConfig config;
     private final TerraWorldConfig originalConfig;
+    private EditBox spawnBox;
 
     private static final int BUTTON_WIDTH  = 200;
     private static final int BUTTON_HEIGHT = 20;
@@ -111,10 +114,20 @@ public class TerraCreateWorldScreen extends Screen {
                         (btn, val) -> config =
                                 config.withRoadWidthScale(val)));
 
-        // Done / Cancel
+        // One paste box: "17.4346 78.5016" — default empty = 0 0
         int bottomY = this.height - 28;
+        int spawnY = bottomY - 36;
+        int spawnWidth = BUTTON_WIDTH * 2 + 8;
+        this.spawnBox = new EditBox(this.font, col1, spawnY, spawnWidth, BUTTON_HEIGHT,
+                Component.literal("Spawn lat lon"));
+        TerraWorldTypeHelper.bindSpawnBox(this.spawnBox);
+        this.spawnBox.setHint(Component.literal("lat lon   e.g. 17.4346 78.5016"));
+        this.addRenderableWidget(this.spawnBox);
+
+        // Done / Cancel
         this.addRenderableWidget(Button.builder(CommonComponents.GUI_DONE,
                 btn -> {
+                    commitSpawnBoxes();
                     // Commit via callback — this writes the file
                     callback.accept(config);
                     this.minecraft.setScreen(parent);
@@ -149,7 +162,21 @@ public class TerraCreateWorldScreen extends Screen {
                 Component.literal(
                         "Configure which real-world features to generate"),
                 this.width / 2, 20, 0xAAAAAA);
+        if (this.spawnBox != null) {
+            TerraWorldTypeHelper.applySpawnSyntaxColor(this.spawnBox);
+            boolean ok = TerraSpawnSettings.isSyntaxValid(this.spawnBox.getValue());
+            graphics.drawString(this.font,
+                    ok ? "Spawn lat lon (paste both, default 0 0)"
+                            : "Spawn lat lon  — invalid (need lat -90..90  lon -180..180)",
+                    this.spawnBox.getX(), this.spawnBox.getY() - 10,
+                    ok ? 0xA0A0A0 : TerraWorldTypeHelper.SPAWN_TEXT_BAD, false);
+        }
         super.render(graphics, mouseX, mouseY, partialTick);
+    }
+
+    private void commitSpawnBoxes() {
+        String raw = this.spawnBox == null ? "" : this.spawnBox.getValue();
+        TerraSpawnSettings.setFromLatLonString(raw);
     }
 
     @Override

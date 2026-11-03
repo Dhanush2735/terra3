@@ -6,8 +6,12 @@
 // ============================================================
 package net.buildtheearth.terraplusplus.client;
 
+import net.buildtheearth.terraplusplus.config.TerraSpawnSettings;
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.worldselection.CreateWorldScreen;
+import net.minecraft.network.chat.Component;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -314,6 +318,8 @@ public class TerraWorldTypeHelper {
                             187, 150, 20)
                     .build());
 
+            addSpawnCoordBoxes(event, createScreen);
+
             LOGGER.info(
                     "Terra++ customize button added");
         } catch (Exception e) {
@@ -321,5 +327,85 @@ public class TerraWorldTypeHelper {
                     "Could not add button: {}",
                     e.getMessage());
         }
+    }
+
+    private static void addSpawnCoordBoxes(
+            ScreenEvent.Init.Post event,
+            CreateWorldScreen createScreen) {
+        boolean alreadyAdded = event.getListenersList()
+                .stream()
+                .anyMatch(w -> w instanceof EditBox box
+                        && "Spawn lat lon".equals(
+                                box.getMessage().getString()));
+        if (alreadyAdded) {
+            return;
+        }
+
+        int x = createScreen.width / 2 - 205;
+        int y = 187;
+        int w = 200;
+        int h = 20;
+
+        EditBox box = new EditBox(
+                Minecraft.getInstance().font,
+                x, y, w, h,
+                Component.literal("Spawn lat lon"));
+        bindSpawnBox(box);
+        event.addListener(box);
+    }
+
+    /** Vanilla EditBox gray vs chat §c red. */
+    static final int SPAWN_TEXT_OK = 0xE0E0E0;
+    static final int SPAWN_TEXT_BAD = 0xFF5555;
+
+    static void applySpawnSyntaxColor(EditBox box) {
+        if (box == null) {
+            return;
+        }
+        boolean ok = TerraSpawnSettings.isSyntaxValid(box.getValue());
+        box.setTextColor(ok ? SPAWN_TEXT_OK : SPAWN_TEXT_BAD);
+        box.setTextColorUneditable(ok ? SPAWN_TEXT_OK : SPAWN_TEXT_BAD);
+    }
+
+    static void bindSpawnBox(EditBox box) {
+        box.setMaxLength(80);
+        // Do not filter keystrokes: invalid syntax must be visible so it can
+        // turn red (letters, extra tokens, lat/lon out of range).
+        box.setHint(Component.literal("lat lon  (0 0)"));
+        box.setResponder(s -> {
+            applySpawnSyntaxColor(box);
+            if (TerraSpawnSettings.isSyntaxValid(s)) {
+                TerraSpawnSettings.setFromLatLonString(s);
+            }
+        });
+        box.setValue(TerraSpawnSettings.formatLatLon());
+        applySpawnSyntaxColor(box);
+    }
+
+    @SubscribeEvent
+    public static void onScreenRender(ScreenEvent.Render.Post event) {
+        if (!(event.getScreen() instanceof CreateWorldScreen screen)) {
+            return;
+        }
+        boolean hasBox = event.getScreen().children().stream()
+                .anyMatch(w -> w instanceof EditBox box
+                        && "Spawn lat lon".equals(box.getMessage().getString()));
+        if (!hasBox) {
+            return;
+        }
+        int x = screen.width / 2 - 205;
+        boolean ok = true;
+        for (var child : event.getScreen().children()) {
+            if (child instanceof EditBox box
+                    && "Spawn lat lon".equals(box.getMessage().getString())) {
+                applySpawnSyntaxColor(box);
+                ok = TerraSpawnSettings.isSyntaxValid(box.getValue());
+                break;
+            }
+        }
+        event.getGuiGraphics().drawString(
+                Minecraft.getInstance().font,
+                ok ? "Spawn lat lon" : "Spawn lat lon  (invalid)",
+                x, 176, ok ? 0xA0A0A0 : SPAWN_TEXT_BAD, false);
     }
 }

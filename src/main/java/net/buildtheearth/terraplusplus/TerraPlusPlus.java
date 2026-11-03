@@ -16,10 +16,16 @@ import net.buildtheearth.terraplusplus.generator.osm.AsyncStructureManager;
 import net.buildtheearth.terraplusplus.generator.osm.StructureTickHandler;
 import net.buildtheearth.terraplusplus.projection.ProjectionRegistry;
 
+import net.buildtheearth.terraplusplus.config.TerraSpawnSettings;
+
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.level.LevelEvent;
+import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -96,6 +102,70 @@ public class TerraPlusPlus {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         TpllCommand.register(event.getDispatcher());
+    }
+
+    /**
+     * Create-world lat/lon (default 0,0) becomes the overworld spawn.
+     * Uses the same BTE projection as /tpll. Cancels vanilla biome hunt
+     * so spawn is not forced back to block 0,0.
+     */
+    private static volatile BlockPos pendingWorldSpawn;
+    private static volatile boolean applyPendingWorldSpawn;
+
+    @SubscribeEvent
+    public void onCreateSpawn(LevelEvent.CreateSpawnPosition event) {
+        if (!(event.getLevel() instanceof ServerLevel level)) {
+            return;
+        }
+        BlockPos spawn = resolveTerraSpawn(level);
+        if (spawn == null) {
+            return;
+        }
+        event.getSettings().setSpawn(spawn, 0.0f);
+        level.setDefaultSpawnPos(spawn, 0.0f);
+        pendingWorldSpawn = spawn;
+        applyPendingWorldSpawn = true;
+        if (event.isCancelable()) {
+            event.setCanceled(true);
+        }
+    }
+
+    @SubscribeEvent
+    public void onServerStarted(ServerStartedEvent event) {
+        if (!applyPendingWorldSpawn || pendingWorldSpawn == null) {
+            return;
+        }
+        ServerLevel overworld = event.getServer().overworld();
+        if (overworld != null
+                && overworld.getChunkSource().getGenerator() instanceof TerraChunkGenerator) {
+            overworld.setDefaultSpawnPos(pendingWorldSpawn, 0.0f);
+        }
+        applyPendingWorldSpawn = false;
+        pendingWorldSpawn = null;
+        TerraSpawnSettings.consume();
+    }
+
+    private BlockPos resolveTerraSpawn(ServerLevel level) {
+        if (level == null || !(level.getChunkSource().getGenerator() instanceof TerraChunkGenerator)) {
+            return null;
+        }
+        double[] geo = TerraSpawnSettings.peek();
+        double lat = geo[0];
+        double lon = geo[1];
+        double[] mc = TpllCommand.blockPosFromGeo(lat, lon);
+        if (mc == null) {
+            LOGGER.warn("Spawn lat={}, lon={} is outside the BTE projection; using 0,0", lat, lon);
+            mc = TpllCommand.blockPosFromGeo(0.0, 0.0);
+        }
+        if (mc == null) {
+            mc = new double[] {0.0, 0.0};
+        }
+        int x = (int) Math.floor(mc[0]);
+        int z = (int) Math.floor(mc[1]);
+        int y = TpllCommand.spawnYFromBlock(x, z);
+        BlockPos spawn = new BlockPos(x, y, z);
+        LOGGER.info("Terra++ world spawn set to lat={}, lon={} -> {}, {}, {}", lat, lon, x, y, z);
+        return spawn;
     }
 
     public static TerraPlusPlus getInstance() { return instance; }

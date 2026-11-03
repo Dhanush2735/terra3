@@ -55,6 +55,22 @@ public class TpllCommand {
         return projection;
     }
 
+    /**
+     * Same projection as {@code /tpll}: geographic lat/lon to Minecraft XZ.
+     * {@code fromGeo} takes longitude first. Returns null if unloaded or out of bounds.
+     */
+    public static double[] blockPosFromGeo(double lat, double lon) {
+        GeographicProjection proj = getProjection();
+        if (proj == null) {
+            return null;
+        }
+        try {
+            return proj.fromGeo(lon, lat);
+        } catch (OutOfProjectionBoundsException e) {
+            return null;
+        }
+    }
+
     private static TerraDensityFunctions getDensityFunctions() {
         if (densityFunctions == null) {
             synchronized (TpllCommand.class) {
@@ -134,6 +150,11 @@ public class TpllCommand {
                 it.remove();
             }
         }
+    }
+
+    /** Surface Y for world spawn / teleport. Falls back high so the player is not buried. */
+    public static int spawnYFromBlock(int blockX, int blockZ) {
+        return estimateSurfaceY(blockX, blockZ);
     }
 
     private static int estimateSurfaceY(int blockX, int blockZ) {
