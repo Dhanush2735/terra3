@@ -1,0 +1,18 @@
+coastline segments in 3x3 tiles: 1,771 (NW27 log count: 1,771)
+sanity: beach quart signed = -4.5 m (land side, <0 here), ocean quart = 60.5 m
+real projection toGeo: 0.38 us/call
+
+A. BEACH chunk (Juhu shore)
+  OLD: 10,668 classify calls (18,893,028 signed-distance) -> 678 ms per chunk
+  NEW: 42 classify calls -> 2.47 ms per chunk (avg of 30)
+  speed-up: 274x | 100 chunks: OLD 1.1 min vs NEW 0.2 s (1 thread)
+
+B. INLAND chunk 60 m east (worst case)
+  OLD: 73,152 classify calls (129,552,192 signed-distance) -> 4482 ms per chunk
+  NEW: 288 classify calls -> 18.73 ms per chunk (avg of 30)
+  speed-up: 239x | 100 chunks: OLD 7.5 min vs NEW 1.9 s (1 thread)
+
+C. OCEAN chunk 60 m west
+  OLD: 8,128 classify calls (14,394,688 signed-distance) -> 501 ms per chunk
+  NEW: 32 classify calls -> 1.96 ms per chunk (avg of 30)
+  speed-up: 255x | 100 chunks: OLD 0.8 min vs NEW 0.2 s (1 thread)

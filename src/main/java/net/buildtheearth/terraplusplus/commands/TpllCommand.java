@@ -7,6 +7,7 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 
+import net.buildtheearth.terraplusplus.generator.HeightSpikeGuard;
 import net.buildtheearth.terraplusplus.generator.TerraChunkGenerator;
 import net.buildtheearth.terraplusplus.generator.TerraDensityFunctions;
 import net.buildtheearth.terraplusplus.generator.osm.AsyncStructureManager;
@@ -220,6 +221,17 @@ public class TpllCommand {
                                         .executes(ctx -> showSourceStatus(ctx.getSource())))
                         )
 
+                        .then(Commands.literal("heights")
+                                .then(Commands.literal("guard")
+                                        .then(Commands.literal("on")
+                                                .executes(ctx -> setHeightsGuard(ctx.getSource(), true)))
+                                        .then(Commands.literal("off")
+                                                .executes(ctx -> setHeightsGuard(ctx.getSource(), false)))
+                                        .then(Commands.literal("status")
+                                                .executes(ctx -> showHeightsGuard(ctx.getSource())))
+                                )
+                        )
+
                         .then(Commands.literal("tp")
                                 .requires(src -> src.hasPermission(2))
                                 .then(Commands.argument("lat", DoubleArgumentType.doubleArg(-85, 85))
@@ -266,6 +278,51 @@ public class TpllCommand {
 
         source.sendSuccess(() -> Component.literal(
                 "  Changes apply to newly generated chunks only. Delete existing chunks to regenerate.")
+                .withStyle(ChatFormatting.DARK_GRAY), false);
+
+        return 1;
+    }
+
+    private static int setHeightsGuard(CommandSourceStack source, boolean on) {
+        HeightSpikeGuard.enabled = on;
+
+        source.sendSuccess(() -> prefix()
+                .append(Component.literal("Height spike guard: ")
+                        .withStyle(ChatFormatting.WHITE))
+                .append(Component.literal(on ? "ON" : "OFF")
+                        .withStyle(on ? ChatFormatting.GREEN : ChatFormatting.RED)),
+                true);
+
+        source.sendSuccess(() -> Component.literal(on
+                ? "  Crazy height pixels are cleaned in memory as tiles load (Mapterhorn is the only height source since 2026-11-20)."
+                : "  Pure Mapterhorn, exactly as downloaded - no cleaning anywhere.")
+                .withStyle(ChatFormatting.GRAY), false);
+
+        source.sendSuccess(() -> Component.literal(
+                "  Applies to tiles loaded from now on; restart the game (or revisit far away) for a fully fresh test.")
+                .withStyle(ChatFormatting.DARK_GRAY), false);
+
+        return 1;
+    }
+
+    private static int showHeightsGuard(CommandSourceStack source) {
+        source.sendSuccess(() -> prefix()
+                .append(Component.literal("Height spike guard: ")
+                        .withStyle(ChatFormatting.WHITE))
+                .append(Component.literal(HeightSpikeGuard.enabled ? "ON" : "OFF")
+                        .withStyle(HeightSpikeGuard.enabled
+                                ? ChatFormatting.GREEN : ChatFormatting.RED)),
+                false);
+
+        source.sendSuccess(() -> Component.literal(String.format(
+                "  Tiles guarded: %d    pixels repaired: %d (zoom-anchor: %d)",
+                HeightSpikeGuard.TILES_GUARDED.get(),
+                HeightSpikeGuard.TOTAL_REPAIRED.get(),
+                HeightSpikeGuard.ANCHOR_REPAIRED.get()))
+                .withStyle(ChatFormatting.GRAY), false);
+
+        source.sendSuccess(() -> Component.literal(
+                "  Switch: /terra heights guard on|off    (Mapterhorn only source; off = tiles exactly as downloaded)")
                 .withStyle(ChatFormatting.DARK_GRAY), false);
 
         return 1;

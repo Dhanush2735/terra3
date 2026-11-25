@@ -1,0 +1,15 @@
+WORLD CHECK demo-scene: PASS — 3176 non-air blocks built in code
+WORLD CHECK demo-truth: PASS — tower top y=83 (want 83 = 20 above ground 63), roof ridge y=72 (want 72), water surface y=62 (want 62)
+WORLD CHECK demo-file: PASS — packed into a real .mca region file (45056 bytes)
+WORLD CHECK region: PASS — demo_r.0.0.mca: 9 chunks parsed, 0 failed
+WORLD CHECK roundtrip: PASS — file read back: 3176 blocks, 0 differences from the town that was built (want 0)
+WORLD CHECK render: PASS — view_top.png 384x384
+WORLD CHECK render: PASS — view_from_NW.png 968x728 (block = 10px)
+WORLD CHECK render: PASS — view_from_NE.png 968x728 (block = 10px)
+WORLD CHECK render: PASS — view_from_SE.png 968x728 (block = 10px)
+WORLD CHECK render: PASS — view_from_SW.png 968x728 (block = 10px)
+WORLD CHECK legend: PASS — legend.txt: 9 blocks, 0.0% auto-coloured (want <=10%)
+WORLD CHECK slices: PASS — 21 floor slices written (levels [63, 64, 65]...[81, 82, 83])
+WORLD CHECK demo-slices: PASS — slice data: door gap at y64, wall above door at y66, window gap at y66, roof ridge at y72
+WORLD CHECK profile: PASS — (0,35)->(47,35): y=63 x28, y=62 x11, y=63 x9
+WORLD CHECK demo-profile: PASS — profile z=35: y=63 flat, y=62 across the pond (x28..38)

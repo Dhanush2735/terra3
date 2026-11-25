@@ -71,10 +71,8 @@ public class TerrainDiagnostic {
 
         String[][] endpoints = {
             // {name, url}
-            {"AWS Terrain Tiles",
-             "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/10/512/512.png"},
-            {"MapZen/Nextzen",
-             "https://tile.nextzen.org/tilezen/terrain/v1/256/terrarium/10/512/512.png"},
+            {"Mapterhorn (only elevation source)",
+             "https://download.mapterhorn.com/planet.pmtiles"},
             {"OpenTopography",
              "https://portal.opentopography.org/API/globaldem"},
             {"OSM Buildings",

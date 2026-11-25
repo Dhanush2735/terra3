@@ -424,10 +424,20 @@ public class SourceCooperativeIndex {
     private void triggerShardFetch(String iso, String shardId,
                                    double centreLat, double centreLon,
                                    String key) {
+        triggerShardFetch(iso, shardId, centreLat, centreLon, key,
+                COLD_START_DELAY_MS);
+    }
+
+    private void triggerShardFetch(String iso, String shardId,
+                                   double centreLat, double centreLon,
+                                   String key, long delayMs) {
         // Missing VIDA data is optional gap-fill work, never an immediate
         // terrain prerequisite. Delay cold work so OSM/OHM can satisfy dense
         // areas first, avoiding immediate contention with terrain and source
         // tile downloads before a large range fetch starts.
+        // An explicit prefetch() (teleport/terrain warmup) passes delay 0:
+        // the player is already travelling there, so starting late would
+        // only guarantee the first chunks are born without VIDA.
         CompletableFuture.runAsync(() -> {
             try { fetchShard(iso, shardId, centreLat, centreLon, key); }
             catch (Exception e) {
@@ -436,9 +446,41 @@ public class SourceCooperativeIndex {
                 retryAfterMs.put(key, System.currentTimeMillis() + RETRY_COOLDOWN_MS);
             }
             finally { pendingShards.remove(key); }
-        }, CompletableFuture.delayedExecutor(COLD_START_DELAY_MS,
+        }, CompletableFuture.delayedExecutor(delayMs,
                 TimeUnit.MILLISECONDS, dlPool));
     }
+
+    /**
+     * Explicit warmup: start this region's shard fetch NOW, with no
+     * cold-start delay. Called from TerraChunkGenerator.warmDestination
+     * (teleport command + first-terrain-generation prefetch), which
+     * fires every OTHER source but never fired VIDA — so VIDA only
+     * ever started when the first chunk was already decorating, plus
+     * the 5 s delay, plus the ranged-fetch time. The first chunks
+     * were therefore always born VIDA-less. Warmup must run in
+     * parallel with terrain generation, like all the other sources.
+     */
+    public void prefetch(double lat, double lon) {
+        String iso = getCountryISO(lat, lon);
+        String shardId = getS2ShardId(lat, lon);
+        if (iso == null || shardId == null) return;
+        String key = regionKey(iso, shardId, lat, lon);
+        Shard cached = shardCache.get(key);
+        if (cached != null && cached.covers(
+                lat - 0.001, lat + 0.001, lon - 0.001, lon + 0.001))
+            return;
+        Long retryAfter = retryAfterMs.get(key);
+        if (retryAfter != null
+                && System.currentTimeMillis() < retryAfter) return;
+        if (pendingShards.add(key)) {
+            LOGGER.info("VIDA prefetch {}: shard fetch starting now"
+                    + " (no cold-start delay)", key);
+            triggerShardFetch(iso, shardId, lat, lon, key, 0L);
+        }
+    }
+
+    /** Regions whose shard fetch is currently in flight. */
+    public int getPendingCount() { return pendingShards.size(); }
 
     private void fetchShard(String iso, String shardId,
                             double centreLat, double centreLon,

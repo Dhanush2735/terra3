@@ -1,0 +1,6 @@
+-encoding
+UTF-8
+-proc:none
+-d
+/tmp/parseout
+net/buildtheearth/terraplusplus/generator/TerraChunkGenerator.java

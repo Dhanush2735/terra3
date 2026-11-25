@@ -6,6 +6,7 @@ package net.buildtheearth.terraplusplus;
 import com.mojang.serialization.Codec;
 
 import net.buildtheearth.terraplusplus.client.TerraCreateWorldScreen;
+import net.buildtheearth.terraplusplus.commands.TerraCheckCommand;
 import net.buildtheearth.terraplusplus.commands.TpllCommand;
 import net.buildtheearth.terraplusplus.config.TerraConfig;
 import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
@@ -102,6 +103,7 @@ public class TerraPlusPlus {
     @SubscribeEvent
     public void onRegisterCommands(RegisterCommandsEvent event) {
         TpllCommand.register(event.getDispatcher());
+        TerraCheckCommand.register(event.getDispatcher());
     }
 
     /**

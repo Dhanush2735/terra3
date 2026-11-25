@@ -1,8 +1,0 @@
--nowarn
--encoding
-UTF-8
--Xmaxerrs
-20000
--d
-/tmp/outr3
-@/tmp/sources.txt

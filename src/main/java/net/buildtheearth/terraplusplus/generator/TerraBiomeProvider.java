@@ -6,7 +6,7 @@
 //      STONY_SHORE threshold raised to 15.0m (realistic cliff threshold)
 //      classifyCoast simplified — no longer uses COAST_LAND_THRESHOLD
 //      getBiomeTypeCode BEACH returns 9 for sand surface
-//      Precipitation multiplied by 12 (monthly to annual fix kept)
+//      Precipitation dataset is annual mm/year (climate channel 1)
 //      WorldCover remains primary classifier for vegetation biomes
 //      Soil fallback retained for when WorldCover tile not loaded
 // ============================================================
@@ -126,6 +126,7 @@ public class TerraBiomeProvider {
     public final Holder<Biome> WOODED_BADLANDS;
     public final Holder<Biome> SAVANNA;
     public final Holder<Biome> SAVANNA_PLATEAU;
+    public final Holder<Biome> WINDSWEPT_SAVANNA;
     public final Holder<Biome> SWAMP;
     public final Holder<Biome> MANGROVE_SWAMP;
     public final Holder<Biome> SNOWY_PLAINS;
@@ -137,6 +138,10 @@ public class TerraBiomeProvider {
     public final Holder<Biome> WINDSWEPT_FOREST;
     public final Holder<Biome> STONY_PEAKS;
     public final Holder<Biome> JAGGED_PEAKS;
+    /** Caves Phase 1 (2026-11-20): underground biome holders. */
+    public final Holder<Biome> LUSH_CAVES;
+    public final Holder<Biome> DRIPSTONE_CAVES;
+    public final Holder<Biome> DEEP_DARK;
 
     // ================================================================
     // CONSTRUCTOR
@@ -161,7 +166,7 @@ public class TerraBiomeProvider {
                                 + "precip_annual={} temp={}",
                         String.format("%.0f", testSoil),
                         String.format("%.1f", testPrecip),
-                        String.format("%.1f", testPrecip * 12.0),
+                        String.format("%.1f", testPrecip),
                         String.format("%.1f", testTemp));
             } catch (Exception e) {
                 LOGGER.warn("Dataset test failed: {}", e.getMessage());
@@ -216,6 +221,7 @@ public class TerraBiomeProvider {
         WOODED_BADLANDS          = get(Biomes.WOODED_BADLANDS);
         SAVANNA                  = get(Biomes.SAVANNA);
         SAVANNA_PLATEAU          = get(Biomes.SAVANNA_PLATEAU);
+        WINDSWEPT_SAVANNA        = get(Biomes.WINDSWEPT_SAVANNA);
         SWAMP                    = get(Biomes.SWAMP);
         MANGROVE_SWAMP           = get(Biomes.MANGROVE_SWAMP);
         SNOWY_PLAINS             = get(Biomes.SNOWY_PLAINS);
@@ -227,6 +233,15 @@ public class TerraBiomeProvider {
         WINDSWEPT_FOREST         = get(Biomes.WINDSWEPT_FOREST);
         STONY_PEAKS              = get(Biomes.STONY_PEAKS);
         JAGGED_PEAKS             = get(Biomes.JAGGED_PEAKS);
+        LUSH_CAVES               = biomeMap.get(Biomes.LUSH_CAVES);
+        DRIPSTONE_CAVES          = biomeMap.get(Biomes.DRIPSTONE_CAVES);
+        DEEP_DARK                = biomeMap.get(Biomes.DEEP_DARK);
+        if (LUSH_CAVES == null || DRIPSTONE_CAVES == null
+                || DEEP_DARK == null)
+            LOGGER.warn("cave biome holders missing (lush={} drip={} "
+                    + "deepDark={}) — cave biome painting limited",
+                    LUSH_CAVES != null, DRIPSTONE_CAVES != null,
+                    DEEP_DARK != null);
 
         LOGGER.info("TerraBiomeProvider: indexed {} biomes, datasets={}",
                 biomeMap.size(), ok ? "OK" : "FALLBACK");
@@ -259,19 +274,21 @@ public class TerraBiomeProvider {
                 double rawPrecip = precipDataset.getAsync(longitude, latitude).join();
                 temp = tempDataset.getAsync(longitude, latitude).join();
 
-                // FIX: Terra-- precipitation is monthly average.
-                // Multiply by 12 to get annual mm/year.
-                if (rawPrecip >= 0 && rawPrecip <= 1000) {
-                    precip = rawPrecip * 12.0;
-                } else if (rawPrecip > 1000) {
-                    // Already annual — use as-is
+                // climate.gz channel 1 is annual precipitation
+                // in mm/year (verified by decoding the dataset:
+                // Cairo ~29, Berlin ~691, Amazon ~2221). Do NOT
+                // multiply by 12 — that old assumption turned
+                // normal temperate rainfall into rainforest data.
+                if (rawPrecip >= 0 && rawPrecip <= 12000) {
                     precip = rawPrecip;
                 } else {
                     precip = estimatePrecipFromLatLon(latitude, longitude);
                 }
 
-                // Guard against temperature dataset returning precip value
-                if (Math.abs(temp - rawPrecip) < 0.01 || temp < -89 || temp > 60) {
+                // Temperature is a separate channel now; only a
+                // physically impossible reading falls back to the
+                // latitude estimate.
+                if (temp < -89 || temp > 60) {
                     temp = estimateTempFromLat(latitude);
                 }
 
@@ -308,6 +325,17 @@ public class TerraBiomeProvider {
         if (dataCache.size() > DATA_CACHE_MAX) dataCache.clear();
         dataCache.put(key, result);
         return result;
+    }
+
+    /** Public climate sample for /terracheck: [soil, annualPrecipMm, tempC]. */
+    public double[] getClimateSample(double latitude, double longitude) {
+        double[] d = queryData(latitude, longitude);
+        return new double[]{ d[0], d[1], d[2] };
+    }
+
+    /** Aridity zone name for an annual precipitation value. */
+    public String describeAridity(double annualPrecipMm) {
+        return getAridity(annualPrecipMm).name();
     }
 
     // ================================================================
@@ -433,7 +461,8 @@ public class TerraBiomeProvider {
     }
 
     public boolean isSavanna(Holder<Biome> b) {
-        return b != null && (b == SAVANNA || b == SAVANNA_PLATEAU);
+        return b != null && (b == SAVANNA || b == SAVANNA_PLATEAU
+                || b == WINDSWEPT_SAVANNA);
     }
 
     public boolean isJungle(Holder<Biome> b) {
@@ -639,6 +668,10 @@ public class TerraBiomeProvider {
         if (isMountain(tierElev) || isHighland(tierElev)) {
             if (temp < 0.0)  return safe(WINDSWEPT_GRAVELLY_HILLS, WINDSWEPT_HILLS);
             if (temp < 10.0) return safe(WINDSWEPT_HILLS, PLAINS);
+            // Step 5: hot high shrubland = windswept savanna
+            // (was never selected before).
+            if (temp >= 18.0 && tierElev >= 1000.0)
+                return safe(WINDSWEPT_SAVANNA, SAVANNA_PLATEAU);
             return safe(WINDSWEPT_HILLS, SAVANNA_PLATEAU);
         }
         if (temp < 0.0)  return safe(SNOWY_PLAINS, PLAINS);
@@ -702,10 +735,43 @@ public class TerraBiomeProvider {
                                         double lat, double lon) {
         if (isMountain(tierElev)) {
             if (temp < 0.0) return safe(SNOWY_SLOPES, FROZEN_PEAKS);
+            // NW(22) Atacama evidence: hot + dry mountains
+            // are desert (Atacama/Altiplano), not stony
+            // peaks. 20 mm/yr at 2400 m is a desert.
+            if (temp >= 8.0
+                    && (ard == AridityZone.HYPER_ARID
+                        || ard == AridityZone.ARID))
+                return safe(DESERT, STONY_PEAKS);
             return safe(STONY_PEAKS, WINDSWEPT_HILLS);
         }
         if (isHighland(tierElev)) {
             if (temp < 0.0) return safe(WINDSWEPT_GRAVELLY_HILLS, SNOWY_SLOPES);
+            // Sahara fix (2026-11-20, owner report at
+            // 23.40,12.60 Tibesti; widened by NW(22) Erg
+            // Chebbi evidence, 91 mm/yr): hot highlands with
+            // under 150 mm/yr rain are true desert
+            // (Sahara/Arabia/Atacama uplands), not mesa.
+            // Without this gate every hot bare massif above
+            // 500 m became badlands + terracotta + grass
+            // patches. Badlands family now requires at
+            // least SEMI_ARID rain (Monument Valley
+            // 236 mm/yr and Grand Canyon still qualify).
+            if ((ard == AridityZone.HYPER_ARID
+                    || ard == AridityZone.ARID) && temp >= 8.0)
+                return safe(DESERT, BADLANDS);
+            // Step 5: use the whole badlands family. High +
+            // driest = eroded (gullied plateau edges); a bit
+            // more rain (semi-arid) = wooded badlands.
+            // (Gate was 1200 m in v1; the NW17 save proved
+            // every visited badlands column sits at
+            // ~500-1090 m, so nothing ever qualified.
+            // 1000 m = canyon-bench country.)
+            if (tierElev >= 1000.0
+                    && ard != AridityZone.SEMI_ARID
+                    && ard != AridityZone.SUB_HUMID)
+                return safe(ERODED_BADLANDS, BADLANDS);
+            if (ard == AridityZone.SEMI_ARID)
+                return safe(WOODED_BADLANDS, BADLANDS);
             return safe(BADLANDS, WINDSWEPT_GRAVELLY_HILLS);
         }
         if (temp < -5.0) return safe(SNOWY_PLAINS, ICE_SPIKES);
@@ -815,9 +881,14 @@ public class TerraBiomeProvider {
                 && isTropicalCoast(lat) && temp >= 20.0)
             return safe(MANGROVE_SWAMP, SWAMP);
 
-        // High precipitation tropical coast
-        if (isTropicalCoast(lat) && temp >= 20.0 && d[1] >= PRECIP_SUB_HUMID)
-            return safe(MANGROVE_SWAMP, SWAMP);
+        // Step 4 v3 (NW15 proof): a precip-only mangrove rule
+        // used to sit here ("tropical + wet -> MANGROVE_SWAMP").
+        // It hijacked every wet tropical SAND beach — Juhu
+        // (2,111 mm/yr) came out mangrove_swamp on the whole
+        // open shore. Real mangroves are muddy sheltered
+        // water, already covered by the MANGROVES / WETLAND
+        // class rules above. Rain alone does not make a
+        // mangrove; open wet-tropical sand is BEACH.
 
         // Default sandy beach
         return safe(BEACH);
@@ -842,8 +913,12 @@ public class TerraBiomeProvider {
     private Holder<Biome> classifyMountainFallback(int soil, double temp,
                                                     AridityZone ard,
                                                     double lat, double lon) {
-        if (ard == AridityZone.HYPER_ARID || ard == AridityZone.ARID)
+        if (ard == AridityZone.HYPER_ARID || ard == AridityZone.ARID) {
+            // Hot dry mountains = desert (Atacama rule,
+            // NW22); cold dry mountains stay stony.
+            if (temp >= 8.0) return safe(DESERT, STONY_PEAKS);
             return safe(STONY_PEAKS, BADLANDS);
+        }
         if (temp < 0.0)  return safe(SNOWY_SLOPES, FROZEN_PEAKS);
         if (temp < 5.0)  return safe(GROVE, SNOWY_SLOPES);
         if (temp < 12.0) {
@@ -1016,6 +1091,27 @@ public class TerraBiomeProvider {
     // which returns the natural surface (desert for Dubai etc.)
     // The actual city buildings are placed by OSM structure
     // generation on top of the natural terrain.
+
+    /**
+     * Step 4 shore-aware entry. classify() never returns
+     * TerrainType.COASTLINE, so the COASTLINE route in the
+     * 5-arg method is unreachable and real shores got inland
+     * biome names. The generator detects shore land itself
+     * (LAND column at shore height with sea water beside it)
+     * and passes shore=true; those columns go to the coast
+     * classifier (beach / snowy beach / stony shore /
+     * mangrove swamp by climate + WorldCover).
+     */
+    public Holder<Biome> getBiomeForLocation(double latitude, double longitude,
+                                              double elevMeters,
+                                              TerraDensityFunctions.TerrainType terrainType,
+                                              WorldCoverClass wcClass,
+                                              boolean shore) {
+        if (shore && terrainType == TerraDensityFunctions.TerrainType.LAND)
+            return classifyCoast(latitude, longitude, elevMeters, wcClass);
+        return getBiomeForLocation(latitude, longitude, elevMeters, terrainType, wcClass);
+    }
+
     public int getBiomeTypeCode(double lat, double lon,
                                  double elevMeters,
                                  WorldCoverClass wcClass) {
@@ -1028,8 +1124,32 @@ public class TerraBiomeProvider {
             case SHRUBLAND: return 6;
             case BUILT_UP:  return 10;
             case BARE: {
+                // Step 5 palette: bare ground is not one
+                // colour. (Was: temp>=12 -> RED_SAND, which
+                // painted even the Sahara red.)
                 double[] d = queryData(lat, lon);
-                return d[2] >= 12.0 ? 7 : 1;
+                double precip = d[1];
+                double temp = d[2];
+                // Arid elevated country -> mesa painter
+                // (terracotta bands): canyon/plateau rock.
+                // NW(22): mesa paint needs >= 150 mm/yr
+                // rain (PRECIP_ARID). Below that it is true
+                // desert — Tibesti 12 mm and Erg Chebbi
+                // 91 mm were painted as Arizona mesa.
+                // Monument Valley (236 mm) keeps mesa.
+                if (temp >= 8.0 && precip >= PRECIP_ARID
+                        && precip < 500.0
+                        && elevMeters >= 500.0
+                        && elevMeters <= 2600.0)
+                    return 2;
+                if (temp >= 12.0) {
+                    // Red-sand country = arid plateau sands;
+                    // low hot desert (Sahara) stays yellow.
+                    if (precip < 400.0 && elevMeters >= 250.0)
+                        return 7;
+                    return 1;
+                }
+                return 1;
             }
             default: break;
         }

@@ -150,7 +150,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
         COARSE_DIRT=
             Blocks.COARSE_DIRT.defaultBlockState(),
         RED_SAND=Blocks.RED_SAND.defaultBlockState(),
-        TUFF    =Blocks.TUFF.defaultBlockState();
+        TUFF    =Blocks.TUFF.defaultBlockState(),
+        MUD     =Blocks.MUD.defaultBlockState();
 
     // ── BUILT_UP SURFACE BLOCKS ───────────────────────────────
     private static final BlockState
@@ -203,6 +204,22 @@ public class TerraChunkGenerator extends ChunkGenerator {
     private final AtomicInteger biomeDbg=
         new AtomicInteger();
     private final AtomicInteger surfDbg =
+        new AtomicInteger();
+    private final AtomicInteger esaWaitDbg=
+        new AtomicInteger();
+    private final AtomicInteger shoreDbg=
+        new AtomicInteger();
+    private final AtomicInteger coastWaitDbg=
+        new AtomicInteger();
+    private final AtomicInteger elevWaitDbg=
+        new AtomicInteger();
+    private final AtomicInteger esaBiomeWaitDbg=
+        new AtomicInteger();
+    private final AtomicInteger biomeTimeDbg=
+        new AtomicInteger();
+    private final AtomicInteger coastSrcDbg=
+        new AtomicInteger();
+    private final AtomicInteger shoreSmoothDbg=
         new AtomicInteger();
     private final AtomicInteger reachDbg=
         new AtomicInteger();
@@ -1463,6 +1480,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
 
             int placedColumns = 0;
             int drainedColumns = 0;
+            int seaRepaired = 0;
+            int seaFilled = 0;
 
             for (int lx = 0; lx < 16; lx++) {
                 for (int lz = 0; lz < 16; lz++) {
@@ -1543,8 +1562,66 @@ public class TerraChunkGenerator extends ChunkGenerator {
                             || col.type ==
                                 TerraDensityFunctions
                                 .TerrainType
-                                .SHALLOW_WATER)
+                                .SHALLOW_WATER) {
+                            // SEA REPAIR: classify now says
+                            // ocean, but this column was born as
+                            // fake dry land before the coastline
+                            // area arrived (missing-sea bug).
+                            // Carve it into real sea. Columns
+                            // that already hold water are real
+                            // ocean — never touched. Only a
+                            // MAPPED sea (or a below--500m deep
+                            // verdict, which cannot be dry land)
+                            // may carve: a shallow elevation-only
+                            // guess could be a dry basin.
+                            if (!hasWater
+                                && (col.mappedSea
+                                    || col.elevationMeters <= WEM)
+                                && placeSeaRepairColumn(
+                                    level, ch, bx, bz,
+                                    lx, lz, col, mb))
+                                seaRepaired++;
                             continue;
+                        }
+                        if (col.type ==
+                                TerraDensityFunctions
+                                .TerrainType.LAND
+                            && col.mappedLand
+                            && hasWater
+                            && waterTopY >= SL - 1
+                            && waterTopY <= SL) {
+                            // SEA REPAIR FILL: the coastline
+                            // map says LAND, but this column
+                            // holds sea-level water — it was
+                            // painted as sea by a backup map
+                            // (ESA 10 m squares or the elevation
+                            // guess) before the coastline map
+                            // arrived, leaving teeth of water
+                            // cutting into the beach (and teeth
+                            // of land where the neighbours used
+                            // the coastline map). Fill it back
+                            // into real land at the classify
+                            // height. Only a MAPPED land verdict
+                            // may fill — never an elevation
+                            // guess, which could be wrong about
+                            // real sea. A mapped river/lake
+                            // feature vetoes the fill and keeps
+                            // its normal handling below.
+                            boolean mappedFeature = false;
+                            try {
+                                var fw = rle.analyze(
+                                    bx, bz, lat, lon, baseElev);
+                                mappedFeature =
+                                    fw != null && fw.isWater;
+                            } catch (Exception ignored) {}
+                            if (!mappedFeature
+                                && placeSeaFillColumn(
+                                    level, ch, bx, bz,
+                                    lx, lz, col, waterBottomY, mb)) {
+                                seaFilled++;
+                                continue;
+                            }
+                        }
                     } catch (Exception e) {
                         continue;
                     }
@@ -1712,7 +1789,8 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 }
             }
 
-            if (placedColumns + drainedColumns > 0) {
+            if (placedColumns + drainedColumns
+                    + seaRepaired + seaFilled > 0) {
                 // Force heightmap recalculation so
                 // the vegetation pass sees the correct
                 // surface Y after water conversion.
@@ -1749,11 +1827,26 @@ public class TerraChunkGenerator extends ChunkGenerator {
                         e.getMessage());
                 }
 
+                if (seaRepaired > 0)
+                    LOGGER.info(
+                        "SEA REPAIR [{},{}]: {} columns carved "
+                        + "into real sea (fake-land coast healed)",
+                        ch.getPos().x, ch.getPos().z,
+                        seaRepaired);
+                if (seaFilled > 0)
+                    LOGGER.info(
+                        "SEA REPAIR FILL [{},{}]: {} columns "
+                        + "filled into real land (fake-sea "
+                        + "coast healed)",
+                        ch.getPos().x, ch.getPos().z,
+                        seaFilled);
                 LOGGER.debug(
                     "syncWater [{},{}]: placed={} drained={} "
+                    + "seaRepaired={} "
                     + "(builtUp={}) year={}",
                     ch.getPos().x, ch.getPos().z,
                     placedColumns, drainedColumns,
+                    seaRepaired,
                     isBuiltUpChunk(ch, esa, d),
                     currentYear);
             }
@@ -1764,6 +1857,151 @@ public class TerraChunkGenerator extends ChunkGenerator {
                 "syncHistoricalWater [{},{}]: {}",
                 ch.getPos().x, ch.getPos().z,
                 e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * SEA REPAIR: converts one fake-land column (born before the
+     * coastline area arrived) into real sea. Safety rails: the
+     * column must currently end in natural ground at about sea
+     * level — anything built, planted with trees, or high is
+     * left alone — and structure blocks are never removed.
+     * Floor and water levels come from the classify() verdict
+     * itself, so repair matches fresh generation.
+     */
+    private boolean placeSeaRepairColumn(
+            net.minecraft.server.level.ServerLevel level,
+            LevelChunk ch, int bx, int bz, int lx, int lz,
+            TerraDensityFunctions.TerrainColumn col, int mb) {
+        try {
+            int topBlockY = ch.getHeight(
+                Heightmap.Types.WORLD_SURFACE, lx, lz) - 1;
+            if (topBlockY <= mb + 4 || topBlockY > SL + 2)
+                return false;
+            BlockPos.MutableBlockPos pos =
+                new BlockPos.MutableBlockPos();
+            pos.set(bx, topBlockY, bz);
+            BlockState top = level.getBlockState(pos);
+            if (!(top.is(Blocks.GRASS_BLOCK)
+                    || top.is(Blocks.DIRT)
+                    || top.is(Blocks.COARSE_DIRT)
+                    || top.is(Blocks.SAND)
+                    || top.is(Blocks.RED_SAND)
+                    || top.is(Blocks.GRAVEL)
+                    || top.is(Blocks.CLAY)
+                    || top.is(Blocks.MUD)
+                    || top.is(Blocks.STONE)))
+                return false;
+            int floorY = Math.max(mb + 4,
+                Math.min(SL - 2, col.surfaceY));
+            // Bed: one gravel block at the floor (underwater
+            // ground painting refines it later if at all).
+            pos.set(bx, floorY, bz);
+            if (!isStructBlock(level.getBlockState(pos)))
+                setHistoricalBlock(level, pos, GRAVEL, 3);
+            // Carve the fake land above the floor.
+            for (int y = floorY + 1; y <= topBlockY; y++) {
+                pos.set(bx, y, bz);
+                BlockState bs = level.getBlockState(pos);
+                if (!bs.isAir() && !isStructBlock(bs))
+                    setHistoricalBlock(level, pos, AIR, 3);
+            }
+            // Fill real sea water up to sea level.
+            for (int y = floorY + 1; y <= SL - 1; y++) {
+                pos.set(bx, y, bz);
+                if (!isStructBlock(level.getBlockState(pos)))
+                    setHistoricalBlock(level, pos, WATER, 3);
+            }
+            return true;
+        } catch (Exception e) {
+            LOGGER.debug("Sea repair [{},{}]: {}",
+                bx, bz, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * SEA REPAIR FILL: converts one fake-sea column (painted as
+     * sea by a backup map before the coastline map arrived)
+     * back into real land, at the height classify() asks for.
+     * Mirror of placeSeaRepairColumn with the same safety
+     * rails: the column must be plain sea water over a natural
+     * sea floor, with nothing built in or above the water —
+     * anything else is left alone. Only shore-height land is
+     * filled (surfaceY near sea level); a high verdict is
+     * never turned into a pillar.
+     */
+    private boolean placeSeaFillColumn(
+            net.minecraft.server.level.ServerLevel level,
+            LevelChunk ch, int bx, int bz, int lx, int lz,
+            TerraDensityFunctions.TerrainColumn col,
+            int waterBottomY, int mb) {
+        try {
+            int targetY = col.surfaceY;
+            if (targetY > SL + 4 || targetY < mb + 5)
+                return false;
+            int floorY = waterBottomY - 1;
+            if (floorY <= mb + 3) return false;
+            if (targetY < floorY) targetY = floorY;
+            BlockPos.MutableBlockPos pos =
+                new BlockPos.MutableBlockPos();
+            // Sea floor must be natural bed material.
+            pos.set(bx, floorY, bz);
+            BlockState floor = level.getBlockState(pos);
+            if (!(floor.is(Blocks.GRAVEL)
+                    || floor.is(Blocks.DIRT)
+                    || floor.is(Blocks.SAND)
+                    || floor.is(Blocks.RED_SAND)
+                    || floor.is(Blocks.CLAY)
+                    || floor.is(Blocks.STONE)
+                    || floor.is(Blocks.MUD)
+                    || floor.is(Blocks.BRAIN_CORAL_BLOCK)
+                    || floor.is(Blocks.TUBE_CORAL_BLOCK)
+                    || floor.is(Blocks.FIRE_CORAL_BLOCK)
+                    || floor.is(Blocks.HORN_CORAL_BLOCK)
+                    || floor.is(Blocks.BUBBLE_CORAL_BLOCK)))
+                return false;
+            // The whole water shaft (and just above the
+            // surface) must be water or natural water plants —
+            // any other block means something built: skip.
+            for (int y = floorY + 1; y <= SL + 2; y++) {
+                pos.set(bx, y, bz);
+                BlockState bs = level.getBlockState(pos);
+                if (bs.isAir()
+                    || bs.is(Blocks.WATER)
+                    || bs.is(Blocks.SEAGRASS)
+                    || bs.is(Blocks.TALL_SEAGRASS)
+                    || bs.is(Blocks.KELP)
+                    || bs.is(Blocks.KELP_PLANT)
+                    || bs.is(Blocks.BRAIN_CORAL)
+                    || bs.is(Blocks.TUBE_CORAL)
+                    || bs.is(Blocks.FIRE_CORAL)
+                    || bs.is(Blocks.HORN_CORAL)
+                    || bs.is(Blocks.BUBBLE_CORAL))
+                    continue;
+                return false;
+            }
+            // Build the land column up to the classify height.
+            for (int y = floorY + 1; y < targetY; y++) {
+                pos.set(bx, y, bz);
+                setHistoricalBlock(level, pos, DIRT, 3);
+            }
+            pos.set(bx, targetY, bz);
+            setHistoricalBlock(level, pos,
+                targetY <= SL + 1 ? SAND : GRASS, 3);
+            // Clear the sea above the new land (mirrors the
+            // anti-flood rule fresh land painting applies).
+            for (int y = targetY + 1; y <= SL + 1; y++) {
+                pos.set(bx, y, bz);
+                BlockState bs = level.getBlockState(pos);
+                if (!bs.isAir() && !isStructBlock(bs))
+                    setHistoricalBlock(level, pos, AIR, 3);
+            }
+            return true;
+        } catch (Exception e) {
+            LOGGER.debug("Sea repair fill [{},{}]: {}",
+                bx, bz, e.getMessage());
             return false;
         }
     }
@@ -2590,8 +2828,16 @@ for (int lx = 0; lx < 16; lx++) {
     // ── LAZY INIT ─────────────────────────────────────────────
     private TerraDensityFunctions getDf(){
         if(df==null)synchronized(this){
-            if(df==null)df=
-                new TerraDensityFunctions(zoom,universeId);}
+            if(df==null){df=
+                new TerraDensityFunctions(zoom,universeId);
+                // ESA permanent-water areas as classify()'s
+                // second sea witness (memory-only getClass;
+                // UNKNOWN answers simply fall through).
+                df.setEsaWaterQuery((la,lo)->{
+                    try{return getWorldCover().getClass(la,lo)
+                        ==EsaWorldCoverIndex.WorldCoverClass
+                            .WATER;}
+                    catch(Exception e){return false;}});}}
         return df;}
     private RiverLakeEngine getRle(){
         if(rle==null)synchronized(this){
@@ -2647,6 +2893,28 @@ for (int lx = 0; lx < 16; lx++) {
     /** Public structure index access for ParadoxEngine. */
     public OsmStructureIndex getStructureIndexPublic(){
         return getStructureIndex();}
+    /** Public WorldCover access for TerraCheck (batch 3, all-sources test). */
+    public EsaWorldCoverIndex getWorldCoverPublic(){
+        return getWorldCover();}
+    /** Public water engine access for TerraCheck (batch 3). */
+    public RiverLakeEngine getRlePublic(){
+        return getRle();}
+    /** Public density-functions access for TerraCheck (batch 3). */
+    public TerraDensityFunctions getDfPublic(){
+        return getDf();}
+    /** Public OHM index access for TerraCheck (batch 3). */
+    public OhmStructureIndex getOhmIndexPublic(){
+        return getOhmIndex();}
+    /** Public biome provider access for TerraCheck biome/ground audit. */
+    public TerraBiomeProvider getBiomeProviderPublic(){
+        return getTerraBiomes();}
+    /** Effective surface code used by terrain painting (gbt). */
+    public int getSurfaceTypeCodePublic(int bx,int bz){
+        return gbt(bx,bz);}
+    /** Roughness helper for TerraCheck expected mesa/scrub blocks. */
+    public double getRoughnessPublic(int bx,int bz){
+        try{var d=getDf();return d==null?0:d.calculateRoughness(bx,bz);}
+        catch(Exception e){return 0;}}
 
     // ── COLD-START DESTINATION WARMUP ─────────────────────────
     // Run 7 forensics: /tpll to cold Durgam Cheruvu spent ~90s
@@ -2688,6 +2956,17 @@ for (int lx = 0; lx < 16; lx++) {
                 lat-R,lat+R,lon-R,lon+R);fired++;}
         }catch(Exception e){
             LOGGER.warn("WARMUP msft failed: {}",
+                e.getMessage());}
+        // BATCH-3 FIX (VIDA late): this warmup fired every source
+        // EXCEPT VIDA. VIDA therefore only started when the first
+        // chunk decorated, then waited out its own 5s cold-start
+        // delay, then the ranged fetch — so the first chunks were
+        // always born without VIDA buildings. Start it here, in
+        // parallel with terrain generation, like everything else.
+        try{if(worldConfig.vidaBuildings){
+            getVidaIndex().prefetch(lat,lon);fired++;}
+        }catch(Exception e){
+            LOGGER.warn("WARMUP vida failed: {}",
                 e.getMessage());}
         try{if(worldConfig.waterBodies){
             var rle=getRle();
@@ -2919,7 +3198,436 @@ for (int lx = 0; lx < 16; lx++) {
     @Override public void applyCarvers(WorldGenRegion a,
         long b,RandomState c,BiomeManager d,
         StructureManager e,ChunkAccess f,
-        GenerationStep.Carving g){}
+        GenerationStep.Carving g){
+        // Caves Phase 1 (2026-11-20): the vanilla carver
+        // pipeline is inert under our custom fill, so karst
+        // caves are carved by hand here. See CAVES_PHASE1.md.
+        try{carveKarstCaves(a,f);}
+        catch(Exception ex){
+            LOGGER.debug("carveKarstCaves: {}",
+                ex.getMessage());}}
+
+    // ── KARST CAVE CARVER (2026-11-20) ────────────────────
+    // Deterministic 80 m grid of seeded "worm" tunnels with
+    // occasional chambers, generated from world coordinates
+    // only — a worm crossing a chunk border is recomputed
+    // identically by the neighbouring chunk, so tunnels are
+    // continuous. Only own-chunk blocks are written. Design
+    // notes & limits: CAVES_PHASE1.md.
+    private static final java.util.concurrent.atomic
+        .AtomicLong CAVE_CHUNKS=
+        new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic
+        .AtomicLong CAVE_BLOCKS=
+        new java.util.concurrent.atomic.AtomicLong();
+
+    private static long mixSeed(int gx,int gz,long salt){
+        long h=(long)gx*0x9E3779B97F4A7C15L
+            ^(long)gz*0xC2B2AE3D27D4EB4FL^salt;
+        h^=h>>>33;h*=0xFF51AFD7ED558CCDL;
+        h^=h>>>33;return h;}
+
+    /** Stable [0,1) hash of a block position. */
+    private static double hash3(int x,int y,int z){
+        long h=(long)x*0x8DA6B343L^(long)y*0xD8163841L
+            ^(long)z*0xCB1AB31FL;
+        h^=h>>>33;h*=0xFF51AFD7ED558CCDL;h^=h>>>33;
+        return (h>>>11)*(1.0/9007199254740992.0);}
+
+    private static boolean isCaveRock(BlockState s){
+        var b=s.getBlock();
+        return b==Blocks.STONE||b==Blocks.DEEPSLATE
+            ||b==Blocks.GRANITE||b==Blocks.DIORITE
+            ||b==Blocks.ANDESITE||b==Blocks.TUFF
+            ||b==Blocks.CALCITE||b==Blocks.DRIPSTONE_BLOCK
+            ||b==Blocks.SANDSTONE||b==Blocks.RED_SANDSTONE;}
+
+    private void carveKarstCaves(WorldGenRegion region,
+            ChunkAccess ch){
+        if(!realCavesEnabled())return;
+        var dfr=getDf();
+        if(dfr==null||!dfr.isProjectionLoaded())return;
+        int minX=ch.getPos().getMinBlockX();
+        int minZ=ch.getPos().getMinBlockZ();
+        var centre=dfr.classify(minX+8,minZ+8);
+        if(centre==null
+            ||centre.type==TerraDensityFunctions
+                .TerrainType.INVALID
+            ||Double.isNaN(centre.latitude)
+            ||Double.isNaN(centre.longitude))return;
+        var tt=centre.type;
+        // Deep-water chunks have neither karst caves nor
+        // real cave entrances worth simulating.
+        if(tt==TerraDensityFunctions.TerrainType.OCEAN
+            ||tt==TerraDensityFunctions.TerrainType
+                .SHALLOW_WATER
+            ||tt==TerraDensityFunctions.TerrainType
+                .BELOW_SEA_WATER)return;
+        boolean centreLand=
+            tt==TerraDensityFunctions.TerrainType.LAND
+            ||tt==TerraDensityFunctions.TerrainType
+                .COASTLINE;
+        int kScore=KarstData.score(
+            centre.latitude,centre.longitude);
+        boolean karst=centreLand
+            &&kScore>=KarstData.KARST_MIN_SCORE;
+
+        // Per-column surface estimate + land mask.
+        int[] surf=new int[256];
+        boolean[] land=new boolean[256];
+        for(int lx=0;lx<16;lx++)
+            for(int lz=0;lz<16;lz++){
+                var col=dfr.classify(minX+lx,minZ+lz);
+                int i=lx*16+lz;
+                if(col==null
+                    ||col.type==TerraDensityFunctions
+                        .TerrainType.INVALID
+                    ||Double.isNaN(col.elevationMeters)){
+                    surf[i]=SL;land[i]=false;continue;}
+                // surfaceY is the scaled world height;
+                // SL+round(elevationMeters) is WRONG above
+                // 1000 m (elevation compression) — see the
+                // NW(22) Monument Valley report: cave code
+                // believed the surface was hundreds of
+                // blocks higher than the real ground.
+                surf[i]=col.surfaceY;
+                land[i]=col.type==TerraDensityFunctions
+                        .TerrainType.LAND
+                    ||col.type==TerraDensityFunctions
+                        .TerrainType.COASTLINE;}
+
+        long carvedHere=0;
+        if(karst){
+        final int CELL=80;
+        int gx0=Math.floorDiv(minX,CELL)-1;
+        int gx1=Math.floorDiv(minX+15,CELL)+1;
+        int gz0=Math.floorDiv(minZ,CELL)-1;
+        int gz1=Math.floorDiv(minZ+15,CELL)+1;
+        var pos=new net.minecraft.core.BlockPos.MutableBlockPos();
+        for(int gx=gx0;gx<=gx1;gx++)
+          for(int gz=gz0;gz<=gz1;gz++){
+            var rng=new java.util.Random(
+                mixSeed(gx,gz,0xCA7E5L));
+            // Density gate: strong karst (100) always
+            // seeds, weak karst (20) one cell in five.
+            if(rng.nextInt(100)>=kScore)continue;
+            int sx=gx*CELL+rng.nextInt(CELL);
+            int sz=gz*CELL+rng.nextInt(CELL);
+            var sc=dfr.classify(sx,sz);
+            if(sc==null||Double.isNaN(sc.latitude)
+                ||KarstData.score(sc.latitude,sc.longitude)
+                    <KarstData.KARST_MIN_SCORE)continue;
+            int surfStart=sc.surfaceY;
+            double x=sx+0.5,z=sz+0.5;
+            double y=Math.max(MY+320,
+                surfStart-15-rng.nextInt(40));
+            double heading=rng.nextDouble()*Math.PI*2.0;
+            double pitch=-0.08-rng.nextDouble()*0.15;
+            double baseRad=2.0+rng.nextDouble()*1.3;
+            int steps=60+rng.nextInt(161);
+            int chamberEvery=40+rng.nextInt(60);
+            for(int step=0;step<steps;step++){
+                heading+=(rng.nextDouble()-0.5)*0.55;
+                pitch+=(rng.nextDouble()-0.5)*0.28;
+                pitch+=(-0.05-pitch)*0.02;
+                if(pitch>0.45)pitch=0.45;
+                if(pitch<-0.65)pitch=-0.65;
+                x+=Math.cos(heading)*1.6;
+                z+=Math.sin(heading)*1.6;
+                y+=pitch*1.6;
+                if(y<MY+280)y=MY+280;
+                double rad=baseRad
+                    +Math.sin(step*0.35)*0.5;
+                carvedHere+=carveBall(region,ch,minX,minZ,
+                    surf,land,x,y,z,rad,pos);
+                if(step>0&&step%chamberEvery==0)
+                    carvedHere+=carveEllipsoid(region,ch,
+                        minX,minZ,surf,land,x,y,z,
+                        5.0+rng.nextDouble()*4.0,
+                        3.0+rng.nextDouble()*2.0,
+                        5.0+rng.nextDouble()*4.0,pos);
+            }
+          }
+        if(carvedHere>0){
+            long n=CAVE_CHUNKS.incrementAndGet();
+            CAVE_BLOCKS.addAndGet(carvedHere);
+            if(n%100==0)
+                LOGGER.info("CAVES carvedChunks={} "
+                    +"carvedBlocks={}",n,CAVE_BLOCKS.get());}
+        }
+        // Phase 2 (2026-11-20): real caves & underground
+        // structures at their true locations, any geology.
+        carveRealCaves(region,ch,minX,minZ,surf,land,
+            centre.latitude,centre.longitude);}
+
+    // ── PHASE 2: REAL CAVES & STRUCTURES (2026-11-20) ────
+    // Every known cave/mine/bunker point (CaveData) whose
+    // passages can reach this chunk is simulated from its
+    // true entrance with a position-seeded worm — the same
+    // determinism trick as Phase 1, so systems continue
+    // across chunk borders. Type 2 (described) caves steer
+    // to their real depth and run toward their real length
+    // (passage generation capped — see CAVES_PHASE2.md);
+    // dots get a modest system. Sensitive points (coords
+    // degraded by the source on purpose) are skipped.
+    private static final java.util.concurrent.atomic
+        .AtomicLong REALCAVE_BUILT=
+        new java.util.concurrent.atomic.AtomicLong();
+
+    private static int stepsFor(int idx){
+        if(CaveData.hasLength(idx))
+            return (int)Math.max(90,Math.min(2200,
+                CaveData.lengthM(idx)/1.4));
+        long h=mixSeed(idx,idx*7+1,0xD07L);
+        return 90+(int)((h>>>33)%231);}
+
+    private void carveRealCaves(WorldGenRegion region,
+            ChunkAccess ch,int minX,int minZ,int[] surf,
+            boolean[] land,double cLat,double cLon){
+        if(!CaveData.ensureLoaded())return;
+        var dfr=getDf();
+        double latR=0.055;
+        double lonR=latR/Math.max(0.25,
+            Math.cos(Math.toRadians(cLat)));
+        var pts=CaveData.inBox(cLat-latR,cLat+latR,
+            cLon-lonR,cLon+lonR);
+        if(pts.isEmpty())return;
+        int[][] cand=new int[pts.size()][];
+        int nc=0;
+        for(int idx:pts){
+            if(CaveData.isSensitive(idx))continue;
+            double[] bxz=dfr.fromGeo(
+                CaveData.lat(idx),CaveData.lon(idx));
+            if(bxz==null)continue;
+            int ex=(int)Math.floor(bxz[0]);
+            int ez=(int)Math.floor(bxz[1]);
+            int reach=(int)(stepsFor(idx)*1.6)+80;
+            if(ex<minX-reach||ex>minX+15+reach
+                ||ez<minZ-reach||ez>minZ+15+reach)continue;
+            cand[nc++]=new int[]{idx,ex,ez};}
+        if(nc==0)return;
+        // Entrances inside this chunk first, then nearest.
+        java.util.Arrays.sort(cand,0,nc,
+            java.util.Comparator.comparingInt(a->{
+                boolean in=a[1]>=minX&&a[1]<minX+16
+                    &&a[2]>=minZ&&a[2]<minZ+16;
+                int d=Math.max(Math.abs(a[1]-(minX+8)),
+                               Math.abs(a[2]-(minZ+8)));
+                return (in?0:1000000)+d;}));
+        var pos=new net.minecraft.core.BlockPos
+            .MutableBlockPos();
+        int sim=Math.min(nc,24);
+        for(int i=0;i<sim;i++){
+            int idx=cand[i][0],ex=cand[i][1],ez=cand[i][2];
+            boolean inChunk=ex>=minX&&ex<minX+16
+                &&ez>=minZ&&ez<minZ+16;
+            buildRealCave(region,ch,minX,minZ,surf,land,
+                idx,ex,ez,inChunk,pos);}}
+
+    private void buildRealCave(WorldGenRegion region,
+            ChunkAccess ch,int minX,int minZ,int[] surf,
+            boolean[] land,int idx,int ex,int ez,
+            boolean inChunk,
+            net.minecraft.core.BlockPos.MutableBlockPos pos){
+        var dfr=getDf();
+        var ecol=dfr.classify(ex,ez);
+        if(ecol==null
+            ||ecol.type==TerraDensityFunctions
+                .TerrainType.INVALID
+            ||Double.isNaN(ecol.elevationMeters))return;
+        var et=ecol.type;
+        // Never drain a water body for an entrance.
+        if(et==TerraDensityFunctions.TerrainType.OCEAN
+            ||et==TerraDensityFunctions.TerrainType
+                .SHALLOW_WATER
+            ||et==TerraDensityFunctions.TerrainType
+                .BELOW_SEA_WATER
+            ||et==TerraDensityFunctions.TerrainType.RIVER
+            ||et==TerraDensityFunctions.TerrainType.LAKE)
+            return;
+        int surfY=ecol.surfaceY;
+        int kind=CaveData.kind(idx);
+        var rng=new java.util.Random(
+            mixSeed(ex,ez,idx*2654435761L));
+        boolean built=false;
+
+        if(kind==CaveData.KIND_BUNKER){
+            if(!inChunk)return;
+            carveEllipsoid(region,ch,minX,minZ,surf,land,
+                ex+0.5,surfY-9,ez+0.5,6.0,2.5,6.0,pos);
+            built=carveShaft(region,minX,minZ,ex,ez,
+                surfY+12,surfY-7,pos)>0;
+        }else if(kind==CaveData.KIND_MINE_SHAFT){
+            int depth=CaveData.hasDepth(idx)
+                ?Math.max(20,Math.min(CaveData.depthM(idx),
+                    surfY-(MY+160)))
+                :50+rng.nextInt(110);
+            int bottomY=surfY-depth;
+            if(inChunk)
+                built=carveShaft(region,minX,minZ,ex,ez,
+                    surfY+12,bottomY,pos)>0;
+            // Two crossing galleries at the shaft bottom.
+            double h0=rng.nextDouble()*Math.PI;
+            for(int g=0;g<2;g++){
+                double heading=h0+g*Math.PI/2.0;
+                double x=ex+0.5,z=ez+0.5,y=bottomY+2;
+                int gsteps=70+rng.nextInt(100);
+                for(int s=0;s<gsteps;s++){
+                    heading+=(rng.nextDouble()-0.5)*0.3;
+                    x+=Math.cos(heading)*1.6;
+                    z+=Math.sin(heading)*1.6;
+                    carveBall(region,ch,minX,minZ,surf,land,
+                        x,y,z,1.7,pos);}}
+            built=true;
+        }else{
+            // Cave (described or dot) and mine adit.
+            boolean adit=kind==CaveData.KIND_MINE_ADIT;
+            int steps=adit?60+rng.nextInt(160)
+                          :stepsFor(idx);
+            double targetDepth=CaveData.hasDepth(idx)
+                ?CaveData.depthM(idx)
+                :(adit?10:25+rng.nextInt(86));
+            double yTarget=Math.max(MY+140,
+                surfY-targetDepth);
+            double x=ex+0.5,z=ez+0.5;
+            double y=adit?surfY-2:surfY-7;
+            double heading=rng.nextDouble()*Math.PI*2.0;
+            double pitch=adit?-0.02:-1.0;
+            double baseRad=adit?1.7:2.1+rng.nextDouble()*1.1;
+            int chamberEvery=110+rng.nextInt(120);
+            if(inChunk&&!adit)
+                built=carveShaft(region,minX,minZ,ex,ez,
+                    surfY+12,(int)y+4,pos)>0;
+            for(int s=0;s<steps;s++){
+                double want=Math.max(-2.3,Math.min(0.3,
+                    (yTarget-y)/55.0));
+                pitch+=(want-pitch)*0.07
+                    +(rng.nextDouble()-0.5)*0.22;
+                if(pitch>0.4)pitch=0.4;
+                if(pitch<-2.6)pitch=-2.6;
+                heading+=(rng.nextDouble()-0.5)*0.5;
+                x+=Math.cos(heading)*1.6;
+                z+=Math.sin(heading)*1.6;
+                y+=pitch*1.6;
+                if(y<MY+120)y=MY+120;
+                double rad=baseRad+Math.sin(s*0.3)*0.4;
+                carveBall(region,ch,minX,minZ,surf,land,
+                    x,y,z,rad,pos);
+                if(!adit&&s>0&&s%chamberEvery==0)
+                    carveEllipsoid(region,ch,minX,minZ,
+                        surf,land,x,y,z,
+                        5.0+rng.nextDouble()*4.0,
+                        3.0+rng.nextDouble()*2.0,
+                        5.0+rng.nextDouble()*4.0,pos);}
+            built=true;}
+
+        if(built&&inChunk){
+            long n=REALCAVE_BUILT.incrementAndGet();
+            if(n<=25||n%250==0)
+                LOGGER.info("REALCAVE {} kind={} depth={} "
+                    +"len={} entrancesBuilt={}",
+                    CaveData.name(idx),kind,
+                    CaveData.depthM(idx),
+                    CaveData.lengthM(idx),n);}}
+
+    /** Carves a 2x2 entrance shaft from the ground down to
+     *  bottomY. Refuses if the surface is water. Only writes
+     *  blocks inside this chunk. */
+    private long carveShaft(WorldGenRegion region,
+            int minX,int minZ,int ex,int ez,int topHint,
+            int bottomY,
+            net.minecraft.core.BlockPos.MutableBlockPos pos){
+        int top=-1;
+        for(int y=Math.min(XY-40,topHint);y>bottomY;y--){
+            pos.set(ex,y,ez);
+            var st=region.getBlockState(pos);
+            if(st.isAir())continue;
+            if(st.getBlock()==Blocks.WATER)return 0;
+            top=y;break;}
+        if(top<0)return 0;
+        long n=0;
+        for(int y=top;y>=bottomY;y--)
+            for(int dx=0;dx<=1;dx++)
+                for(int dz=0;dz<=1;dz++){
+                    int bx=ex+dx,bz=ez+dz;
+                    if(bx<minX||bx>minX+15
+                        ||bz<minZ||bz>minZ+15)continue;
+                    pos.set(bx,y,bz);
+                    if(region.getBlockState(pos).isAir())
+                        continue;
+                    region.setBlock(pos,AIR,2);n++;}
+        return n;}
+
+    /** Carves one squashed sphere (tunnel cross-section or,
+     *  with chamber=true, a room). Returns blocks carved in
+     *  this chunk. Never breaks the surface (solid-ceiling
+     *  check), never touches water columns or <=8 blocks
+     *  below the estimated surface. */
+    private long carveBall(WorldGenRegion region,
+            ChunkAccess ch,int minX,int minZ,int[] surf,
+            boolean[] land,double cx,double cy,double cz,
+            double rad,
+            net.minecraft.core.BlockPos.MutableBlockPos pos){
+        return carveEllipsoid(region,ch,minX,minZ,surf,land,
+            cx,cy,cz,rad,rad*0.75,rad,pos);}
+
+    private long carveEllipsoid(WorldGenRegion region,
+            ChunkAccess ch,int minX,int minZ,int[] surf,
+            boolean[] land,double cx,double cy,double cz,
+            double rx,double ry,double rz,
+            net.minecraft.core.BlockPos.MutableBlockPos pos){
+        long n=0;
+        int x0=(int)Math.floor(cx-rx),x1=(int)Math.ceil(cx+rx);
+        int y0=(int)Math.floor(cy-ry),y1=(int)Math.ceil(cy+ry);
+        int z0=(int)Math.floor(cz-rz),z1=(int)Math.ceil(cz+rz);
+        if(x1<minX||x0>minX+15||z1<minZ||z0>minZ+15)
+            return 0;
+        if(y1<MY+8||y0>XY-16)return 0;
+        double rr=Math.max(rx,rz);
+        for(int bx=Math.max(x0,minX);bx<=Math.min(x1,minX+15);bx++)
+          for(int bz=Math.max(z0,minZ);bz<=Math.min(z1,minZ+15);bz++){
+            int ci=(bx-minX)*16+(bz-minZ);
+            if(!land[ci])continue;
+            int topHere=surf[ci]-8;
+            for(int by=Math.max(y0,MY+4);
+                    by<=Math.min(y1,XY-8);by++){
+                if(by>topHere)continue;
+                double dx=(bx+0.5-cx)/rx;
+                double dy=(by+0.5-cy)/ry;
+                double dz=(bz+0.5-cz)/rz;
+                if(dx*dx+dy*dy+dz*dz>1.0)continue;
+                pos.set(bx,by,bz);
+                BlockState cur=region.getBlockState(pos);
+                if(!isCaveRock(cur))continue;
+                // Ceiling guard: solid rock must remain
+                // above, else we would punch the surface.
+                pos.set(bx,(int)Math.min(XY-4,
+                    by+rr+5),bz);
+                if(!isCaveRock(region.getBlockState(pos)))
+                    continue;
+                pos.set(bx,by,bz);
+                region.setBlock(pos,AIR,2);
+                n++;
+                // Simple dressing: convert the floor block.
+                pos.set(bx,by-1,bz);
+                BlockState fl=region.getBlockState(pos);
+                if(isCaveRock(fl)){
+                    double h=hash3(bx,by-1,bz);
+                    if(by>20){
+                        if(h<0.13)
+                            region.setBlock(pos,
+                                Blocks.MOSS_BLOCK
+                                    .defaultBlockState(),2);
+                        else if(h<0.20)
+                            region.setBlock(pos,
+                                Blocks.DRIPSTONE_BLOCK
+                                    .defaultBlockState(),2);
+                    }else if(h<0.10){
+                        region.setBlock(pos,
+                            Blocks.DRIPSTONE_BLOCK
+                                .defaultBlockState(),2);
+                    }}}}
+        return n;}
     @Override public void buildSurface(WorldGenRegion a,
         StructureManager b,RandomState c,
         ChunkAccess d){}
@@ -2953,6 +3661,34 @@ for (int lx = 0; lx < 16; lx++) {
             // Area-deduped (one trigger per 0.01-deg tile ≈ 41
             // chunks); warm start = mem/disk hit = no-op.
             prefetchForChunk(cx,cz);
+            // ELEVATION READINESS GATE (NW23): prefetch only
+            // STARTS the height-tile downloads. Building now
+            // anyway is how first-burst chunks fossilised on
+            // fallback heights (a tile that misses the 3 s
+            // getTile window silently demotes the chunk to
+            // the parent/bathymetry ladder). Wait — bounded,
+            // on this worker thread — until the terrain
+            // tiles covering this chunk are actually resident.
+            // Warm areas pay nothing (memory hits). If the
+            // deadline expires we still generate (never hang
+            // worldgen), but the chunk is named in the log so
+            // a bad-looking chunk can be convicted from the
+            // log instead of guessed at.
+            try{
+                var dw=getDf();
+                if(dw!=null&&dw.isProjectionLoaded()){
+                    int notReady=dw.awaitTilesForChunk(
+                        ch.getPos().getMinBlockX(),
+                        ch.getPos().getMinBlockZ(),15000L);
+                    if(notReady>0
+                            &&elevWaitDbg.getAndIncrement()<50)
+                        LOGGER.warn("ELEV NOT READY [{},{}]: "
+                            +"{} terrain tile(s) still missing "
+                            +"after 15s — generating with "
+                            +"fallback heights; if this chunk "
+                            +"looks wrong, delete it and let it "
+                            +"regenerate",cx,cz,notReady);}
+            }catch(Exception ignored){}
             generateTerrain(ch);
             assignBiomes(ch);
             markTerrainPlaced(ch);
@@ -3095,6 +3831,8 @@ for (int lx = 0; lx < 16; lx++) {
             List<OhmStructureIndex.OhmStructure>
                 upcoming=new ArrayList<>();
             boolean retry=false;
+            // [TerraStruct] per-source counts for the log
+            int osmN=0, vidaN=0, msftN=0;
             // FAST-TELEPORT FIX: short bounded wait instead of
             // 8s/source. Miss -> appetizer + async retry; the
             // chunk reaches FULL immediately and the swap
@@ -3137,6 +3875,7 @@ for (int lx = 0; lx < 16; lx++) {
                     LOGGER.debug("OSM [{},{}]: {}",
                         cx,cz,e.getMessage());
                     retry=true;}
+                osmN=all.size();
                 // ── TIER 3: VIDA (Google/MS/OSM open buildings) ──
                 // Runs after OSM, before Microsoft. Gap-fill only:
                 // anything overlapping an OSM footprint is dropped.
@@ -3175,6 +3914,7 @@ for (int lx = 0; lx < 16; lx++) {
                     }catch(Exception e){
                         LOGGER.debug("VIDA [{},{}]: {}",
                             cx,cz,e.getMessage());}
+                vidaN=vidaAccepted.size();
                 if(("overture".equals(src)
                         ||"both".equals(src))
                         &&worldConfig.overtureBuildings)
@@ -3260,6 +4000,7 @@ for (int lx = 0; lx < 16; lx++) {
                             "Overture [{},{}]: {}",
                             cx,cz,e.getMessage());
                         retry=true;}
+                msftN=all.size()-osmN-vidaN;
             }
             // ── APPETIZER (generation path — fast-teleport fix)
             // Main sources missed the short budget: plate any
@@ -3304,6 +4045,12 @@ for (int lx = 0; lx < 16; lx++) {
                     placementDuplicateTest(ch.getPos(), all);
                     markDecorationPlaced(ch);
                     markCurrentYear=true;
+                    LOGGER.info(
+                        "[TerraStruct] PLACED chunk "
+                        +"[{},{}] osm={} vida={} "
+                        +"microsoft={} structures={}",
+                        cx,cz,osmN,vidaN,msftN,
+                        all.size());
                 }else{
                     LOGGER.debug(
                         "Placement failed [{},{}]",
@@ -3319,9 +4066,20 @@ for (int lx = 0; lx < 16; lx++) {
                 LOGGER.debug("Async [{},{}]: {}",
                     cx,cz,e.getMessage());}
         }catch(Exception e){
+            // A failed chunk must NEVER be marked
+            // decorated: that buries the hole forever
+            // (nothing ever retries it). Queue an async
+            // retry instead so the chunk can heal.
             LOGGER.error("Struct [{},{}]: {}",
                 cx,cz,e.getMessage());
-            markDecorationPlaced(ch);}
+            try{
+                double[] gc2=getDf().toGeo(
+                    ch.getPos().getMinBlockX()+8,
+                    ch.getPos().getMinBlockZ()+8);
+                if(gc2!=null)
+                    getAsyncManager().queueRetry(
+                        gc2[1],gc2[0],cx,cz);
+            }catch(Exception ignored){}}
         List<OhmStructureIndex.OhmStructure> upcoming=
             upcomingCache.getOrDefault(k,List.of());
         placeWorldCoverVegetation(lvl,ch,upcoming,
@@ -3691,6 +4449,14 @@ for (int lx = 0; lx < 16; lx++) {
                 lvl.setBlock(pos,tgt,3);
             return;}
         // ERA 8: MODERN 1900+
+        // Step 6 (NW(22) evidence: 30% of ALL tops at
+        // Yakutsk were flat TUFF): modern built-up ground
+        // is a patch mix, not a blanket. Paved patches
+        // (55%) become TUFF; open patches — lots, yards,
+        // parks inside the 10 m BUILT_UP pixel — keep
+        // their natural top. Buildings/roads still draw
+        // over everything afterwards.
+        if(patchHash(bx,bz)>=55)return;
         pos.set(bx,sy,bz);
         BlockState cs=lvl.getBlockState(pos);
         if(cs.is(Blocks.GRASS_BLOCK)
@@ -4127,7 +4893,7 @@ for (int lx = 0; lx < 16; lx++) {
                     BlockState s=ch.getBlockState(p);
                     if(s.isAir()||isSafe(s))continue;
                     if(oc){ch.setBlockState(p,
-                        y<=sy?STONE:y<=SL?WATER:AIR,
+                        y<=sy?GRAVEL:y<=SL?WATER:AIR,
                         false);continue;}
                     if(isLava(s)||isPortal(s)
                             ||isGeode(s)){
@@ -4164,6 +4930,16 @@ for (int lx = 0; lx < 16; lx++) {
             ||s.is(Blocks.TALL_SEAGRASS)
             ||s.is(Blocks.KELP)
             ||s.is(Blocks.KELP_PLANT)
+            ||s.is(Blocks.BRAIN_CORAL_BLOCK)
+            ||s.is(Blocks.TUBE_CORAL_BLOCK)
+            ||s.is(Blocks.FIRE_CORAL_BLOCK)
+            ||s.is(Blocks.HORN_CORAL_BLOCK)
+            ||s.is(Blocks.BUBBLE_CORAL_BLOCK)
+            ||s.is(Blocks.BRAIN_CORAL)
+            ||s.is(Blocks.TUBE_CORAL)
+            ||s.is(Blocks.FIRE_CORAL)
+            ||s.is(Blocks.HORN_CORAL)
+            ||s.is(Blocks.BUBBLE_CORAL)
             ||s.is(Blocks.TERRACOTTA)
             ||s.is(Blocks.WHITE_TERRACOTTA)
             ||s.is(Blocks.ORANGE_TERRACOTTA)
@@ -4245,6 +5021,72 @@ for (int lx = 0; lx < 16; lx++) {
             ||s.is(Blocks.POINTED_DRIPSTONE);}
 
     // ── BIOME ASSIGNMENT ──────────────────────────────────────
+    /**
+     * Step 4 shore test — single source of truth, shared by
+     * assignBiomes (beach biome name) and /terracheck (SHORE
+     * verdict): true when (bx,bz) classifies LAND at shore
+     * height with sea water within 12 blocks in any of 8
+     * directions. classify() alone can never answer this
+     * because it never returns COASTLINE.
+     */
+    public boolean isShoreCellPublic(int bx,int bz){
+        try{
+            var d=getDf();
+            if(d==null||!d.isProjectionLoaded())return false;
+            var col=d.classify(bx,bz);
+            if(col.type!=TerraDensityFunctions.TerrainType.LAND)
+                return false;
+            if(col.surfaceY<SL-2||col.surfaceY>SL+8)
+                return false;
+            // Two probe rings (12 + 28 blocks, 8 directions):
+            // wide real sand strips read beach across their
+            // whole width, not just at the wet edge (NW15:
+            // Juhu sand >12 blocks from water kept "desert").
+            int[][] offs={{12,0},{-12,0},{0,12},{0,-12},
+                {12,12},{12,-12},{-12,12},{-12,-12},
+                {28,0},{-28,0},{0,28},{0,-28},
+                {28,28},{28,-28},{-28,28},{-28,-28}};
+            for(int[] o:offs){
+                var nc=d.classify(bx+o[0],bz+o[1]);
+                if(nc.type==TerraDensityFunctions
+                        .TerrainType.OCEAN
+                    ||nc.type==TerraDensityFunctions
+                        .TerrainType.SHALLOW_WATER)
+                    return true;}
+            return false;
+        }catch(Exception e){return false;}}
+
+    // ── CAVES PHASE 1 (2026-11-20) ─────────────────────────
+    // Real-geology caves: see CAVES_PHASE1.md. Config kill
+    // switch cached once (config may be unreadable very
+    // early; default ON).
+    private static Boolean cavesCfgCache;
+    static boolean realCavesEnabled(){
+        if(cavesCfgCache==null){
+            boolean v=true;
+            try{v=net.buildtheearth.terraplusplus.config
+                    .TerraConfig.REAL_CAVES.get();}
+            catch(Exception ignored){}
+            cavesCfgCache=v;}
+        return cavesCfgCache;}
+
+    /** Underground biome for a quart centre: null = keep the
+     *  surface biome. Depth-banded like vanilla: shallow lush,
+     *  mid dripstone, deep dark below Y -32; nothing within
+     *  12 blocks of the surface. */
+    private static Holder<Biome> caveBiomeAt(
+            TerraBiomeProvider bp,int wy,int depth){
+        if(depth<12)return null;
+        if(wy<=-32)
+            return bp.DEEP_DARK!=null?bp.DEEP_DARK
+                :(bp.DRIPSTONE_CAVES!=null?bp.DRIPSTONE_CAVES
+                    :bp.LUSH_CAVES);
+        if(wy<=20)
+            return bp.DRIPSTONE_CAVES!=null
+                ?bp.DRIPSTONE_CAVES:bp.LUSH_CAVES;
+        return bp.LUSH_CAVES!=null?bp.LUSH_CAVES
+            :bp.DRIPSTONE_CAVES;}
+
     private void assignBiomes(ChunkAccess ch){
         try{
             var bp=getTerraBiomes();
@@ -4255,47 +5097,156 @@ for (int lx = 0; lx < 16; lx++) {
             int cmx=ch.getPos().getMinBlockX();
             int cmz=ch.getPos().getMinBlockZ();
             boolean dbg=biomeDbg.getAndIncrement()<3;
+            // ESA BIOME WAIT (NW23): the biome loop below
+            // asks the NON-blocking getClass per quart. On a
+            // cold WorldCover tile every answer is UNKNOWN,
+            // classification falls back to the climate/soil
+            // guess, and the wrong biome is saved forever —
+            // NW(23) has a badlands chunk (ROCKY-soil fallback)
+            // in the middle of savanna neighbours for exactly
+            // this reason. The ESA WAIT in generateTerrain
+            // usually warms the tile first, but its 5 s budget
+            // can expire mid-fetch; give the in-flight fetch
+            // one more bounded chance here, before a single
+            // quart is classified. Warm chunks return at once.
+            try{
+                long bT0=System.currentTimeMillis();
+                long bDeadline=bT0+6000L;
+                int[][] bPts={{8,8},{0,0},{15,0},{0,15},{15,15}};
+                boolean bLoaded=true;
+                for(int[] pt:bPts){
+                    long rem=bDeadline
+                        -System.currentTimeMillis();
+                    if(rem<=0){bLoaded=false;break;}
+                    double[] g=d.toGeo(cmx+pt[0],cmz+pt[1]);
+                    if(g==null||Double.isNaN(g[0])
+                        ||Double.isNaN(g[1]))continue;
+                    if(esa.getClassBlocking(g[1],g[0],rem)
+                        ==EsaWorldCoverIndex
+                            .WorldCoverClass.UNKNOWN)
+                        bLoaded=false;}
+                long bWaited=System.currentTimeMillis()-bT0;
+                if((bWaited>100||!bLoaded)
+                    &&esaBiomeWaitDbg.getAndIncrement()<50)
+                    LOGGER.info("ESA BIOME WAIT [{},{}]: "
+                        +"waited={}ms loaded={} (no fallback "
+                        +"biome fossil)",ch.getPos().x,
+                        ch.getPos().z,bWaited,bLoaded);
+            }catch(Exception ignored){}
+            // ── BIOME SPEED FIX (owner suspicion, proven ──
+            // in code): the world is 4,064 blocks tall =
+            // 254 sections, but a chunk is only 4x4 biome
+            // quarts wide, and a quart's biome depends only
+            // on its (x,z) column. The old loop re-ran the
+            // whole column classification (projection +
+            // elevation + coastline segment scan, plus
+            // isShoreCellPublic's 17 extra classify()
+            // probes) for EVERY section: 254 x 16 quarts x
+            // ~18 classify() calls ≈ 73k classify() calls
+            // per chunk, all repeating the same 16 answers.
+            // At a coast (Juhu: 1,771 coastline segments in
+            // memory) the coastline maths alone benchmarks
+            // at seconds per chunk. Classify the 16 columns
+            // ONCE here; the section loop below only paints
+            // (cave bands still vary by Y, computed from the
+            // one stored column per quart). Side benefit:
+            // one consistent snapshot per chunk — a tile
+            // landing mid-paint can no longer stripe the
+            // biomes vertically.
+            long biomeT0=System.currentTimeMillis();
+            @SuppressWarnings("unchecked")
+            Holder<Biome>[] qBiome=(Holder<Biome>[])
+                new Holder[16];
+            boolean[] qCave=new boolean[16];
+            int[] qSurf=new int[16];
+            boolean[] qOk=new boolean[16];
+            for(int bx=0;bx<4;bx++)
+                for(int bz=0;bz<4;bz++){
+                    int qi=bx*4+bz;
+                    int blockX=cmx+bx*4;
+                    int blockZ=cmz+bz*4;
+                    var col=d.classify(blockX,blockZ);
+                    if(col.type==TerraDensityFunctions
+                            .TerrainType.INVALID)
+                        continue;
+                    double la=col.latitude;
+                    double lo=col.longitude;
+                    double el=col.elevationMeters;
+                    if(Double.isNaN(la)
+                            ||Double.isNaN(lo))
+                        continue;
+                    var wcClass=
+                        esa.getClass(la,lo);
+                    // Step 4: shore detection for the
+                    // biome NAME (shared with /terracheck
+                    // via isShoreCellPublic).
+                    boolean shore=isShoreCellPublic(
+                        blockX,blockZ);
+                    Holder<Biome> bi=
+                        bp.getBiomeForLocation(
+                            la,lo,el,col.type,
+                            wcClass,shore);
+                    if(bi==null)continue;
+                    // Caves Phase 1 (2026-11-20): in
+                    // karst regions, underground biome
+                    // zones replace the surface biome by
+                    // depth. See CAVES_PHASE1.md.
+                    boolean caveZone=realCavesEnabled()
+                        &&(col.type==TerraDensityFunctions
+                                .TerrainType.LAND
+                           ||col.type==TerraDensityFunctions
+                                .TerrainType.COASTLINE)
+                        &&KarstData.isKarst(la,lo);
+                    // MUST be the scaled world surface
+                    // (col.surfaceY), not SL+real metres:
+                    // above 1000 m elevation the unscaled
+                    // value sits hundreds of blocks above
+                    // the ground, so cave biome bands
+                    // leaked onto the surface (NW22:
+                    // Monument Valley surface biome was
+                    // 100% lush_caves).
+                    qBiome[qi]=bi;
+                    qCave[qi]=caveZone;
+                    qSurf[qi]=col.surfaceY;
+                    qOk[qi]=true;
+                    if(dbg&&bx==2&&bz==2)
+                        LOGGER.info(
+                            "BIOME [{},{}] {},{}"
+                            +" {}m {} wc={} -> {}",
+                            ch.getPos().x,
+                            ch.getPos().z,
+                            String.format(
+                                "%.4f",la),
+                            String.format(
+                                "%.4f",lo),
+                            String.format(
+                                "%.1f",el),
+                            col.type,wcClass,bi);}
             for(int si=0;si<ch.getSectionsCount();si++){
                 var sec=ch.getSection(si);
                 var bc=getWB(sec);if(bc==null)continue;
                 for(int bx=0;bx<4;bx++)
                     for(int bz=0;bz<4;bz++){
-                        int blockX=cmx+bx*4;
-                        int blockZ=cmz+bz*4;
-                        var col=d.classify(blockX,blockZ);
-                        if(col.type==TerraDensityFunctions
-                                .TerrainType.INVALID)
-                            continue;
-                        double la=col.latitude;
-                        double lo=col.longitude;
-                        double el=col.elevationMeters;
-                        if(Double.isNaN(la)
-                                ||Double.isNaN(lo))
-                            continue;
-                        var wcClass=
-                            esa.getClass(la,lo);
-                        Holder<Biome> bi=
-                            bp.getBiomeForLocation(
-                                la,lo,el,col.type,
-                                wcClass);
-                        if(bi==null)continue;
-                        for(int by=0;by<4;by++)
-                            bc.set(bx,by,bz,bi);
-                        if(dbg&&bx==2&&bz==2
-                            &&si==ch.getSectionsCount()
-                                /2)
-                            LOGGER.info(
-                                "BIOME [{},{}] {},{}"
-                                +" {}m {} wc={} -> {}",
-                                ch.getPos().x,
-                                ch.getPos().z,
-                                String.format(
-                                    "%.4f",la),
-                                String.format(
-                                    "%.4f",lo),
-                                String.format(
-                                    "%.1f",el),
-                                col.type,wcClass,bi);}}
+                        int qi=bx*4+bz;
+                        if(!qOk[qi])continue;
+                        Holder<Biome> bi=qBiome[qi];
+                        int surfY=qSurf[qi];
+                        for(int by=0;by<4;by++){
+                            Holder<Biome> cell=bi;
+                            if(qCave[qi]){
+                                int wy=ch.getMinBuildHeight()
+                                    +si*16+by*4+2;
+                                Holder<Biome> cb=caveBiomeAt(
+                                    bp,wy,surfY-wy);
+                                if(cb!=null)cell=cb;}
+                            bc.set(bx,by,bz,cell);}}}
+            long biomeMs=System.currentTimeMillis()-biomeT0;
+            if(biomeMs>100
+                &&biomeTimeDbg.getAndIncrement()<50)
+                LOGGER.info("BIOME TIME [{},{}]: {}ms for "
+                    +"{} sections (16 columns classified "
+                    +"once)",ch.getPos().x,ch.getPos().z,
+                    biomeMs,ch.getSectionsCount());
         }catch(Exception e){
             LOGGER.debug("assignBiomes: {}",
                 e.getMessage());}}
@@ -4425,7 +5376,7 @@ for (int lx = 0; lx < 16; lx++) {
         }catch(Exception e){return 0;}}
 
     private BlockState getSurfaceBlock(int bt,
-            double el,double rg){
+            double el,double rg,int x,int z){
         return switch(bt){
             case 1->TerraDensityFunctions
                 .getLandSurfaceBlock(el,1,rg);
@@ -4433,9 +5384,9 @@ for (int lx = 0; lx < 16; lx++) {
                 .getLandSurfaceBlock(el,2,rg);
             case 3->TerraDensityFunctions
                 .getLandSurfaceBlock(el,3,rg);
-            case 4->GRASS;
-            case 5->COARSE_DIRT;
-            case 6->COARSE_DIRT;
+            case 4->wetlandGround(x,z,el);
+            case 5->savannaGround(x,z,el);
+            case 6->shrublandGround(x,z,el);
             case 7->RED_SAND;
             case 9->SAND;
             case 10->TUFF;
@@ -4443,6 +5394,37 @@ for (int lx = 0; lx < 16; lx++) {
                 .defaultBlockState();
             default->TerraDensityFunctions
                 .getLandSurfaceBlock(el,0,rg);};}
+
+    // Step 5 palettes: patch mixes keyed on an 8-block patch
+    // hash, so ground reads as patches of grass/soil — not
+    // per-block confetti, and not one flat colour wall to
+    // wall (savanna and shrubland used to be 100% coarse
+    // dirt; wetland 100% grass).
+    private static int patchHash(int x,int z){
+        int h=TerraDensityFunctions.blockHash(x>>3,z>>3);
+        return ((h%100)+100)%100;}
+
+    private BlockState savannaGround(int x,int z,double el){
+        if(el>=2500)return STONE;
+        int pm=patchHash(x,z);
+        if(el>=1500)return pm<60?COARSE_DIRT:GRASS;
+        return pm<70?GRASS:COARSE_DIRT;}
+
+    private BlockState shrublandGround(int x,int z,double el){
+        if(el>=2500)return STONE;
+        int pm=patchHash(x,z);
+        if(pm<38)return GRASS;
+        if(pm<72)return COARSE_DIRT;
+        if(pm<84)return DIRT;
+        if(pm<94)return RED_SAND;
+        return GRAVEL;}
+
+    private BlockState wetlandGround(int x,int z,double el){
+        if(el>=1500)return COARSE_DIRT;
+        int pm=patchHash(x,z);
+        if(pm<70)return MUD;
+        if(pm<90)return GRASS;
+        return DIRT;}
     // ── UNDERGROUND ───────────────────────────────────────────
     private void ugLava(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -4520,7 +5502,8 @@ for (int lx = 0; lx < 16; lx++) {
                     &&ct!=TerraDensityFunctions
                         .TerrainType.SHALLOW_WATER)
                     continue;
-                if(c[gx][gz].elevationMeters<=WEM)
+                if(c[gx][gz].mappedSea
+                    ||c[gx][gz].elevationMeters<=WEM)
                     continue;
                 int bw=Integer.MIN_VALUE;
                 boolean fw=false;
@@ -4572,7 +5555,8 @@ for (int lx = 0; lx < 16; lx++) {
                     &&ct!=TerraDensityFunctions
                         .TerrainType.SHALLOW_WATER)
                     continue;
-                if(c[gx][gz].elevationMeters<=WEM)
+                if(c[gx][gz].mappedSea
+                    ||c[gx][gz].elevationMeters<=WEM)
                     continue;
                 boolean hon=false;int hs=0,hc=0;
                 for(int dx=-1;dx<=1;dx++)
@@ -4584,7 +5568,8 @@ for (int lx = 0; lx < 16; lx++) {
                             ||nt==TerraDensityFunctions
                                 .TerrainType
                                 .SHALLOW_WATER){
-                            if(c[gx+dx][gz+dz]
+                            if(c[gx+dx][gz+dz].mappedSea
+                                    ||c[gx+dx][gz+dz]
                                     .elevationMeters
                                     <=WEM)hon=true;}
                         else{hs+=h[gx+dx][gz+dz];hc++;}}
@@ -4601,6 +5586,116 @@ for (int lx = 0; lx < 16; lx++) {
                             .InvalidReason.NONE,null);
                 h[gx][gz]=by;os[gx][gz]=by;}}
 
+    /**
+     * Shore shape pass (Step 4 shore-shape fix, NW16): the
+     * painted water edge is the classify grid's sea/land
+     * boundary. When the smooth OSM coastline line is in
+     * memory that boundary is a clean staircase — trust it
+     * (mapped cells flip only as total singles). When it is
+     * absent, the edge is drawn by the ESA 10 m raster + the
+     * elevation contour, whose noise has a ~5-block DEM-pixel
+     * wavelength (measured in the NW16 save: deviation
+     * autocorr +0.82 @ lag1 decaying by lag 8, mean |dev|
+     * 2.1 blocks, NOT chunk-stitched) — the shore comes out
+     * rough and blocky no matter how long COAST WAIT waits
+     * for data that never arrives. Regularise that fallback
+     * edge here: a sea/land cell whose neighbours vote
+     * strongly the other way (5 of 8, or all 4 cardinal)
+     * flips. Features 3+ cells wide (real coves, inlets)
+     * survive; rivers/lakes/below-sea water are never
+     * touched; flips stay in the shore elevation band.
+     * Runs before floor transitions so flipped cells get
+     * normal shore terracing.
+     */
+    private void smoothShoreMask(
+            TerraDensityFunctions.TerrainColumn[][] c,
+            int[][] h,int[][] os,int mb,
+            boolean coastData,int cx,int cz){
+        int flips=0;
+        for(int pass=0;pass<6;pass++){
+            boolean[][] sea=new boolean[G][G];
+            boolean[][] lan=new boolean[G][G];
+            for(int gx=0;gx<G;gx++)
+                for(int gz=0;gz<G;gz++){
+                    var t=c[gx][gz].type;
+                    sea[gx][gz]=t==TerraDensityFunctions
+                            .TerrainType.OCEAN
+                        ||t==TerraDensityFunctions
+                            .TerrainType.SHALLOW_WATER;
+                    lan[gx][gz]=t==TerraDensityFunctions
+                            .TerrainType.LAND
+                        ||t==TerraDensityFunctions
+                            .TerrainType.RIVER_BANK
+                        ||t==TerraDensityFunctions
+                            .TerrainType.LAKE_SHORE
+                        ||t==TerraDensityFunctions
+                            .TerrainType.COASTLINE;}
+            int passFlips=0;
+            for(int gx=1;gx<G-1;gx++)
+                for(int gz=1;gz<G-1;gz++){
+                    var col=c[gx][gz];
+                    boolean isSea=sea[gx][gz];
+                    boolean isLand=col.type
+                        ==TerraDensityFunctions
+                            .TerrainType.LAND;
+                    if(!isSea&&!isLand)continue;
+                    int opp8=0,opp4=0;
+                    for(int dx=-1;dx<=1;dx++)
+                        for(int dz=-1;dz<=1;dz++){
+                            if(dx==0&&dz==0)continue;
+                            boolean o=isSea
+                                ?lan[gx+dx][gz+dz]
+                                :sea[gx+dx][gz+dz];
+                            if(o){opp8++;
+                                if(dx==0||dz==0)opp4++;}}
+                    double el=col.elevationMeters;
+                    boolean vote=opp8>=5||opp4==4;
+                    boolean single=opp8==8;
+                    if(isSea){
+                        if(el<-12.0)continue;
+                        if(!vote&&!single)continue;
+                        if(coastData&&col.mappedSea&&!single)
+                            continue;
+                        int sy=TerraDensityFunctions
+                            .elevMetersToSurfaceY(el,true);
+                        c[gx][gz]=new TerraDensityFunctions
+                            .TerrainColumn(
+                                TerraDensityFunctions
+                                    .TerrainType.LAND,
+                                el,sy,col.latitude,
+                                col.longitude,
+                                TerraDensityFunctions
+                                    .InvalidReason.NONE,null);
+                        h[gx][gz]=sy;os[gx][gz]=sy;
+                        passFlips++;}
+                    else{
+                        if(el>10.0)continue;
+                        if(!vote&&!single)continue;
+                        if(coastData&&col.mappedLand&&!single)
+                            continue;
+                        double oe=el>=-0.5?-5.0:el;
+                        int sy=TerraDensityFunctions
+                            .elevMetersToSurfaceY(oe,false);
+                        c[gx][gz]=new TerraDensityFunctions
+                            .TerrainColumn(
+                                TerraDensityFunctions
+                                    .TerrainType.SHALLOW_WATER,
+                                oe,sy,col.latitude,
+                                col.longitude,
+                                TerraDensityFunctions
+                                    .InvalidReason.NONE,null);
+                        int fl=Math.max(mb+4,Math.min(SL-1,
+                            sy+ofn(cx-B+gx,cz-B+gz,
+                                Math.abs(oe))));
+                        h[gx][gz]=fl;os[gx][gz]=sy;
+                        passFlips++;}}
+            flips+=passFlips;
+            if(passFlips==0)break;}
+        if(flips>0&&shoreSmoothDbg.getAndIncrement()<30)
+            LOGGER.info("SHORE SMOOTH [{},{}]: flipped={} "
+                +"coastData={} (fallback shore regularised)",
+                cx,cz,flips,coastData);}
+
     private boolean[][] oceanBFS(
             TerraDensityFunctions.TerrainColumn[][] c,
             int[][] h){
@@ -4616,7 +5711,8 @@ for (int lx = 0; lx < 16; lx++) {
                         .TerrainType.OCEAN
                     ||t==TerraDensityFunctions
                         .TerrainType.SHALLOW_WATER)
-                    &&c[gx][gz].elevationMeters<=WEM){
+                    &&(c[gx][gz].mappedSea
+                        ||c[gx][gz].elevationMeters<=WEM)){
                     r[gx][gz]=true;v[gx][gz]=true;
                     q.add(new int[]{gx,gz});}}
         while(!q.isEmpty()){
@@ -4649,6 +5745,7 @@ for (int lx = 0; lx < 16; lx++) {
 // Replace the existing prefetch/waterDataAvailable block:
 
         boolean waterDataAvailable=false;
+        boolean coastData=false;
         try{
             double[] gc=d.toGeo(cx+8,cz+8);
             if(gc!=null&&!Double.isNaN(gc[0])
@@ -4662,6 +5759,82 @@ for (int lx = 0; lx < 16; lx++) {
                     // requeues it for authoritative water placement once its
                     // geographic source tile is ready.
                     getAsyncWaterManager().request(cLa,cLo,ch.getPos());
+                    // COAST WAIT: near sea level the land/sea
+                    // decision must come from the coastline AREA,
+                    // not from elevation (the height map reads
+                    // 0m over the sea, which the fallback calls
+                    // LAND — the missing-sea bug). Give the
+                    // coastline tile one bounded chance to land
+                    // before this chunk classifies its columns.
+                    // Inland chunks (elevation outside the band)
+                    // never wait. See COASTLINE_MISSING_SEA.md.
+                    if(!r.getOsmWaterIndex().isTileCached(
+                            r.getOsmWaterIndex()
+                                .getTileKeyPublic(cLa,cLo))
+                        &&ce>-10.0&&ce<10.0){
+                        // SHARED 12 s window (was 3 s per
+                        // chunk; 10 s in NW15-NW22, 2.5 s
+                        // before that): NW(12)/(14) teeth came
+                        // from chunks classified in the first
+                        // seconds, before the coastline tile
+                        // landed — neighbours then used two
+                        // different shorelines and the mix
+                        // fossilised. But NW(23) showed the
+                        // other failure: at 10 s PER CHUNK the
+                        // wait itself became the coast jam —
+                        // every coastal chunk parked a worker
+                        // thread while one shared Overpass
+                        // fetch crawled. The window is now
+                        // shared per tile (getTileBlockingShared):
+                        // the first coastal chunk may wait out
+                        // up to 12 s, later chunks on the same
+                        // tile only wait what is left of that
+                        // window, then fail fast while the fetch
+                        // finishes in the background and
+                        // AsyncWaterManager heals the chunk.
+                        // 12 s is worth spending now because
+                        // OsmWaterIndex races its Overpass
+                        // endpoints (hedged, first answer wins)
+                        // instead of trying them in series, so
+                        // a healthy fetch lands well inside it.
+                        try{r.getOsmWaterIndex()
+                            .getTileBlockingShared(cLa,cLo,12000L);}
+                        catch(Exception ignored){}
+                        if(!r.getOsmWaterIndex().isTileCached(
+                                r.getOsmWaterIndex()
+                                    .getTileKeyPublic(cLa,cLo))
+                            &&coastWaitDbg.getAndIncrement()<20)
+                            LOGGER.info("COAST WAIT [{},{}]: "
+                                +"coastline still not ready "
+                                +"after shared 12s window — this chunk may "
+                                +"get a rough shore (heals on "
+                                +"refresh)",cx,cz);}
+                    // Which witness will draw this shore?
+                    // NW16 save forensics: the rough edge had
+                    // a ~5-block DEM-pixel fingerprint and NO
+                    // chunk stitching (border steps smaller
+                    // than inside steps) — where the smooth
+                    // coastline line is absent, the ESA pixel
+                    // edge + elevation contour draw a noisy
+                    // shore. Record the witness per coastal
+                    // chunk; the shore smoother (below) trusts
+                    // mapped cells only when the line is here.
+                    try{
+                        var owi=r.getOsmWaterIndex();
+                        int segs=owi.coastSegCountAround(
+                                cLa,cLo);
+                        coastData=owi.isTileCached(
+                                owi.getTileKeyPublic(cLa,cLo))
+                            &&segs>0;
+                        if(ce>-10.0&&ce<10.0
+                            &&coastSrcDbg.getAndIncrement()<30)
+                            LOGGER.info("COAST SRC [{},{}]: "
+                                +"centre={} segs={} coastData={}",
+                                cx,cz,
+                                owi.classifyCoastlineMemOnly(
+                                    cLa,cLo),
+                                segs,coastData);
+                    }catch(Exception ignored){}
                     waterDataAvailable = r.getOhmWaterIndex().isTileCached(
                         r.getOhmWaterIndex().getTileKeyPublic(cLa,cLo))
                         || r.getOsmWaterIndex().isTileCached(
@@ -4809,7 +5982,7 @@ for (int lx = 0; lx < 16; lx++) {
                         &&t!=TerraDensityFunctions
                             .TerrainType.SHALLOW_WATER)
                         continue;
-                    if(or[gx][gz])continue;
+                    if(or[gx][gz]||cl.mappedSea)continue;
                     int dy=Math.max(mb+4,Math.min(XY,
                         TerraDensityFunctions
                         .elevMetersToSurfaceY(
@@ -4827,6 +6000,7 @@ for (int lx = 0; lx < 16; lx++) {
                     ht[gx][gz]=dy;osy[gx][gz]=dy;}}
 
         reclassWB(cols,ht,osy,mb);
+        smoothShoreMask(cols,ht,osy,mb,coastData,cx,cz);
         smoothBSW(cols,ht);
         // Terrace both sides of every water boundary. Each horizontal block
         // changes by at most one vertical block: terrain slopes into the
@@ -4854,6 +6028,7 @@ for (int lx = 0; lx < 16; lx++) {
 
         boolean[][] nwf=new boolean[G][G];
         int[][] lwn=new int[G][G];
+        int[][] wsn=new int[G][G];
         for(int gx=1;gx<G-1;gx++)
             for(int gz=1;gz<G-1;gz++){
                 var ct=cols[gx][gz].type;
@@ -4864,7 +6039,7 @@ for (int lx = 0; lx < 16; lx++) {
                     ||ct==TerraDensityFunctions
                         .TerrainType.LAKE_SHORE){
                     int sy=ht[gx][gz];
-                    boolean fw=false;int ln=sy;
+                    boolean fw=false;int ln=sy;int ws=mb;
                     for(int dx=-1;dx<=1;dx++)
                         for(int dz=-1;dz<=1;dz++){
                             if(dx==0&&dz==0)continue;
@@ -4888,9 +6063,113 @@ for (int lx = 0; lx < 16; lx++) {
                                     .TerrainType.OCEAN){
                                 fw=true;
                                 ln=Math.min(ln,
-                                    ht[gx+dx][gz+dz]);}}
+                                    ht[gx+dx][gz+dz]);
+                                // Step 4: remember the
+                                // highest neighbouring water
+                                // SURFACE (sea = SL; rivers and
+                                // lakes keep their own surface
+                                // in osy) so pLand can apply the
+                                // shore rule.
+                                int nws=(nt==
+                                        TerraDensityFunctions
+                                        .TerrainType.OCEAN
+                                    ||nt==
+                                        TerraDensityFunctions
+                                        .TerrainType
+                                        .SHALLOW_WATER)
+                                    ?SL:osy[gx+dx][gz+dz];
+                                if(nws>ws)ws=nws;}}
                     nwf[gx][gz]=fw;
-                    lwn[gx][gz]=ln;}}
+                    lwn[gx][gz]=ln;
+                    wsn[gx][gz]=ws;}}
+
+        // Step 4 v2: shore DISTANCE + nearest-water surface for
+        // every land column (not just the touching column), so
+        // beaches paint a few columns wide instead of a single
+        // blocky line. Water cells: distance 0, own surface.
+        // Relax outward over land (6 passes covers the band).
+        int[][] shd=new int[G][G];
+        int[][] wsf=new int[G][G];
+        for(int gx=0;gx<G;gx++)
+            for(int gz=0;gz<G;gz++){
+                var t=cols[gx][gz].type;
+                if(isTransitionWater(t)){
+                    shd[gx][gz]=0;
+                    wsf[gx][gz]=transitionWaterSurface(
+                        t,osy[gx][gz]);}
+                else{
+                    shd[gx][gz]=99;
+                    wsf[gx][gz]=nwf[gx][gz]
+                        ?wsn[gx][gz]:Integer.MIN_VALUE/2;}}
+        for(int pass=0;pass<6;pass++){
+            boolean any=false;
+            for(int gx=1;gx<G-1;gx++)
+                for(int gz=1;gz<G-1;gz++){
+                    if(shd[gx][gz]==0)continue;
+                    for(int i=0;i<4;i++){
+                        int nx=gx+BDX[i],nz=gz+BDZ[i];
+                        if(shd[nx][nz]+1<shd[gx][gz]
+                            &&wsf[nx][nz]>Integer.MIN_VALUE/4){
+                            shd[gx][gz]=shd[nx][nz]+1;
+                            wsf[gx][gz]=wsf[nx][nz];
+                            any=true;}}}
+            if(!any)break;}
+
+        // ESA WAIT (Step 3 — stop cold-start ground fossilisation,
+        // BIOMES_GROUND_AUDIT P1): ground painting asks
+        // EsaWorldCoverIndex for a class per column through the
+        // NON-blocking getClass. On a cold tile every answer is
+        // UNKNOWN, the column falls back to generic ground, and
+        // the wrong surface is saved forever. The prologue prefetch
+        // only fetches COG headers, not the internal class tiles.
+        // If this chunk has any land to paint, give the in-flight
+        // ESA fetch one bounded chance to land before painting:
+        // sample centre + corners under a shared 5 s deadline
+        // (checked between samples; one in-flight fetch may run
+        // past it while finishing, never an endless stall).
+        // Warm chunks return instantly; pure-ocean chunks (no land
+        // columns) never wait. Same bounded-wait pattern as
+        // COAST WAIT. Painting runs on a worker thread, so waiting
+        // here stalls no player.
+        boolean needEsa=false;
+        for(int gx=0;gx<G&&!needEsa;gx++)
+            for(int gz=0;gz<G;gz++){
+                var t=cols[gx][gz].type;
+                if(t==TerraDensityFunctions.TerrainType.LAND
+                    ||t==TerraDensityFunctions
+                        .TerrainType.RIVER_BANK
+                    ||t==TerraDensityFunctions
+                        .TerrainType.LAKE_SHORE
+                    ||t==TerraDensityFunctions
+                        .TerrainType.COASTLINE){
+                    needEsa=true;break;}}
+        if(needEsa){
+            try{
+                var esa=getWorldCover();
+                long t0=System.currentTimeMillis();
+                long deadline=t0+5000L;
+                int[][] pts={{cx+8,cz+8},{cx,cz},{cx+15,cz},
+                    {cx,cz+15},{cx+15,cz+15}};
+                boolean loaded=true;
+                for(int[] pt:pts){
+                    long rem=deadline
+                        -System.currentTimeMillis();
+                    if(rem<=0){loaded=false;break;}
+                    double[] g=d.toGeo(pt[0],pt[1]);
+                    if(g==null||Double.isNaN(g[0])
+                        ||Double.isNaN(g[1]))continue;
+                    if(esa.getClassBlocking(g[1],g[0],rem)
+                        ==EsaWorldCoverIndex
+                            .WorldCoverClass.UNKNOWN)
+                        loaded=false;}
+                long waited=System.currentTimeMillis()-t0;
+                if((waited>100||!loaded)
+                    &&esaWaitDbg.getAndIncrement()<50)
+                    LOGGER.info("ESA WAIT [{},{}]: waited={}ms "
+                        +"loaded={} (Step 3: real WorldCover "
+                        +"ground, no fossil fallback)",cx,cz,
+                        waited,loaded);
+            }catch(Exception ignored){}}
 
         try{
             for(int lx=0;lx<16;lx++)
@@ -4901,10 +6180,23 @@ for (int lx = 0; lx < 16; lx++) {
                     int sf=ht[gx][gz];
                     boolean nw=nwf[gx][gz];
                     int lw=lwn[gx][gz];
+                    int ws=wsf[gx][gz];
+                    int sh=shd[gx][gz];
+                    // Step 5: local relief (5x5 height range
+                    // of the terraced grid) for the rock rule.
+                    int rk=0;
+                    {int mn=Integer.MAX_VALUE,
+                         mx=Integer.MIN_VALUE;
+                     for(int i2=-2;i2<=2;i2++)
+                        for(int j2=-2;j2<=2;j2++){
+                            int v=ht[gx+i2][gz+j2];
+                            if(v<mn)mn=v;
+                            if(v>mx)mx=v;}
+                     rk=mx-mn;}
                     switch(cl.type){
                         case LAND->pLand(ch,p,bx,bz,
                             sf,cl.elevationMeters,mb,
-                            nw,lw);
+                            nw,lw,ws,sh,rk);
                         case RIVER->pRiver(ch,p,bx,bz,
                             cl,sf,osy[gx][gz],mb);
                         case LAKE->pLake(ch,p,bx,bz,
@@ -4919,7 +6211,7 @@ for (int lx = 0; lx < 16; lx++) {
                         case RIVER_BANK,LAKE_SHORE->
                             pLand(ch,p,bx,bz,sf,
                                 cl.elevationMeters,
-                                mb,nw,lw);
+                                mb,nw,lw,ws,sh,rk);
                         case SHALLOW_WATER,OCEAN->
                             pUW(ch,p,bx,bz,sf,
                                 cl.elevationMeters,mb);
@@ -4927,7 +6219,7 @@ for (int lx = 0; lx < 16; lx++) {
                             pUW(ch,p,bx,bz,sf,-50,mb);
                         case COASTLINE->pLand(ch,p,bx,
                             bz,sf,cl.elevationMeters,
-                            mb,nw,lw);}}}
+                            mb,nw,lw,ws,sh,rk);}}}
         catch(Exception ex){
             LOGGER.error("Chunk [{},{}] FAILED: {}",
                 ch.getPos().x,ch.getPos().z,
@@ -5291,10 +6583,43 @@ for (int lx = 0; lx < 16; lx++) {
     private void pLand(ChunkAccess c,
             BlockPos.MutableBlockPos p,
             int x,int z,int sy,double el,int mb,
-            boolean nw,int lw){
+            boolean nw,int lw,int ws,int shd,int rk){
         int bt=gbt(x,z);
         double rg=bt==2
             ?getDf().calculateRoughness(x,z):0;
+        // STEP 4 SHORE RULE (BIOMES_GROUND_AUDIT: the COASTLINE
+        // biome path is dead — classify never produces it — so
+        // shores are detected here, where true water adjacency
+        // is known): a land column touching water (nw) and
+        // sitting just above its surface (sy vs ws) is a shore.
+        //   frozen (bt=3)        -> sand + the snow layer the
+        //                           snow rule below already adds
+        //   wetland at sea level -> mud (mangrove shore)
+        //   steep or rough coast -> gravel (stony shore)
+        //   otherwise            -> sand (beach)
+        // Dirt paths (bt=11) keep their surface. Only the top
+        // and sub-surface blocks change; deep fill is untouched.
+        BlockState shoreTop=null,shoreSub=null;
+        if(shd>=1&&shd<=4&&ws>mb&&sy>SL-2&&sy-ws>=-1
+            &&sy-ws<=6&&bt!=11){
+            if(bt==3){shoreTop=SAND;shoreSub=SAND;}
+            else if(bt==4&&sy<=SL+3&&shd==1){
+                shoreTop=MUD;shoreSub=MUD;}
+            else{
+                boolean stony=false;
+                if(shd==1){
+                    double srg=bt==2?rg
+                        :getDf().calculateRoughness(x,z);
+                    stony=sy-ws>=5||srg>0.4;}
+                if(stony){shoreTop=GRAVEL;shoreSub=GRAVEL;}
+                else{shoreTop=SAND;shoreSub=SAND;}}
+            if(shoreDbg.getAndIncrement()<20)
+                LOGGER.info("SHORE [{},{}]: {} top sy={} "
+                    +"waterSurface={} bt={} dist={} "
+                    +"(Step 4 shore rule)",
+                    x,z,shoreTop==SAND?"sand"
+                        :shoreTop==MUD?"mud":"stony gravel",
+                    sy,ws,bt,shd);}
         ugLava(c,p,x,z,sy,mb);
         if(nw&&sy-lw>4&&lw>MY+10){
             int ff=Math.max(mb+1,lw-2);
@@ -5312,12 +6637,28 @@ for (int lx = 0; lx < 16; lx++) {
         for(int y=Math.max(mb+1,sy-7);y<=sy-4;y++){
             p.set(x,y,z);
             c.setBlockState(p,db,false);}
-        var sb=TerraDensityFunctions
-            .getSubSurfaceBlock(el,bt,rg);
+        // Step 5: steep/rough ground shows bare rock (gorge
+        // walls, broken slopes) whatever the flat palette
+        // says. rk = height range over the 5x5 around this
+        // column in the terraced height grid (>=6 means a
+        // sustained steep slope). The shore rule above
+        // keeps precedence on beaches; mesa (2), snow (3),
+        // beach (9) and paths (11) keep their own surfaces.
+        boolean rocky=shoreTop==null&&rk>=6
+            &&(bt==0||bt==1||bt==4||bt==5||bt==6||bt==7);
+        BlockState rockTop=bt==1?SANDSTONE
+            :bt==7?Blocks.RED_SANDSTONE.defaultBlockState()
+            :STONE;
+        var sb=shoreSub!=null?shoreSub
+            :rocky?rockTop
+            :TerraDensityFunctions
+                .getSubSurfaceBlock(el,bt,rg);
         for(int y=Math.max(mb+1,sy-3);y<sy;y++){
             p.set(x,y,z);
             c.setBlockState(p,sb,false);}
-        var sf=getSurfaceBlock(bt,el,rg);
+        var sf=shoreTop!=null?shoreTop
+            :rocky?rockTop
+            :getSurfaceBlock(bt,el,rg,x,z);
         p.set(x,sy,z);c.setBlockState(p,sf,false);
         if(sy+1<=XY&&(bt==3||el>4500
                 ||(el>4000&&bt!=1))){
@@ -5359,7 +6700,7 @@ for (int lx = 0; lx < 16; lx++) {
     private void pLand(ChunkAccess c,
             BlockPos.MutableBlockPos p,
             int x,int z,int sy,double el,int mb){
-        pLand(c,p,x,z,sy,el,mb,false,sy);}
+        pLand(c,p,x,z,sy,el,mb,false,sy,sy,99,0);}
 
     private void pRiver(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -5425,8 +6766,18 @@ for (int lx = 0; lx < 16; lx++) {
         for(int y=Math.max(mb+1,fy-3);y<=fy-1;y++){
             p.set(x,y,z);
             c.setBlockState(p,DIRT,false);}
+        // Step 5: varied sea floor (was 100% gravel).
+        // Warm shallow shelf gets sand patches like the
+        // beach continuing underwater; deep floor mixes in
+        // dirt patches. Coral/seagrass logic in pUWD is
+        // untouched (it decorates or replaces this top).
+        int pm=patchHash(x,z);
+        BlockState floorTop;
+        if(dp<60) floorTop=pm<50?SAND:GRAVEL;
+        else if(dp<250) floorTop=pm<25?SAND:GRAVEL;
+        else floorTop=pm<20?DIRT:GRAVEL;
         p.set(x,fy,z);
-        c.setBlockState(p,GRAVEL,false);
+        c.setBlockState(p,floorTop,false);
         int ws=pUWD(c,p,x,z,fy,dp);
         for(int y=ws;y<=SL;y++){
             p.set(x,y,z);

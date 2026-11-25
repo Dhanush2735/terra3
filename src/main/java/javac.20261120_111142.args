@@ -1,0 +1,10 @@
+-encoding
+UTF-8
+-proc:none
+-d
+/tmp/parseout
+net/buildtheearth/terraplusplus/generator/CaveData.java
+net/buildtheearth/terraplusplus/generator/KarstData.java
+net/buildtheearth/terraplusplus/generator/TerraChunkGenerator.java
+net/buildtheearth/terraplusplus/generator/TerraBiomeProvider.java
+net/buildtheearth/terraplusplus/config/TerraConfig.java

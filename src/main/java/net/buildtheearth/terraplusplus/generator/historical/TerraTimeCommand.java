@@ -22,6 +22,7 @@ package net.buildtheearth.terraplusplus.generator.historical;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
 import net.buildtheearth.terraplusplus.generator.TerraChunkGenerator;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -173,6 +174,12 @@ public class TerraTimeCommand {
     // ── SET SCALE ─────────────────────────────────────────────
     private static int setScale(
             CommandSourceStack src, int scale) {
+        if (!TerraWorldConfig.TIMEJUMP_FEATURE_ENABLED) {
+            src.sendFailure(Component.literal(
+                "§c[Terra++] Time system is temporarily "
+                + "disabled."));
+            return 0;
+        }
         TerraTimeManager.setTimeScale(scale);
         src.sendSuccess(
             () -> Component.literal(
@@ -186,6 +193,12 @@ public class TerraTimeCommand {
     // ── TIME JUMP ─────────────────────────────────────────────
     private static int executeTimeJump(
             CommandSourceStack src, int targetYear) {
+        if (!TerraWorldConfig.TIMEJUMP_FEATURE_ENABLED) {
+            src.sendFailure(Component.literal(
+                "§c[Terra++] Time jump is temporarily "
+                + "disabled."));
+            return 0;
+        }
         ServerLevel level = getOverworld();
         if (level == null) {
             src.sendFailure(Component.literal(

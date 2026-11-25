@@ -27,6 +27,20 @@
 //   tile bytes -> gunzip -> hand-parsed MVT (protobuf subset)
 //   -> OsmStructure conversion.
 //
+// Release handling (2026-11 fix): Overture DELETES old
+// releases from this bucket — only the newest few remain.
+// The previously pinned release (2026-08-19.0) began
+// answering HTTP 404 (NoSuchKey, verified live), so every
+// header read failed; and ONE failed read poisoned the
+// theme for the whole session (batch-3: "OVERTURE header
+// FAIL" at every check, 0 tiles served even when armed).
+// Now: the release is DISCOVERED at runtime from the bucket
+// listing (newest tiles/<date>.<n>/ wins, last verified one
+// kept as offline fallback), and a failed header/root read
+// is retryable after a 60 s cooldown instead of permanent.
+// HTTP failures now log their status/exception (rate-limited)
+// instead of vanishing into a null.
+//
 // Design rules (project doctrine):
 //   - bounded blocking only; every network call has timeouts
 //   - missing/failed = PENDING (never cached as empty)
@@ -44,9 +58,12 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -62,11 +79,30 @@ public final class OvertureOsmIndex {
     private static final Logger LOGGER =
         LogManager.getLogger("Terra++OvertureOSM");
 
-    /** Pinned release; bump deliberately after testing. */
-    private static final String RELEASE = "2026-08-19.0";
-    private static final String BASE_URL =
+    /** Bucket host. Releases live under tiles/<release>/ and
+     *  OLD RELEASES ARE DELETED by Overture (only the newest
+     *  few are kept), so the release is discovered at runtime
+     *  — see resolveRelease(). A pinned release rots: the old
+     *  pin 2026-08-19.0 answers HTTP 404 today. */
+    private static final String HOST =
         "https://overturemaps-extras-us-west-2.s3.us-west-2."
-        + "amazonaws.com/tiles/" + RELEASE + "/";
+        + "amazonaws.com";
+    private static final String LIST_URL = HOST
+        + "/?list-type=2&prefix=tiles/&delimiter=/";
+    /** Offline fallback, used only when release discovery
+     *  itself fails AND no previously discovered release was
+     *  stamped on disk. Verified live 2026-11-18: header,
+     *  root dir, leaf hop and Hyderabad z14 tiles (buildings
+     *  + transportation) all read correctly. Bump whenever a
+     *  newer release is verified. */
+    private static final String LAST_KNOWN_RELEASE =
+        "2026-10-21.0";
+    private static final Pattern RELEASE_PATTERN =
+        Pattern.compile(
+            "tiles/(\\d{4}-\\d{2}-\\d{2}\\.\\d+)/");
+    /** After a failed header/root read, wait this long before
+     *  retrying (was: poisoned forever — the batch-3 bug). */
+    private static final long ROOT_RETRY_MS = 60_000L;
 
     private static final int Z = 14;          // native maxzoom
     private static final int HTTP_TIMEOUT_MS = 8000;
@@ -96,10 +132,21 @@ public final class OvertureOsmIndex {
     private static final class ThemeState {
         volatile long rootOff, rootLen, leafOff, tileOff;
         volatile List<long[]> rootDir;   // [tileId, runLen, off, len]
-        volatile boolean failed;
+        volatile int internalComp, tileComp, tileType, maxZoom;
+        /** Last header/root failure time (0 = healthy) plus
+         *  its reason. Retryable after ROOT_RETRY_MS — a
+         *  failure is NEVER permanent (the batch-3 bug was
+         *  exactly that: one 404 poisoned a theme forever). */
+        volatile long failedAtMs;
+        volatile String failReason;
     }
     private final Map<Theme, ThemeState> themes =
         new ConcurrentHashMap<>();
+
+    /** Release resolved for this session (newest discovered,
+     *  or a fallback). Null until first use. */
+    private volatile String release;
+    private final Object releaseLock = new Object();
 
     /** parsed-features cache per (theme,z,x,y) */
     private final ConcurrentHashMap<String,
@@ -113,7 +160,11 @@ public final class OvertureOsmIndex {
     private final ExecutorService dlPool;
 
     private OvertureOsmIndex() {
-        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("overture_osm_" + RELEASE.replace(".", "_"));
+        // Fixed dir name: the release is discovered at runtime
+        // now, so cached tile files carry the release in their
+        // FILE name instead (see loadTile) — a release rotation
+        // then invalidates old tiles automatically.
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("overture_osm");
         boolean ok = false;
         try { Files.createDirectories(dir); ok = true; }
         catch (Exception e) {
@@ -129,7 +180,138 @@ public final class OvertureOsmIndex {
         });
         LOGGER.info("OvertureOsmIndex init (release={}, "
             + "z={}, disk={}) — OSM-derived planet tiles via "
-            + "HTTP range reads", RELEASE, Z, ok);
+            + "HTTP range reads", "auto-discover", Z, ok);
+    }
+
+    /** The release in use, discovering it on first call.
+     *  Discovery = one bucket-listing GET; the newest
+     *  tiles/<date>.<n>/ prefix wins (ISO dates sort
+     *  lexicographically). Overture deletes old releases, so
+     *  anything pinned eventually 404s — that is what killed
+     *  this source in batch 3. On discovery failure: the
+     *  release stamped on disk by a previous session, else
+     *  LAST_KNOWN_RELEASE. Result is cached for the session
+     *  and stamped to disk for offline restarts. Blocking
+     *  (≤10 s) on the very first call only — call it from
+     *  download threads, never the server thread. */
+    public String getRelease() {
+        return resolveRelease();
+    }
+
+    /** Release if already resolved, else a note. Never
+     *  touches the network (safe for /terracheck). */
+    public String getReleaseIfKnown() {
+        String r = release;
+        return r != null ? r
+            : "auto (fallback " + LAST_KNOWN_RELEASE + ")";
+    }
+
+    private String resolveRelease() {
+        String r = release;
+        if (r != null) return r;
+        synchronized (releaseLock) {
+            if (release != null) return release;
+            try {
+                HttpURLConnection c = (HttpURLConnection)
+                    new URL(LIST_URL).openConnection();
+                c.setConnectTimeout(10_000);
+                c.setReadTimeout(10_000);
+                c.setRequestProperty("User-Agent",
+                    "TerraPlusPlus/2.0");
+                if (c.getResponseCode() != 200)
+                    throw new IllegalStateException(
+                        "HTTP " + c.getResponseCode());
+                String xml;
+                try (InputStream is = c.getInputStream()) {
+                    xml = new String(is.readAllBytes(),
+                        StandardCharsets.UTF_8);
+                }
+                Matcher m = RELEASE_PATTERN.matcher(xml);
+                String best = null;
+                while (m.find()) {
+                    String cand = m.group(1);
+                    if (best == null
+                            || cand.compareTo(best) > 0)
+                        best = cand;
+                }
+                if (best == null)
+                    throw new IllegalStateException(
+                        "no tiles/<release>/ in listing");
+                release = best;
+                stampRelease(best);
+                LOGGER.info("OVERTURE release: discovered "
+                    + "newest {} from bucket listing", best);
+            } catch (Exception e) {
+                String stamped = readReleaseStamp();
+                release = stamped != null ? stamped
+                    : LAST_KNOWN_RELEASE;
+                LOGGER.warn("OVERTURE release discovery FAILED"
+                    + " ({}) — using {} {}",
+                    e.getMessage(),
+                    stamped != null ? "disk-stamped" : "last-known",
+                    release);
+            }
+            return release;
+        }
+    }
+
+    private void stampRelease(String rel) {
+        if (!diskOk) return;
+        try {
+            Files.writeString(diskDir.resolve("release.txt"),
+                rel, StandardCharsets.UTF_8);
+        } catch (Exception ignored) { }
+    }
+
+    private String readReleaseStamp() {
+        if (!diskOk) return null;
+        try {
+            Path f = diskDir.resolve("release.txt");
+            if (!Files.exists(f)) return null;
+            String s = Files.readString(f,
+                StandardCharsets.UTF_8).trim();
+            return RELEASE_PATTERN.matcher(
+                "tiles/" + s + "/").find() ? s : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String tileUrl(Theme t) {
+        return HOST + "/tiles/" + resolveRelease() + "/"
+            + t.file + ".pmtiles";
+    }
+
+    /** One-line state summary for logs and /terracheck:
+     *  which release, how many tiles are resident, and each
+     *  appetizer theme's root-directory health. */
+    public String getDiagnostics() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("release=").append(getReleaseIfKnown());
+        sb.append(" cacheTiles=").append(memCache.size());
+        for (Theme t : APPETIZER_THEMES) {
+            ThemeState st = themes.get(t);
+            sb.append(' ').append(t.file).append('=');
+            if (st == null) {
+                sb.append("UNTOUCHED");
+            } else if (st.rootDir != null) {
+                sb.append("ROOT OK (")
+                  .append(st.rootDir.size())
+                  .append(" entries)");
+            } else if (st.failedAtMs != 0) {
+                sb.append("FAILED ")
+                  .append((System.currentTimeMillis()
+                      - st.failedAtMs) / 1000)
+                  .append("s ago (")
+                  .append(st.failReason).append(')');
+            } else {
+                // Root dir is only read when a tile must come
+                // from the network; tiles served from the disk
+                // cache legitimately leave it unfetched.
+                sb.append("ROOT not fetched (disk may serve)");
+            }
+        }
+        return sb.toString();
     }
 
     public void shutdown() {
@@ -307,40 +489,91 @@ public final class OvertureOsmIndex {
     private List<long[]> rootFor(Theme t) {
         ThemeState st = themes.computeIfAbsent(t,
             k -> new ThemeState());
-        if (st.failed) return null;
         if (st.rootDir != null) return st.rootDir;
         synchronized (st) {
             if (st.rootDir != null) return st.rootDir;
+            if (st.failedAtMs != 0
+                    && System.currentTimeMillis() - st.failedAtMs
+                        < ROOT_RETRY_MS)
+                return null; // cooling down; callers plate
+                             // whatever is resident meanwhile
             try {
                 byte[] hdr = httpRange(t, 0, 126);
                 if (hdr == null || hdr.length < 127
-                        || hdr[0] != 'P') {
-                    st.failed = true;
-                    LOGGER.warn("OVERTURE header FAIL "
-                        + "theme={}", t.file);
+                        || hdr[0] != 'P' || hdr[1] != 'M'
+                        || hdr[2] != 'T' || hdr[7] != 3) {
+                    failTheme(st, t, "header unreadable ("
+                        + (hdr == null
+                            ? "no answer / non-206"
+                            : hdr.length + " B, bad magic/version")
+                        + ", release=" + resolveRelease() + ")");
                     return null;
                 }
                 st.rootOff = le64(hdr, 8);
                 st.rootLen = le64(hdr, 16);
                 st.leafOff = le64(hdr, 40);
                 st.tileOff = le64(hdr, 56);
+                st.internalComp = hdr[97] & 0xFF;
+                st.tileComp = hdr[98] & 0xFF;
+                st.tileType = hdr[99] & 0xFF;
+                st.maxZoom = hdr[101] & 0xFF;
+                if (st.tileType != 1
+                        || !decompressible(st.internalComp)
+                        || !decompressible(st.tileComp)) {
+                    failTheme(st, t, "unsupported PMTiles flavour"
+                        + " (tileType=" + st.tileType
+                        + " internalComp=" + st.internalComp
+                        + " tileComp=" + st.tileComp
+                        + "; need MVT + none/gzip)");
+                    return null;
+                }
                 byte[] rootGz = httpRange(t, st.rootOff,
                     st.rootOff + st.rootLen - 1);
                 if (rootGz == null) {
-                    st.failed = true; return null;
+                    failTheme(st, t,
+                        "root directory fetch failed");
+                    return null;
                 }
-                st.rootDir = parseDirectory(gunzip(rootGz));
+                st.rootDir = parseDirectory(
+                    decompress(rootGz, st.internalComp));
+                st.failedAtMs = 0;
+                st.failReason = null;
                 LOGGER.info("OVERTURE root dir theme={}: {} "
-                    + "entries ({} B) — header self-check PASS",
-                    t.file, st.rootDir.size(), st.rootLen);
+                    + "entries ({} B) — header self-check PASS "
+                    + "(release={}, maxzoom={}, tileComp={})",
+                    t.file, st.rootDir.size(), st.rootLen,
+                    resolveRelease(), st.maxZoom, st.tileComp);
                 return st.rootDir;
             } catch (Exception e) {
-                st.failed = true;
-                LOGGER.warn("OVERTURE root dir theme={} "
-                    + "failed: {}", t.file, e.getMessage());
+                failTheme(st, t, e.getClass().getSimpleName()
+                    + ": " + e.getMessage());
                 return null;
             }
         }
+    }
+
+    /** Records a theme failure WITH its reason and arms the
+     *  cooldown. The batch-3 bug was this being permanent and
+     *  reason-less; now the theme heals itself after
+     *  ROOT_RETRY_MS and the log always says why. */
+    private void failTheme(ThemeState st, Theme t,
+            String reason) {
+        st.failedAtMs = System.currentTimeMillis();
+        st.failReason = reason;
+        LOGGER.warn("OVERTURE header FAIL theme={}: {} "
+            + "(retry in {}s; other theme unaffected)",
+            t.file, reason, ROOT_RETRY_MS / 1000);
+    }
+
+    /** PMTiles compression enum: 1=none, 2=gzip (3=brotli and
+     *  4=zstd are not readable with the JDK alone). */
+    private static boolean decompressible(int comp) {
+        return comp == 1 || comp == 2;
+    }
+
+    private static byte[] decompress(byte[] in, int comp)
+            throws Exception {
+        return comp == 2 ? gunzip(in) : in;
     }
 
     /** Loads + parses one tile; caches; null on any failure
@@ -353,8 +586,13 @@ public final class OvertureOsmIndex {
         if (hit != null) return hit;
         try {
             byte[] mvt = null;
+            // Release in the file name: when Overture rotates
+            // releases, tiles cached from the old release are
+            // simply never looked up again (no stale serving,
+            // no manual cache clearing).
             Path f = diskDir.resolve(
-                t.file + "_" + x + "_" + y + ".mvt");
+                resolveRelease() + "_" + t.file + "_"
+                + x + "_" + y + ".mvt");
             if (diskOk && Files.exists(f)
                     && System.currentTimeMillis()
                         - Files.getLastModifiedTime(f)
@@ -375,8 +613,9 @@ public final class OvertureOsmIndex {
                         st.leafOff + e[2],
                         st.leafOff + e[2] + e[3] - 1);
                     if (leafGz == null) return null;
-                    e = findEntry(
-                        parseDirectory(gunzip(leafGz)), tid);
+                    e = findEntry(parseDirectory(
+                        decompress(leafGz, st.internalComp)),
+                        tid);
                 }
                 if (e == null) {
                     // genuinely empty tile (ocean): cache empty
@@ -390,7 +629,7 @@ public final class OvertureOsmIndex {
                 byte[] gz = httpRange(t, st.tileOff + e[2],
                     st.tileOff + e[2] + e[3] - 1);
                 if (gz == null) return null;
-                mvt = gunzip(gz);
+                mvt = decompress(gz, st.tileComp);
                 if (diskOk)
                     try { Files.write(f, mvt); }
                     catch (Exception ex) {
@@ -428,6 +667,9 @@ public final class OvertureOsmIndex {
     private final java.util.concurrent.atomic.AtomicInteger
         emptyLogged =
             new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger
+        httpFailLogged =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private byte[] httpRange(Theme t, long from, long to) {
         // KEEP-ALIVE FIX: never call disconnect() — it closes
@@ -438,7 +680,7 @@ public final class OvertureOsmIndex {
         // request per host pays the handshake.
         try {
             HttpURLConnection c = (HttpURLConnection) new URL(
-                BASE_URL + t.file + ".pmtiles")
+                tileUrl(t))
                 .openConnection();
             c.setConnectTimeout(HTTP_TIMEOUT_MS);
             c.setReadTimeout(HTTP_TIMEOUT_MS);
@@ -446,18 +688,34 @@ public final class OvertureOsmIndex {
                 "bytes=" + from + "-" + to);
             c.setRequestProperty("User-Agent",
                 "TerraPlusPlus/2.0");
-            if (c.getResponseCode() != 206) {
+            int code = c.getResponseCode();
+            if (code != 206) {
                 // drain the error body so the socket is clean
                 // for reuse instead of being torn down
                 try (InputStream es = c.getErrorStream()) {
                     if (es != null) es.readAllBytes();
                 } catch (Exception ignored) { }
+                // Batch-3 lesson: a silent null here cost a
+                // whole debugging round (a 404 looked exactly
+                // like a corrupt header). Log the status,
+                // rate-limited so a dead host can't flood.
+                if (httpFailLogged.incrementAndGet() <= 10)
+                    LOGGER.warn("OVERTURE http FAIL theme={} "
+                        + "bytes={}-{} HTTP {} (release={})",
+                        t.file, from, to, code,
+                        resolveRelease());
                 return null;
             }
             try (InputStream is = c.getInputStream()) {
                 return is.readAllBytes();
             }
         } catch (Exception e) {
+            if (httpFailLogged.incrementAndGet() <= 10)
+                LOGGER.warn("OVERTURE http FAIL theme={} "
+                    + "bytes={}-{} {}: {}",
+                    t.file, from, to,
+                    e.getClass().getSimpleName(),
+                    e.getMessage());
             return null;
         }
     }

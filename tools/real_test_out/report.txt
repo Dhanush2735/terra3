@@ -1,0 +1,7 @@
+WORLD CHECK discover: PASS — 1 region file(s) found
+WORLD CHECK region: PASS — r.0.0.mca: 1024 chunks parsed, 0 failed
+WORLD CHECK surface: WARN — r.0.0.mca: 1024 chunks, surface coverage 94% (245504 columns)
+WORLD CHECK colors: PASS — r.0.0.mca: 1% surface blocks without palette color (render magenta) top:minecraft:mud_bricksx651 minecraft:prismarine_bricksx485 minecraft:repeaterx119
+WORLD CHECK render: PASS — r.0.0.mca: real_test_out/map_r.0.0.png (512x512, y -61..-49)
+WORLD CHECK era: PASS — r.0.0.mca: road-material era census: modern=250  1900s=0  victorian/roman=0  medieval=0 -> dominant: modern
+WORLD CHECK timing: PASS — r.0.0.mca: processed in 1.3s

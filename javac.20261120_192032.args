@@ -1,0 +1,8 @@
+-encoding
+UTF-8
+-XDshouldStop.at=PARSE
+-proc:none
+-d
+/tmp/parseout
+src/main/java/net/buildtheearth/terraplusplus/generator/water/OsmWaterIndex.java
+src/main/java/net/buildtheearth/terraplusplus/generator/TerraChunkGenerator.java

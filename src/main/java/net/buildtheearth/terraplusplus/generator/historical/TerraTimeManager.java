@@ -15,6 +15,8 @@ import net.minecraftforge.server.ServerLifecycleHooks;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import net.buildtheearth.terraplusplus.config.TerraWorldConfig;
+
 import java.io.*;
 import java.nio.file.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -54,6 +56,20 @@ public class TerraTimeManager {
 
     public static void initialize(boolean enabled,
             int scale, int baseYearOverride) {
+        if (!TerraWorldConfig.TIMEJUMP_FEATURE_ENABLED) {
+            // TEMPORARY: timejump feature removed (owner
+            // directive). The world behaves as present day,
+            // so structures are OSM + VIDA + Microsoft only.
+            timeEnabled = false;
+            timeScale   = clampScale(scale);
+            currentYear = java.time.Year.now().getValue();
+            initialized = true;
+            LOGGER.info(
+                "TerraTimeManager: timejump disabled "
+                + "(temporary); year pinned to {}",
+                currentYear);
+            return;
+        }
         timeEnabled = enabled;
         timeScale   = clampScale(scale);
         currentYear = Math.max(MIN_YEAR,
@@ -128,7 +144,8 @@ public class TerraTimeManager {
     }
 
     public static void setTimeEnabled(boolean enabled) {
-        timeEnabled = enabled;
+        timeEnabled = enabled
+            && TerraWorldConfig.TIMEJUMP_FEATURE_ENABLED;
         LOGGER.info("Time system {}",
             enabled ? "enabled" : "disabled");
     }
@@ -241,6 +258,13 @@ public class TerraTimeManager {
                     timeEnabled,
                     System.currentTimeMillis()
                         - savedAt);
+            }
+            if (!TerraWorldConfig.TIMEJUMP_FEATURE_ENABLED) {
+                // TEMPORARY: an old save file must not
+                // resurrect the timejump feature.
+                timeEnabled = false;
+                currentYear =
+                    java.time.Year.now().getValue();
             }
             lastSavedYear  = currentYear;
             lastSavedScale = timeScale;

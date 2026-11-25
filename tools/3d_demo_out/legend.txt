@@ -1,0 +1,9 @@
+    1728  minecraft:grass_block                      rgb(95, 159, 53)  true
+     455  minecraft:black_concrete                   rgb(25, 25, 25)  true
+     323  minecraft:stone_bricks                     rgb(122, 122, 122)  true
+     242  minecraft:water                            rgb(63, 118, 228)  true
+     152  minecraft:oak_planks                       rgb(162, 130, 78)  true
+     121  minecraft:dirt                             rgb(134, 96, 67)  true
+     117  minecraft:bricks                           rgb(150, 97, 83)  true
+      21  minecraft:oak_log                          rgb(102, 81, 50)  true
+      17  minecraft:oak_leaves                       rgb(60, 120, 35)  true

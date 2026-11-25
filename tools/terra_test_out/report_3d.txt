@@ -1,0 +1,20 @@
+WORLD CHECK region: PASS — r.19670.-3950.mca: 456 chunks parsed, 0 failed
+WORLD CHECK region: PASS — r.19670.-3951.mca: 767 chunks parsed, 0 failed
+WORLD CHECK region: PASS — r.19671.-3950.mca: 513 chunks parsed, 0 failed
+WORLD CHECK region: PASS — r.19671.-3951.mca: 861 chunks parsed, 0 failed
+WORLD CHECK region: PASS — r.19670.-3950.mca: 456 chunks parsed, 0 failed
+WORLD CHECK load: PASS — r.19670.-3950.mca: kept 0 blocks (top 64 layers per column)
+WORLD CHECK region: PASS — r.19670.-3951.mca: 767 chunks parsed, 0 failed
+WORLD CHECK load: PASS — r.19670.-3951.mca: kept 2315238 blocks (top 64 layers per column)
+WORLD CHECK region: PASS — r.19671.-3950.mca: 513 chunks parsed, 0 failed
+WORLD CHECK load: PASS — r.19671.-3950.mca: kept 0 blocks (top 64 layers per column)
+WORLD CHECK region: PASS — r.19671.-3951.mca: 861 chunks parsed, 0 failed
+WORLD CHECK load: PASS — r.19671.-3951.mca: kept 0 blocks (top 64 layers per column)
+WORLD CHECK scene: PASS — 2315238 blocks, x 10071328..10071519, y 503..594, z -2022720..-2022529
+WORLD CHECK region: FAIL — r.19670.-3950.mca: only 0 bytes (header needs 8192)
+WORLD CHECK region: PASS — r.19670.-3951.mca: 5 chunks parsed, 0 failed
+WORLD CHECK region: FAIL — r.19671.-3950.mca: only 0 bytes (header needs 8192)
+WORLD CHECK region: PASS — r.19671.-3951.mca: 5 chunks parsed, 0 failed
+WORLD CHECK entities: PASS — 10 entities (minecraft:itemx9, minecraft:spiderx1) -> entities.txt
+WORLD CHECK render: PASS — 5 views written
+WORLD CHECK legend: PASS — legend.txt: 36 blocks, 0.0% auto-coloured (want <=10%)

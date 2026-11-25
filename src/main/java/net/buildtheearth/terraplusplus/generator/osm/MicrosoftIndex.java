@@ -53,6 +53,14 @@ public class MicrosoftIndex {
     private static final int    HTTP_TIMEOUT_MS      = 20000;
     private static final long   TILE_WAIT_MS         = 500;
     private static final int    DL_THREADS           = 3;
+    // Step-2 fix (2026-11): a cold quadkey file is ~53 MB served over
+    // ONE connection (owner-measured 166 s ≈ 0.32 MB/s). Azure honours
+    // Range requests (verified live: Accept-Ranges + Content-Range),
+    // so large files are fetched as DL_PARALLEL_PARTS byte slices in
+    // parallel and stitched — per-connection throttling then no longer
+    // caps the whole download at one flow's speed.
+    private static final int    DL_PARALLEL_PARTS    = 6;
+    private static final long   DL_PARALLEL_MIN_BYTES = 8L * 1024 * 1024;
     private static final int    MAX_CONSECUTIVE_FAILURES = 10;
     private static final long   PAUSE_ON_FAILURES_MS = 60000;
     private static final double OVERLAP_MARGIN       = 0.0005;
@@ -297,6 +305,28 @@ public class MicrosoftIndex {
     // objects. Allow exactly one cold parse at a time process-wide.
     private final java.util.concurrent.Semaphore msftParsePermit =
         new java.util.concurrent.Semaphore(1, true);
+
+    // Batch-3: live download progress. Before this, a quadkey download
+    // was a black box — it logged "Downloading ..." once and then
+    // either a completion line or nothing at all, forever. The batch-2
+    // owner's log showed "started, never finished, no error", which
+    // cannot be diagnosed without knowing whether lines were still
+    // moving. Every download now publishes its line count as it goes.
+    private static final class DownloadProgress {
+        final long startMs = System.currentTimeMillis();
+        volatile int  lines;
+        // Parallel byte-phase progress (compressed bytes), before
+        // the line phase begins. dlBytesTotal=0 = not in byte phase.
+        volatile long dlBytes;
+        volatile long dlBytesTotal;
+        volatile long lastProgressMs = startMs;
+        volatile boolean done;
+        volatile boolean failed;
+    }
+    private final ConcurrentHashMap<String, DownloadProgress> downloadProgress =
+            new ConcurrentHashMap<>();
+    private volatile String lastDownloadSummary =
+            "no download yet this session";
 
     private final ConcurrentHashMap<String, List<MicrosoftBuilding>> msftQuadkeyCache =
             new ConcurrentHashMap<>();
@@ -650,14 +680,28 @@ public class MicrosoftIndex {
                                double minLon, double maxLon) {
         if (!enabled) return;
         Set<Long> keys = getTileKeysForArea(minLat, maxLat, minLon, maxLon);
+        // Step-1 fix (2026-11): fire-and-forget. This used to call
+        // query(), which WAITS up to TILE_WAIT_MS (500 ms) per tile
+        // on the caller's thread — warmup dispatch of ~25 tiles
+        // could stall for seconds AND only started the download as
+        // a side effect. The whole point of prefetching is that the
+        // ~170 s quadkey download runs in parallel with terrain
+        // generation, so just trigger the async fetch and return.
+        int fired = 0;
         for (long key : keys) {
             if (!memCache.containsKey(key)) {
                 int tLatI = (int) (key >> 32);
                 int tLonI = (int) key;
-                query(tLatI * TILE_DEG + TILE_DEG / 2,
+                triggerFetch(key,
+                        tLatI * TILE_DEG + TILE_DEG / 2,
                         tLonI * TILE_DEG + TILE_DEG / 2);
+                fired++;
             }
         }
+        if (fired > 0)
+            LOGGER.info("[TerraStruct] MSFT prefetch: {} tiles "
+                    + "dispatched (quadkey download starts now, "
+                    + "in parallel with generation)", fired);
     }
 
     public int countMissingTiles(double minLat, double maxLat,
@@ -671,6 +715,40 @@ public class MicrosoftIndex {
     // ================================================================
     // STATS
     // ================================================================
+
+    public boolean isIndexLoaded() { return msftIndexLoaded; }
+
+    /**
+     * Plain-words state of the quadkey download, for /terracheck.
+     * "DOWNLOADING ... lines=N ageSec=A sinceProgressSec=P" while a
+     * download runs: N rising between checks = slow but alive; N
+     * frozen while ages grow = genuinely stuck. Otherwise the last
+     * download's summary (completed or FAILED) is reported.
+     */
+    public String getDownloadState() {
+        for (Map.Entry<String, DownloadProgress> e :
+                downloadProgress.entrySet()) {
+            DownloadProgress p = e.getValue();
+            if (!p.done && !p.failed) {
+                long now = System.currentTimeMillis();
+                if (p.dlBytesTotal > 0 && p.lines == 0)
+                    return String.format(
+                            "DOWNLOADING (parallel x%d) quadkey=%s"
+                            + " %.1f/%.1f MB ageSec=%d",
+                            DL_PARALLEL_PARTS, e.getKey(),
+                            p.dlBytes / 1048576.0,
+                            p.dlBytesTotal / 1048576.0,
+                            (now - p.startMs) / 1000);
+                return String.format(
+                        "DOWNLOADING quadkey=%s lines=%d ageSec=%d"
+                        + " sinceProgressSec=%d",
+                        e.getKey(), p.lines,
+                        (now - p.startMs) / 1000,
+                        (now - p.lastProgressMs) / 1000);
+            }
+        }
+        return "idle (" + lastDownloadSummary + ")";
+    }
 
     public boolean isEnabled()     { return enabled; }
     public void setEnabled(boolean e) {
@@ -833,8 +911,14 @@ public class MicrosoftIndex {
             try {
                 msftBuildings = fetchMicrosoftBuildings(centerLat, centerLon,
                         minLat, minLon, maxLat, maxLon);
-            } catch (Exception e) {
-                LOGGER.debug("Microsoft fetch failed: {}", e.getMessage());
+            } catch (Throwable e) {
+                // Batch-3: was debug-level + Exception-only, i.e.
+                // invisible in a normal log. Fetch errors now speak.
+                LOGGER.warn("[TerraStruct] MICROSOFT fetch error"
+                        + " [{},{}]: {} {}",
+                        String.format("%.4f", centerLat),
+                        String.format("%.4f", centerLon),
+                        e.getClass().getSimpleName(), e.getMessage());
             }
         }
         if (msftBuildings == null) {
@@ -857,6 +941,11 @@ public class MicrosoftIndex {
 
         if (allBuildings.isEmpty()) {
             emptyTiles.incrementAndGet();
+            LOGGER.info(
+                    "[TerraStruct] MICROSOFT FETCHED "
+                    + "[{},{}] buildings=0 (empty tile)",
+                    String.format("%.4f", centerLat),
+                    String.format("%.4f", centerLon));
             BuildingTile empty = new BuildingTile(
                     new MicrosoftBuilding[0], true, DataSource.MICROSOFT_ML);
             memCache.put(key, empty);
@@ -878,12 +967,13 @@ public class MicrosoftIndex {
 
         if (diskOk) saveDiskBuildings(key, tile);
 
-        if (dbgCount.get() < 30) {
-            LOGGER.info("MSFT [{},{}]: {} buildings [{}]",
-                    String.format("%.4f", centerLat),
-                    String.format("%.4f", centerLon),
-                    tile.buildings.length, tile.sourceBreakdown());
-        }
+        LOGGER.info(
+                "[TerraStruct] MICROSOFT FETCHED "
+                + "[{},{}] buildings={} [{}]",
+                String.format("%.4f", centerLat),
+                String.format("%.4f", centerLon),
+                tile.buildings.length,
+                tile.sourceBreakdown());
         return tile;
     }
 
@@ -1024,25 +1114,52 @@ public class MicrosoftIndex {
         }
 
         HttpURLConnection conn = null;
+        Path gzTmp = null;
         try {
             LOGGER.info("Downloading Microsoft buildings for quadkey {} ...",
                     quadkey);
-            conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-            conn.setReadTimeout(60000);
-            conn.setRequestProperty("User-Agent", "TerraPlusPlus/2.0");
-            conn.setRequestProperty("Accept-Encoding", "gzip");
+            // Progress exists from the very start so /terracheck sees
+            // the byte phase too (batch-3 created it only once the
+            // line phase began — a stuck byte phase still looked
+            // like "started, nothing happening").
+            DownloadProgress progress = new DownloadProgress();
+            downloadProgress.put(quadkey, progress);
 
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                LOGGER.debug("Microsoft download returned {}", code);
-                return null;
+            InputStream is;
+            boolean isGzipFile;
+            boolean isGzipResponse = false;
+            // Step-2 (2026-11): fetch the compressed file with
+            // parallel byte ranges first; the line loop below then
+            // streams from that local file. The old single flow was
+            // owner-measured at 166 s for this 53 MB file. Any
+            // failure here (no Range support, tiny file, I/O error)
+            // returns null and falls through to the proven
+            // single-connection stream — never worse than before.
+            if (diskOk)
+                gzTmp = downloadQuadkeyGzParallel(url, quadkey,
+                        progress);
+            if (gzTmp != null) {
+                is = Files.newInputStream(gzTmp);
+                isGzipFile = true;
+            } else {
+                conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+                conn.setReadTimeout(60000);
+                conn.setRequestProperty("User-Agent", "TerraPlusPlus/2.0");
+                conn.setRequestProperty("Accept-Encoding", "gzip");
+
+                int code = conn.getResponseCode();
+                if (code != 200) {
+                    LOGGER.debug("Microsoft download returned {}", code);
+                    progress.failed = true;
+                    return null;
+                }
+
+                is = conn.getInputStream();
+                isGzipFile = url.endsWith(".gz");
+                isGzipResponse = "gzip".equalsIgnoreCase(
+                        conn.getContentEncoding());
             }
-
-            InputStream is         = conn.getInputStream();
-            boolean isGzipFile     = url.endsWith(".gz");
-            boolean isGzipResponse = "gzip".equalsIgnoreCase(
-                    conn.getContentEncoding());
 
             BufferedReader reader;
             if (isGzipFile && !isGzipResponse) {
@@ -1065,38 +1182,90 @@ public class MicrosoftIndex {
             final double loLon = minLon - pad, hiLon = maxLon + pad;
 
             List<MicrosoftBuilding> buildings = new ArrayList<>();
-            StringBuilder diskContent = new StringBuilder(1024 * 1024);
+            // Batch-3 fix: stream the file STRAIGHT to a temp file on
+            // disk. The old code appended every one of the ~628k lines
+            // to one StringBuilder, then copied the whole thing with
+            // toString() and wrote it out — hundreds of MB held in the
+            // heap at once, inside a process already holding a
+            // Minecraft world. In both owner sessions the download
+            // then never reached its completion line, and not one
+            // error line appeared either. Streaming keeps memory flat
+            // no matter how large the quadkey file is; the temp file
+            // is renamed only on success, so an interrupted download
+            // can never poison the disk cache.
+            StringBuilder regionContent = new StringBuilder(64 * 1024);
             // Persist a compact local 0.01-degree region sidecar while the
             // full quadkey is already being streamed for the first time.
-            StringBuilder regionContent = new StringBuilder(64 * 1024);
             double regionLat = Math.floor(minLat / MSFT_REGION_DEG) * MSFT_REGION_DEG;
             double regionLon = Math.floor(minLon / MSFT_REGION_DEG) * MSFT_REGION_DEG;
             double regionPad = 0.001;
+            // (DownloadProgress was created before the byte phase,
+            // so both phases report into the same record.)
+            Path tmpFile = diskOk
+                    ? msftCacheDir.resolve(quadkey + ".geojsonl.tmp")
+                    : null;
+            BufferedWriter diskWriter = null;
             String line;
             int lineCount = 0, parsedCount = 0;
-            while ((line = reader.readLine()) != null) {
-                lineCount++;
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                diskContent.append(line).append('\n');
-                if (firstVertexInBox(line, regionLat - regionPad,
-                        regionLat + MSFT_REGION_DEG + regionPad,
-                        regionLon - regionPad,
-                        regionLon + MSFT_REGION_DEG + regionPad))
-                    regionContent.append(line).append('\n');
-                if (!firstVertexInBox(line, loLat, hiLat, loLon, hiLon))
-                    continue;
-                parsedCount++;
-                try {
-                    MicrosoftBuilding b = parseMicrosoftLine(line);
-                    if (b != null) buildings.add(b);
-                } catch (Exception e) {
-                    if (lineCount <= 3)
-                        LOGGER.debug("MSFT parse line {}: {}",
-                                lineCount, e.getMessage());
+            try {
+                if (tmpFile != null)
+                    diskWriter = Files.newBufferedWriter(
+                            tmpFile, StandardCharsets.UTF_8);
+                while ((line = reader.readLine()) != null) {
+                    lineCount++;
+                    if ((lineCount & 0x3FF) == 0) {
+                        progress.lines = lineCount;
+                        progress.lastProgressMs =
+                                System.currentTimeMillis();
+                    }
+                    if (lineCount % 100_000 == 0)
+                        LOGGER.info("[TerraStruct] MICROSOFT downloading"
+                                + " quadkey {}: {} lines read, {}s"
+                                + " elapsed — still moving",
+                                quadkey, lineCount,
+                                (System.currentTimeMillis()
+                                        - progress.startMs) / 1000);
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    if (diskWriter != null) {
+                        diskWriter.write(line);
+                        diskWriter.newLine();
+                    }
+                    if (firstVertexInBox(line, regionLat - regionPad,
+                            regionLat + MSFT_REGION_DEG + regionPad,
+                            regionLon - regionPad,
+                            regionLon + MSFT_REGION_DEG + regionPad))
+                        regionContent.append(line).append('\n');
+                    if (!firstVertexInBox(line, loLat, hiLat, loLon, hiLon))
+                        continue;
+                    parsedCount++;
+                    try {
+                        MicrosoftBuilding b = parseMicrosoftLine(line);
+                        if (b != null) buildings.add(b);
+                    } catch (Exception e) {
+                        if (lineCount <= 3)
+                            LOGGER.debug("MSFT parse line {}: {}",
+                                    lineCount, e.getMessage());
+                    }
                 }
+            } finally {
+                try { reader.close(); } catch (Exception ignored) {}
+                if (diskWriter != null)
+                    try { diskWriter.close(); } catch (Exception ignored) {}
+                // The parallel-downloaded .gz was only a vehicle
+                // for the parse stream (the durable cache is the
+                // decompressed .geojsonl + region sidecars).
+                if (gzTmp != null)
+                    try { Files.deleteIfExists(gzTmp); }
+                    catch (Exception ignored) {}
             }
-            reader.close();
+            progress.lines = lineCount;
+            progress.done = true;
+            progress.lastProgressMs = System.currentTimeMillis();
+            long dlSecs = (System.currentTimeMillis()
+                    - progress.startMs) / 1000;
+            lastDownloadSummary = "quadkey " + quadkey + ": "
+                    + lineCount + " lines in " + dlSecs + "s";
 
             // Cache under a REGION key, not the bare quadkey. The parsed list
             // now covers only the requested window, so storing it as if it
@@ -1106,23 +1275,207 @@ public class MicrosoftIndex {
                     regionCacheKey(quadkey, minLat, minLon), buildings);
             if (diskOk) {
                 try {
-                    Files.writeString(
-                            msftCacheDir.resolve(quadkey + ".geojsonl"),
-                            diskContent.toString(), StandardCharsets.UTF_8);
+                    if (tmpFile != null)
+                        Files.move(tmpFile,
+                                msftCacheDir.resolve(quadkey + ".geojsonl"),
+                                java.nio.file.StandardCopyOption
+                                        .REPLACE_EXISTING);
                     Files.writeString(microsoftRegionFile(quadkey, minLat, minLon),
                             regionContent.toString(), StandardCharsets.UTF_8);
                 } catch (Exception ignored) {}
             }
-            LOGGER.info("MSFT quadkey {}: {} retained, {} of {} lines parsed",
-                    quadkey, buildings.size(), parsedCount, lineCount);
+            LOGGER.info("MSFT quadkey {}: {} retained, {} of {} lines parsed ({}s)",
+                    quadkey, buildings.size(), parsedCount, lineCount,
+                    dlSecs);
             return filterByBbox(buildings, minLat, minLon, maxLat, maxLon);
 
-        } catch (Exception e) {
-            LOGGER.warn("Microsoft download failed for {}: {}",
-                    quadkey, e.getMessage());
+        } catch (Throwable e) {
+            // Batch-3: catch Throwable, not only Exception. A memory
+            // error on the old buffering path is an Error — it slipped
+            // past the old catch, vanished into the async future, and
+            // left NO line in the log: the download simply "never
+            // finished". A failed download must now say so, by name.
+            LOGGER.warn("[TerraStruct] MICROSOFT FAILED quadkey {}:"
+                    + " {} {}",
+                    quadkey, e.getClass().getSimpleName(), e.getMessage());
+            try {
+                Files.deleteIfExists(msftCacheDir.resolve(
+                        quadkey + ".geojsonl.tmp"));
+                Files.deleteIfExists(msftCacheDir.resolve(
+                        quadkey + ".geojsonl.gz.tmp"));
+            } catch (Exception ignored) {}
+            DownloadProgress p = downloadProgress.get(quadkey);
+            if (p != null) {
+                p.failed = true;
+                p.lastProgressMs = System.currentTimeMillis();
+            }
+            lastDownloadSummary = "quadkey " + quadkey + " FAILED: "
+                    + e.getClass().getSimpleName();
             return null;
         } finally {
             net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // PARALLEL QUADKEY DOWNLOAD (step-2 fix, 2026-11)
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Total size of the remote file via a 1-byte Range probe, or
+     * -1 when the host does not answer 206/Content-Range (caller
+     * then uses the single-connection stream).
+     */
+    private long probeQuadkeySize(String url) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(HTTP_TIMEOUT_MS);
+            c.setReadTimeout(HTTP_TIMEOUT_MS);
+            c.setRequestProperty("Range", "bytes=0-0");
+            c.setRequestProperty("User-Agent", "TerraPlusPlus/2.0");
+            if (c.getResponseCode() != 206) return -1;
+            String cr = c.getHeaderField("Content-Range");
+            if (cr != null) {
+                int slash = cr.lastIndexOf('/');
+                if (slash >= 0) {
+                    try {
+                        return Long.parseLong(
+                                cr.substring(slash + 1).trim());
+                    } catch (NumberFormatException ignored) { }
+                }
+            }
+            return -1;
+        } catch (Exception e) {
+            return -1;
+        } finally {
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(c);
+        }
+    }
+
+    /** One byte-range slice → file. False on any failure. */
+    private boolean downloadRangePart(String url, Path part,
+            long start, long end, DownloadProgress progress,
+            java.util.concurrent.atomic.AtomicLong doneBytes) {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(url).openConnection();
+            c.setConnectTimeout(HTTP_TIMEOUT_MS);
+            c.setReadTimeout(60000);
+            c.setRequestProperty("Range",
+                    "bytes=" + start + "-" + end);
+            c.setRequestProperty("User-Agent", "TerraPlusPlus/2.0");
+            if (c.getResponseCode() != 206) return false;
+            try (InputStream in = c.getInputStream();
+                 OutputStream out = Files.newOutputStream(part)) {
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    progress.dlBytes = doneBytes.addAndGet(n);
+                    progress.lastProgressMs =
+                            System.currentTimeMillis();
+                }
+            }
+            return Files.size(part) == (end - start + 1);
+        } catch (Exception e) {
+            return false;
+        } finally {
+            net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(c);
+        }
+    }
+
+    /**
+     * Fetches the complete compressed quadkey file into
+     * {@code <quadkey>.geojsonl.gz.tmp} using parallel HTTP byte
+     * ranges (verified live against this host: Accept-Ranges is
+     * honoured and stitched bytes are identical to the sequential
+     * original). Returns null — caller falls back to the proven
+     * single-connection stream — when the file is small, ranges
+     * are unsupported, or any slice fails. The merged file is
+     * deleted by the caller once its parse stream has closed;
+     * slice files are removed on every path.
+     */
+    private Path downloadQuadkeyGzParallel(String url,
+            String quadkey, DownloadProgress progress) {
+        long total = probeQuadkeySize(url);
+        if (total < DL_PARALLEL_MIN_BYTES) return null;
+        Path merged = msftCacheDir.resolve(
+                quadkey + ".geojsonl.gz.tmp");
+        List<Path> parts = new ArrayList<>();
+        ExecutorService pool = Executors.newFixedThreadPool(
+                DL_PARALLEL_PARTS, r -> {
+                    Thread t = new Thread(r, "Terra++MicrosoftDL");
+                    t.setDaemon(true);
+                    return t;
+                });
+        boolean ok = false;
+        long t0 = System.currentTimeMillis();
+        try {
+            long chunk = (total + DL_PARALLEL_PARTS - 1)
+                    / DL_PARALLEL_PARTS;
+            progress.dlBytesTotal = total;
+            java.util.concurrent.atomic.AtomicLong doneBytes =
+                    new java.util.concurrent.atomic.AtomicLong(0);
+            List<Future<Boolean>> futs = new ArrayList<>();
+            for (int i = 0; i < DL_PARALLEL_PARTS; i++) {
+                long start = (long) i * chunk;
+                if (start >= total) break;
+                long end = Math.min(total - 1, start + chunk - 1);
+                Path part = msftCacheDir.resolve(
+                        quadkey + ".gz.part" + i);
+                parts.add(part);
+                final long fs = start, fe = end;
+                futs.add(pool.submit(() ->
+                        downloadRangePart(url, part, fs, fe,
+                                progress, doneBytes)));
+            }
+            for (Future<Boolean> f : futs)
+                if (!Boolean.TRUE.equals(f.get()))
+                    return null;
+            // Stitch the slices back together, in order.
+            try (OutputStream out = Files.newOutputStream(merged)) {
+                byte[] buf = new byte[1 << 16];
+                for (Path part : parts) {
+                    try (InputStream in = Files.newInputStream(part)) {
+                        int n;
+                        while ((n = in.read(buf)) > 0)
+                            out.write(buf, 0, n);
+                    }
+                }
+            }
+            if (Files.size(merged) != total) {
+                LOGGER.warn("[TerraStruct] MICROSOFT parallel "
+                        + "download quadkey {}: stitched size {} "
+                        + "!= expected {} — falling back",
+                        quadkey, Files.size(merged), total);
+                return null;
+            }
+            long secs = Math.max(1,
+                    (System.currentTimeMillis() - t0) / 1000);
+            LOGGER.info(String.format(
+                    "[TerraStruct] MICROSOFT parallel download "
+                    + "quadkey %s: %.1f MB in %ds (%.2f MB/s, "
+                    + "%d connections) — now parsing",
+                    quadkey, total / 1048576.0, secs,
+                    total / 1048576.0 / secs, futs.size()));
+            ok = true;
+            return merged;
+        } catch (Throwable e) {
+            LOGGER.warn("[TerraStruct] MICROSOFT parallel download"
+                    + " quadkey {} failed ({}: {}) — falling back "
+                    + "to single-connection stream",
+                    quadkey, e.getClass().getSimpleName(),
+                    e.getMessage());
+            return null;
+        } finally {
+            pool.shutdownNow();
+            for (Path p : parts)
+                try { Files.deleteIfExists(p); }
+                catch (Exception ignored) { }
+            if (!ok)
+                try { Files.deleteIfExists(merged); }
+                catch (Exception ignored) { }
         }
     }
 
@@ -1174,6 +1527,12 @@ public class MicrosoftIndex {
 
         double height     = getDouble(props, "height", 0);
         double confidence = getDouble(props, "confidence", 0.85);
+        // The current Microsoft release writes -1.0 for "unknown"
+        // height/confidence (verified against the real quadkey
+        // 123301331 file, 2026-11-18). A negative height is not a
+        // measurement and must not reach the builder as one.
+        if (height < 0)     height = 0;
+        if (confidence < 0) confidence = 0.85;
 
         return new MicrosoftBuilding(
                 coords.toArray(new double[0][]),

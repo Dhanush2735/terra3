@@ -53,6 +53,8 @@ public class OhmWaterIndex {
         30L * 24 * 60 * 60 * 1000;
     private static final int    HTTP_TIMEOUT_MS = 25000;
     private static final long   TILE_WAIT_MS    = 500;
+    // Slow-start cure: failed-fetch memory (see OsmWaterIndex).
+    private static final long   FAIL_TTL_MS     = 30_000L;
     private static final int    DL_THREADS      = 3; // increased from 2
     private static final int    MAX_CONSECUTIVE_FAILURES = 5;
     private static final long   PAUSE_ON_FAILURES_MS = 60000;
@@ -142,6 +144,20 @@ public class OhmWaterIndex {
     private final ConcurrentHashMap<Long,
         CompletableFuture<OhmWaterTile>>
         pending = new ConcurrentHashMap<>();
+    // Tile key -> last failed fetch time (slow-start cure).
+    private final ConcurrentHashMap<Long, Long>
+        failedAt = new ConcurrentHashMap<>();
+
+    private void stampFailure(long key) {
+        if (failedAt.size() > 4096) failedAt.clear();
+        failedAt.put(key, System.currentTimeMillis());
+    }
+
+    private boolean recentlyFailed(long key) {
+        Long t = failedAt.get(key);
+        return t != null
+            && System.currentTimeMillis() - t < FAIL_TTL_MS;
+    }
     private final ExecutorService dlPool;
     private final AtomicInteger totalQueries =
         new AtomicInteger(0);
@@ -237,6 +253,10 @@ public class OhmWaterIndex {
             }
         }
 
+        // Recent failure on record: fail fast instead of
+        // paying (or launching) another doomed fetch round.
+        if (recentlyFailed(key)) return false;
+
         // Not on disk — submit to thread pool
         CompletableFuture<OhmWaterTile> future =
             pending.computeIfAbsent(key,
@@ -247,8 +267,11 @@ public class OhmWaterIndex {
                 maxWaitMs, TimeUnit.MILLISECONDS);
             return r != null && r.valid;
         } catch (TimeoutException e) {
-            // Clean up so future calls can retry
-            pending.remove(key, future);
+            // Slow-start cure: keep the pending entry while
+            // the fetch is still running — dropping it made
+            // the next caller launch a duplicate download.
+            if (future.isDone())
+                pending.remove(key, future);
             return false;
         } catch (Exception e) {
             pending.remove(key, future);
@@ -379,7 +402,15 @@ public class OhmWaterIndex {
         double tileLon =
             Math.floor(lon / TILE_DEG) * TILE_DEG;
         return CompletableFuture.supplyAsync(
-            () -> fetchTile(key, tileLat, tileLon),
+            () -> {
+                OhmWaterTile t =
+                    fetchTile(key, tileLat, tileLon);
+                if (t == null || !t.valid)
+                    stampFailure(key);
+                else
+                    failedAt.remove(key);
+                return t;
+            },
             dlPool);
     }
 

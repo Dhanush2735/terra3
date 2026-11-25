@@ -1,0 +1,387 @@
+{
+  "schema": "javac-args-archive-v1",
+  "archive": "legacy_javac_args.tar.xz",
+  "archive_sha256": "906d785330f8589ff3ec7eb4cae3d3f3f2e8da6191fee509f7a6b94e3c5da289",
+  "files": [
+    {
+      "name": "javac.20260821_195426.args",
+      "size": 75,
+      "sha256": "f4d906d18543562d28a230d6a444862491c7dd0cf24eaab5245b792b53fadc46",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260821_203810.args",
+      "size": 74,
+      "sha256": "5f387482fd26a98e1370ad203fceaab7080c0a57f1f2eade148b743ba13795bc",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260821_204634.args",
+      "size": 74,
+      "sha256": "5f387482fd26a98e1370ad203fceaab7080c0a57f1f2eade148b743ba13795bc",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260821_204745.args",
+      "size": 74,
+      "sha256": "5f387482fd26a98e1370ad203fceaab7080c0a57f1f2eade148b743ba13795bc",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260821_205111.args",
+      "size": 74,
+      "sha256": "5f387482fd26a98e1370ad203fceaab7080c0a57f1f2eade148b743ba13795bc",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_164614.args",
+      "size": 76,
+      "sha256": "11b6f0f376d21ee67b3ecd1ac6c2828990cd823bc37c3f32055cb5ea6bcdfd34",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_173443.args",
+      "size": 71,
+      "sha256": "8d2bc50b5f9959caf36cc5a4bf4ce07fdb88ae165253610b49e2c800ccc6c09a",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_175550.args",
+      "size": 72,
+      "sha256": "29a807f60175525e6e40e25bacfc4ce7871ea0e2dd72b9303766891d6be52542",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_191559.args",
+      "size": 71,
+      "sha256": "102a85678b774e8db8346f9b9c672ff1c6add1a7eab9cd781155b6631606080d",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_192719.args",
+      "size": 71,
+      "sha256": "874b92c9669a9eca32cb0c96ef572a1a84ea7fdb25fed1a75b02207327e84f97",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_192824.args",
+      "size": 72,
+      "sha256": "de874a58ce3a9d3666e74b5e4fc643c142fba7c054efcbd8cf7ce4fd554a4137",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_194521.args",
+      "size": 71,
+      "sha256": "dcb5635d85911be0f791005594d93fb77f73da6392a98894303b482f4b790c65",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_202417.args",
+      "size": 73,
+      "sha256": "99587a7c0e686a7f39b0512893ea7aacf804754e31d794818caaa1a6ef9d61b0",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_203129.args",
+      "size": 72,
+      "sha256": "d5b3be9f546abba79cfa132d47279b479baffab045859b3674633502235c65bb",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260823_203205.args",
+      "size": 72,
+      "sha256": "55a52ca7e2da4311f25b9bf2682863da569ad000b8ca6b117150bf7623c4adc2",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260824_091706.args",
+      "size": 72,
+      "sha256": "e51d3dd02174ec7dcfc3b93ccd549d73327af184d4ecd88c50042a559598d39d",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260824_094948.args",
+      "size": 71,
+      "sha256": "9ac1c598883cd97426ee35354968cc48439d295fae2d4a40ceb80a30442d656c",
+      "mode": 420,
+      "mtime_ns": 1793214160231726808
+    },
+    {
+      "name": "javac.20260824_095131.args",
+      "size": 72,
+      "sha256": "b3e26ef2b89cb04800914027d55299cf6d529cec99dee48cc419077bb9472071",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_105027.args",
+      "size": 70,
+      "sha256": "ed4fd0f67e98a56c038ab88b0d5bfbe443f271471ff17e91c5dd8bed271e1663",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_131425.args",
+      "size": 70,
+      "sha256": "ed4fd0f67e98a56c038ab88b0d5bfbe443f271471ff17e91c5dd8bed271e1663",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_133719.args",
+      "size": 70,
+      "sha256": "ed4fd0f67e98a56c038ab88b0d5bfbe443f271471ff17e91c5dd8bed271e1663",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_134833.args",
+      "size": 70,
+      "sha256": "ed4fd0f67e98a56c038ab88b0d5bfbe443f271471ff17e91c5dd8bed271e1663",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_144614.args",
+      "size": 70,
+      "sha256": "ed4fd0f67e98a56c038ab88b0d5bfbe443f271471ff17e91c5dd8bed271e1663",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_145318.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_163006.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260824_173520.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_184658.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_193410.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_194237.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_194919.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_200333.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260825_201157.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260826_122131.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260826_130426.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260826_204949.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260830_194204.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260830_194245.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260830_200942.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260830_205843.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260830_205948.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260831_184814.args",
+      "size": 100,
+      "sha256": "1f2ea377c9a644e6c54e24b3232ea570d66c495931f1a8bc92339a24473aa883",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260831_201727.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260831_202024.args",
+      "size": 11299,
+      "sha256": "366ffdf6ef92dad7b1e08c60c69087d3b46ac75f9ab51744c5cdeb07ac6ce70a",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260831_204806.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260901_114840.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260901_185810.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260901_190750.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260901_192325.args",
+      "size": 11298,
+      "sha256": "31726c7f6464663b7266c7b94b6de2fd1253c74d7face1faa48c2d31b13922e7",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260901_195304.args",
+      "size": 11370,
+      "sha256": "4dd0228604bc2fcde70a2bb26f3e4adca5f024af5cbe55f4505a6d17028376fd",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260902_132323.args",
+      "size": 11370,
+      "sha256": "2924fb2184b0683826cc17ee9f41358f69d1c9735df8454d440a7ae09a65dff0",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260902_134437.args",
+      "size": 11442,
+      "sha256": "cd417a9411e7df2ac7e5b7e2c1686b993fc09ea383d7322aa8b21ef7677add12",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260902_182353.args",
+      "size": 11512,
+      "sha256": "a770dca3bd525b006253d72b84b30ccfa78d9fbb3f1b3c55d3d3f69754f01191",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260902_193921.args",
+      "size": 11512,
+      "sha256": "c6f2e0657fed83c8485b8d74f54574c947f88c643527543d1aec73c3e506665e",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    },
+    {
+      "name": "javac.20260902_200231.args",
+      "size": 11512,
+      "sha256": "c6f2e0657fed83c8485b8d74f54574c947f88c643527543d1aec73c3e506665e",
+      "mode": 420,
+      "mtime_ns": 1793214160235726808
+    }
+  ],
+  "restore_command": "python r2_wikipedia/archive_javac_args.py restore",
+  "note": "Only historical compiler argument files are archived; current source files and game assets are unchanged."
+}

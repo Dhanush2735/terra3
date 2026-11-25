@@ -142,6 +142,18 @@ public class TerraWorldConfig {
                                     cfg.baseYear,
                                     cfg.ohmEnabled)));
 
+    // ── TEMPORARY FEATURE SWITCH (owner directive) ────────────
+    /**
+     * TEMPORARY: the timejump / historical-year feature is
+     * switched OFF. While this is false, every world config is
+     * forced to timeEnabled=false and ohmEnabled=false, so
+     * structures come only from OSM + VIDA + Microsoft
+     * (present day), with no year filtering and no OHM.
+     * To restore the time feature, set this back to true.
+     * Nothing is deleted.
+     */
+    public static final boolean TIMEJUMP_FEATURE_ENABLED = false;
+
     // ── DEFAULT ───────────────────────────────────────────────
     public static final TerraWorldConfig DEFAULT =
             new TerraWorldConfig(
@@ -250,11 +262,13 @@ public class TerraWorldConfig {
         this.cleanupArtifacts  = cleanupArtifacts;
         this.overtureBuildings = overtureBuildings;
         this.overtureSupplement = overtureSupplement;
-        this.timeEnabled       = timeEnabled;
+        this.timeEnabled       = timeEnabled
+                && TIMEJUMP_FEATURE_ENABLED;
         this.timeScale         = clampTimeScale(timeScale);
         this.baseYear          = Math.max(-3000,
                 Math.min(9999, baseYear));
-        this.ohmEnabled        = ohmEnabled;
+        this.ohmEnabled        = ohmEnabled
+                && TIMEJUMP_FEATURE_ENABLED;
     }
 
     // ── TIME SCALE VALIDATION ─────────────────────────────────

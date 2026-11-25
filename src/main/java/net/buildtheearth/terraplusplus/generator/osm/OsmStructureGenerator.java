@@ -713,6 +713,11 @@ public boolean generateStructuresFromList(
         structures){
     if(structures==null||structures.isEmpty())
         return true;
+    LOGGER.info(
+        "[TerraStruct] PLACING chunk [{},{}] "
+        + "structures={}",
+        chunk.getPos().x, chunk.getPos().z,
+        structures.size());
     if(!isChunkValid(chunk))return false;
 
     int cx=chunk.getPos().getMinBlockX();
@@ -946,9 +951,24 @@ public boolean generateStructuresFromList(
         if(!state.isAir()&&!isWaterBlock(state)){
             while(y+1<=maxY){
                 pos.set(bx,y+1,bz);
-                if(chunk.getBlockState(pos).isAir()
-                    ||isWaterBlock(
-                        chunk.getBlockState(pos)))
+                BlockState above=chunk.getBlockState(pos);
+                if(above.isAir()||isWaterBlock(above))
+                    break;
+                // Never climb a PLACED structure. This also
+                // runs on already-built chunks (the async
+                // placement road, placeSingleBlock): there a
+                // finished building plus the metro deck above
+                // it are one unbroken solid stack, and climbing
+                // it made "ground" the roof — the same building
+                // was built again on the deck and the rail was
+                // stamped on the copy's roof (owner's world
+                // newworld1: stone tower at Secunderabad,
+                // copies at y 599..628 and y 631..661, rail
+                // at y 663). Terrain tops are natural blocks;
+                // climbing them is unchanged.
+                if(isBuildingBlock(above)
+                    ||isRoadBlock(above)
+                    ||isBridgeDeckBlock(above))
                     break;
                 y++;}
             return y;}
@@ -2698,13 +2718,26 @@ public boolean generateStructuresFromList(
                 boolean underBridge=
                     isUnderBridgeZone(
                         lat,lon,bridges);
+                // This road re-runs on chunks the generator
+                // already built. If a building already stands
+                // on this column's terrain ground, never place
+                // another one here — not even a different
+                // source's copy, and not an elevated/station
+                // copy floated to deck height. (Floating-copy
+                // bug, newworld1: same tower placed at ground
+                // and again at deck+32 with rail on its roof.)
                 if(config.buildings
                         &&(!underBridge
-                        ||isTransportationBuilding(s)))
+                        ||isTransportationBuilding(s))
+                        &&!hasBuildingAbove(chunk,pos,
+                            bx,bz,groundY))
                     placeBuilding(chunk,pos,bx,bz,
                         groundY,s,lat,lon,roads,
                         bridges);}
             case BUILDING_PART->{
+                // No already-built guard here: a part is
+                // MEANT to stack on its base building, so a
+                // building below is not proof of duplication.
                 boolean underBridge=
                     isUnderBridgeZone(
                         lat,lon,bridges);

@@ -60,6 +60,17 @@ public class AsyncStructureManager {
     private final ConcurrentHashMap<Long, CompletedResult> completedResults = new ConcurrentHashMap<>();
     private final AtomicInteger totalRetries   = new AtomicInteger(0);
     private final AtomicInteger totalSuccesses = new AtomicInteger(0);
+    // Batch-3: tiles that completed WITHOUT a late/dead optional tier
+    // (see the give-up logic in processRetry). Reported by /terracheck
+    // so "completed" and "completed degraded" are never confused.
+    private final AtomicInteger tilesWithoutMsft = new AtomicInteger(0);
+    private final AtomicInteger tilesWithoutVida = new AtomicInteger(0);
+    /** Bounded tries for the VIDA tier before a tile completes OSM-only. */
+    private static final int VIDA_GIVE_UP_ATTEMPTS = 12;
+    /** Bounded tries for the Microsoft tier before a tile completes
+     *  without it. Microsoft is the lowest, optional gap-fill tier; it
+     *  must never veto the whole tile (batch-3 root fix — see below). */
+    private static final int MSFT_GIVE_UP_ATTEMPTS = 6;
     private final AtomicInteger dbgCount       = new AtomicInteger(0);
 
     private volatile boolean running = true;
@@ -70,6 +81,8 @@ public class AsyncStructureManager {
         final double       tileLon;
         final List<long[]> waitingChunks;
         int     attempts;
+        int     vidaAttempts;
+        int     overtureAttempts;
         long    nextRetryMs;
         long    backoffMs;
         boolean ohmDone;
@@ -184,6 +197,8 @@ public class AsyncStructureManager {
     public int getCompletedCount() { return completedTiles.size(); }
     public int getTotalRetries()   { return totalRetries.get(); }
     public int getTotalSuccesses() { return totalSuccesses.get(); }
+    public int getTilesCompletedWithoutMsft() { return tilesWithoutMsft.get(); }
+    public int getTilesCompletedWithoutVida() { return tilesWithoutVida.get(); }
 
     /**
      * Return the accepted current-year hierarchy result for one chunk bounds,
@@ -316,11 +331,29 @@ public class AsyncStructureManager {
                                 task.tileLat - 0.005, task.tileLat + 0.005,
                                 task.tileLon - 0.005, task.tileLon + 0.005);
                 if (vb == null) {
-                    defer(task);
-                    return;
+                    // Batch-3: late VIDA is normal (cold shard fetch),
+                    // so the tile waits — but not forever. After a
+                    // bounded number of tries spread over minutes the
+                    // tile completes OSM-only instead of never
+                    // completing at all if VIDA's host is down.
+                    if (++task.vidaAttempts >= VIDA_GIVE_UP_ATTEMPTS) {
+                        task.vidaResult = List.of();
+                        task.vidaDone = true;
+                        tilesWithoutVida.incrementAndGet();
+                        LOGGER.warn("[TerraStruct] AsyncStruct tile"
+                                + " [{},{}]: VIDA still not ready after"
+                                + " {} tries — completing WITHOUT VIDA",
+                                String.format("%.4f", task.tileLat),
+                                String.format("%.4f", task.tileLon),
+                                task.vidaAttempts);
+                    } else {
+                        defer(task);
+                        return;
+                    }
+                } else {
+                    task.vidaResult = vb;
+                    task.vidaDone = true;
                 }
-                task.vidaResult = vb;
-                task.vidaDone = true;
             } catch (Exception e) {
                 LOGGER.debug("VIDA stage failed: {}", e.getMessage());
                 defer(task);
@@ -363,8 +396,35 @@ public class AsyncStructureManager {
 
         if (!overtureRequired) task.overtureDone = true;
         if (!task.overtureDone) {
-            defer(task);
-            return;
+            // BATCH-3 ROOT FIX — the dead refill road. Completion used
+            // to require EVERY tier terminal, so Microsoft, the lowest
+            // and purely optional gap-fill tier, vetoed the whole tile
+            // forever while its download never landed. The batch-2 log
+            // proved the result: "OSM retry success" lines fired, yet
+            // successes stayed 0, completedTiles stayed 0, and the
+            // placement queue was never fed — chunks born before their
+            // data arrived were NEVER topped up. (There is exactly one
+            // AsyncStructureManager; the tick handler holds this same
+            // instance, so /terracheck was reading the right counters
+            // all along.) Microsoft now gets a bounded number of tries
+            // across minutes of backoff; after that the tile completes
+            // with OSM+VIDA and Microsoft merely misses this tile.
+            // New chunks still query the Microsoft cache directly at
+            // generation time, so a late download is not wasted.
+            if (++task.overtureAttempts >= MSFT_GIVE_UP_ATTEMPTS) {
+                task.overtureDone = true;
+                tilesWithoutMsft.incrementAndGet();
+                LOGGER.warn("[TerraStruct] AsyncStruct tile [{},{}]:"
+                        + " Microsoft not ready after {} tries —"
+                        + " completing WITHOUT Microsoft (OSM/VIDA"
+                        + " still placed)",
+                        String.format("%.4f", task.tileLat),
+                        String.format("%.4f", task.tileLon),
+                        task.overtureAttempts);
+            } else {
+                defer(task);
+                return;
+            }
         }
 
         // All enabled tiers have now reached terminal source states. Completion
@@ -396,6 +456,7 @@ public class AsyncStructureManager {
                 }
             }
 
+            int osmStageCount = combined.size();
             // ── VIDA tier: after OSM, before Microsoft ──
             // Gap-fill only. Uses geometric overlap because VIDA
             // footprints carry no OSM IDs.
@@ -502,6 +563,8 @@ public class AsyncStructureManager {
                 }
             }
 
+            int msftStageCount = combined.size()
+                    - osmStageCount - vidaAccepted.size();
             completedResults.put(task.tileKey, new CompletedResult(
                     TerraTimeManager.getCurrentYear(), combined));
             if (!combined.isEmpty()) {
@@ -526,10 +589,14 @@ public class AsyncStructureManager {
                     placementQueue.enqueue(chunkX, chunkZ, local,
                             task.tileLat, task.tileLon);
                 }
-                LOGGER.info("AsyncStruct tile [{},{}]: combined={} waiting={} queued={} "
+                LOGGER.info("[TerraStruct] AsyncStruct tile [{},{}]: "
+                                + "osm={} vida={} microsoft={} combined={} "
+                                + "waiting={} queued={} "
                                 + "skipped={} localRefs={}",
                         String.format("%.4f", task.tileLat),
                         String.format("%.4f", task.tileLon),
+                        osmStageCount, vidaAccepted.size(),
+                        msftStageCount,
                         combined.size(), chunks.size(), queuedChunks,
                         skippedChunks, localReferences);
             }

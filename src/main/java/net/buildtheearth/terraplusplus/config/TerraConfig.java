@@ -12,7 +12,15 @@ public class TerraConfig {
     public static final ForgeConfigSpec.BooleanValue ENABLE_TREES;
     public static final ForgeConfigSpec.BooleanValue ENABLE_OSM_BUILDINGS;
     public static final ForgeConfigSpec.IntValue ASYNC_LOADER_THREADS;
-    public static final ForgeConfigSpec.ConfigValue<String> TERRAIN_DATA_URL;
+    // TERRAIN_DATA_URL + MAPTERHORN_ELEVATION removed
+    // 2026-11-20: single elevation source (Mapterhorn).
+    // Later the same day the owner ordered the Y rule
+    // (new book >= Y65, old book <= Y64, transition gap):
+    // the old book's URL is a fixed constant in
+    // TerraDensityFunctions, not a config key, and there
+    // is still no dual-source switch to flip. Existing
+    // config files that carry the removed keys are ignored.
+    public static final ForgeConfigSpec.BooleanValue REAL_CAVES;
     
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -47,9 +55,14 @@ public class TerraConfig {
             .comment("Number of threads for async terrain data loading")
             .defineInRange("asyncLoaderThreads", 4, 1, 16);
         
-        TERRAIN_DATA_URL = builder
-            .comment("Base URL for terrain data tiles")
-            .define("terrainDataUrl", "https://s3.amazonaws.com/elevation-tiles-prod/terrarium");
+        REAL_CAVES = builder
+            .comment("Real-geology caves (Phase 1, 2026-11-20): in karst regions "
+                    + "(WHYMAP/WOKAM carbonate & evaporite rocks) carve worm/tunnel "
+                    + "caves into the subsurface and paint lush/dripstone/deep-dark "
+                    + "underground biomes by depth. Outside karst regions (and "
+                    + "under oceans) there are no caves, matching real geology. "
+                    + "Set false to disable. See CAVES_PHASE1.md.")
+            .define("realCaves", true);
         
         builder.pop();
         

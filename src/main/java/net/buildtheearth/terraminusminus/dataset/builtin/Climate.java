@@ -53,7 +53,11 @@ public abstract class Climate extends AbstractBuiltinDataset implements IntToDou
             if (x >= COLS || x < 0 || y >= ROWS || y < 0) {
                 return -50.0d;
             }
-            return this.data[(x * ROWS + y) << 1];
+            // climate.gz stores interleaved channels per cell:
+            // channel 0 = temperature (degC), channel 1 =
+            // precipitation (mm/year). Reading channel 0 here made
+            // TerraBiomeProvider use temperature as rainfall.
+            return this.data[((x * ROWS + y) << 1) | 1];
         }
     }
 

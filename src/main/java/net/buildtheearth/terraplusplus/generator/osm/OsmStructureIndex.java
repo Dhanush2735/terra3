@@ -1532,13 +1532,13 @@ public class OsmStructureIndex {
                 pending.remove(key);
                 evictIfNeeded();
                 if (diskOk) saveDisk(key, apiJson);
-                if (dbgCount.getAndIncrement() < 20)
-                    LOGGER.info(
-                        "OSM STRUCT [{},{}]:"
-                        + " {} features (api.osm.org)",
-                        String.format("%.4f", minLat),
-                        String.format("%.4f", minLon),
-                        st.structures.length);
+                LOGGER.info(
+                    "[TerraStruct] OSM FETCHED "
+                    + "[{},{}] features={} "
+                    + "(api.osm.org)",
+                    String.format("%.4f", minLat),
+                    String.format("%.4f", minLon),
+                    st.structures.length);
                 return st;
             }
         }
@@ -1652,16 +1652,15 @@ public class OsmStructureIndex {
                     evictIfNeeded();
                     if (diskOk)
                         saveDisk(key, json);
-                    if (dbgCount
-                            .getAndIncrement() < 20)
-                        LOGGER.info(
-                            "OSM STRUCT [{},{}]:"
-                            + " {} features",
-                            String.format(
-                                "%.4f", minLat),
-                            String.format(
-                                "%.4f", minLon),
-                            st.structures.length);
+                    LOGGER.info(
+                        "[TerraStruct] OSM FETCHED "
+                        + "[{},{}] features={} "
+                        + "(overpass)",
+                        String.format(
+                            "%.4f", minLat),
+                        String.format(
+                            "%.4f", minLon),
+                        st.structures.length);
                     return st;
                 } else if (code == 429
                         || code == 504) {
@@ -1699,6 +1698,11 @@ public class OsmStructureIndex {
         // health signal: API AND all Overpass endpoints failed
         // for this tile — OSM is definitively struggling.
         osmLastFailAt = System.currentTimeMillis();
+        LOGGER.warn(
+            "[TerraStruct] OSM FAILED [{},{}] "
+            + "all endpoints failed",
+            String.format("%.4f", minLat),
+            String.format("%.4f", minLon));
         pending.remove(key);
         return StructureTile.FAILED;
     }
@@ -2509,20 +2513,29 @@ public class OsmStructureIndex {
             && !LIFECYCLE_BRIDGE_VALUES.contains(
                 bridgeTagValue.toLowerCase().trim());
 
-        String buildingPart =
-            getTag(tags, "building:part");
-        if (buildingPart != null) {
-            type = StructureType.BUILDING_PART;
-            subType = buildingPart;
-            isArea = true; isPart = true;
+        // OUTLINE WINS: a way can carry BOTH
+        // building=yes and building:part=yes -- the
+        // Charminar (way 238186115) is tagged exactly
+        // like this. Checking building:part first
+        // turned the whole monument into an orphan
+        // part with no building. If a real building
+        // outline tag is present, it IS the building.
+        String buildingTag =
+            getTag(tags, "building");
+        if (buildingTag != null
+                && !"no".equalsIgnoreCase(
+                    buildingTag.trim())) {
+            type = StructureType.BUILDING;
+            subType = buildingTag; isArea = true;
         }
 
         if (type == null) {
-            String building =
-                getTag(tags, "building");
-            if (building != null) {
-                type = StructureType.BUILDING;
-                subType = building; isArea = true;
+            String buildingPart =
+                getTag(tags, "building:part");
+            if (buildingPart != null) {
+                type = StructureType.BUILDING_PART;
+                subType = buildingPart;
+                isArea = true; isPart = true;
             }
         }
 
@@ -3158,6 +3171,15 @@ private String getTag(JsonObject tags,
             StructureTile st = parseResponse(
                 Files.readString(file,
                     StandardCharsets.UTF_8));
+            if (st.valid)
+                LOGGER.info(
+                    "[TerraStruct] OSM DISK "
+                    + "[{},{}] features={}",
+                    String.format("%.4f",
+                        (key >> 32) * TILE_DEG),
+                    String.format("%.4f",
+                        ((int) key) * TILE_DEG),
+                    st.structures.length);
             return st.valid ? st : null;
         } catch (Exception ignored) {
             return null;

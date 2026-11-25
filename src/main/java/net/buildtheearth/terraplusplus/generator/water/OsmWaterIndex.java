@@ -10,6 +10,16 @@
 //   - pending map cleaned up on timeout in getTileBlocking()
 //   - fetchTile() no longer does disk check (done before
 //     submission) — only network fetch + parse + save
+//   - Hedged endpoint racing (raceQuery) + Taiwan endpoint
+//     + shared bounded coast wait (getTileBlockingShared):
+//     JUHU_COAST_SPEED_FIX.md
+//   - Coastline spatial index (CoastGrid): classifyCoastline
+//     no longer scans every segment in 3x3 tiles per point;
+//     it measures only segments in nearby grid cells and
+//     expands until the nearest segment is proven found.
+//     Same answers, far fewer distance computations
+//     (NW28 proved the full scan cost ~137 ms per coastal
+//     chunk at Juhu). See COAST_SCAN_INDEX_FIX.md
 //   - All prior fixes retained
 // ============================================================
 package net.buildtheearth.terraplusplus.generator.water;
@@ -35,16 +45,21 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class OsmWaterIndex {
@@ -59,6 +74,10 @@ public class OsmWaterIndex {
         14L * 24 * 60 * 60 * 1000;
     private static final int    HTTP_TIMEOUT_MS = 20000;
     private static final long   TILE_WAIT_MS    = 500;
+    // Slow-start cure: how long a failed tile fetch is
+    // remembered. Inside this window callers fail fast
+    // instead of relaunching a full fetch round per chunk.
+    private static final long   FAIL_TTL_MS     = 30_000L;
     private static final int    DL_THREADS      = 4; // increased from 2
     private static final int    MAX_CONSECUTIVE_FAILURES = 5;
     // Source-wide pause is temporary: public Overpass outages must never
@@ -68,12 +87,63 @@ public class OsmWaterIndex {
     // Quarantine only that mirror and continue with the other endpoints.
     private static final long   ENDPOINT_4XX_PAUSE_MS = 5 * 60_000L;
     private static final double COASTLINE_BAND_M = 5.0;
+    // Coastline spatial index cell size (~111 m of latitude).
+    // A classification point only measures segments whose
+    // bounding boxes touch its own cell neighbourhood instead
+    // of every segment stored in the surrounding 3x3 tiles.
+    private static final double COAST_GRID_CELL_DEG = 0.001;
+    // Half-size (degrees) of the first search box around a
+    // point (~178 m). The box grows x4 until the nearest
+    // segment is proven found or the tile's whole coastline
+    // extent has been covered.
+    private static final double COAST_GRID_FIRST_DEG = 0.0016;
+    // 3x3 tile visit order for coastline classification:
+    // centre tile first (see classifyCoastline).
+    private static final int[][] COAST_TILE_OFFS = {
+        {0, 0}, {0, -1}, {0, 1}, {-1, 0}, {1, 0},
+        {-1, -1}, {-1, 1}, {1, -1}, {1, 1}};
+    // Hedged endpoint racing: if the first Overpass endpoint
+    // has produced nothing after this long, the SAME query is
+    // launched on the next endpoint in parallel (first 200
+    // wins, losers are disconnected). Kills the old sequential
+    // worst case where a hung endpoint burned a full 20 s read
+    // timeout before the next endpoint was even tried (NW24:
+    // real batches at 39-66 s near Juhu, far past the 3 s
+    // COAST WAIT, so shores fossilised from the fallback).
+    private static final long   HEDGE_MS        = 6000L;
+    private static final ExecutorService RACE_POOL =
+        Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "Terra++OSM-Race");
+            t.setDaemon(true);
+            return t;
+        });
 
     private static final String[] OVERPASS_ENDPOINTS = {
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
+        // Taiwan (NCHC) — global coverage per the OSM wiki and
+        // geographically the closest public instance to India,
+        // where overpass-api.de/kumi routinely take 39-66 s.
+        "https://overpass.nchc.org.tw/api/interpreter",
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
     };
+
+    // ── COASTLINE FALLBACK DOOR (official OSM API) ────────────
+    // The open sea exists only as coastline ways, and Overpass
+    // is chronically overloaded (502/timeout) in some networks.
+    // When every Overpass endpoint fails, coastline segments are
+    // fetched from api.openstreetmap.org map.json instead — the
+    // door OsmStructureIndex already proves alive. Coastline
+    // only: water polygons still come from Overpass when it
+    // answers. See COASTLINE_MISSING_SEA.md.
+    private static final String OSM_API_URL =
+        "https://api.openstreetmap.org/api/0.6/map.json?bbox=";
+    private static final long OSM_API_SPACING_MS = 300;
+    private static final Object OSM_API_GATE = new Object();
+    private static long osmApiLastCall = 0;
+    private static volatile long osmApiDownUntil = 0;
+    private static final AtomicInteger osmApiFails =
+        new AtomicInteger();
 
     // ── RATE LIMITERS ─────────────────────────────────────────
     // One token bucket per endpoint — allows parallel fetches
@@ -132,6 +202,265 @@ public class OsmWaterIndex {
             double dl = (lat2 - lat1) * mLat;
             double dn = (lon2 - lon1) * mLon;
             return Math.sqrt(dl * dl + dn * dn);
+        }
+    }
+
+    // ── COASTLINE SPATIAL INDEX ─────────────────────────────
+    // NW28 (in-game, Juhu) proved the beach slowness is this
+    // class re-measuring EVERY coastline segment in the 3x3
+    // tile neighbourhood for EVERY classified point: ~32 us
+    // per point, ~137 ms of pure classification per coastal
+    // chunk, re-paid by every chunk along a shore. The old
+    // mightBeNear(lat, lon, 0.5) filter was 0.5 DEGREES wide
+    // (~55 km), so it filtered out almost nothing.
+    //
+    // CoastGrid files each segment of one tile into the grid
+    // cells its bounding box touches. A query gathers only
+    // the cells overlapped by a small box around the point,
+    // then grows the box (x4) until either the whole coastline
+    // extent of the tile was covered or the best distance
+    // found is smaller than anything outside the box could
+    // possibly be (box half-size converted to metres with the
+    // most poleward latitude in play, i.e. a safe lower
+    // bound). The nearest segment — and therefore the
+    // LAND/OCEAN/COASTLINE answer — is exactly the one the
+    // old full scan would have found.
+    //
+    // Segments whose bounding box touches too many cells
+    // (very long straight ways) go to a small "big" list that
+    // is always measured; there are only ever a few of those.
+    private static final class CoastGrid {
+        final CoastlineSegment[] segs;
+        final double minLat, maxLat, minLon, maxLon, cellDeg;
+        final int nLat, nLon;
+        final int[][] cells;   // [latCell * nLon + lonCell]
+        final int[] big;       // always-measured segment idx
+        final int[] seen;      // per-segment gather stamp
+        final AtomicInteger seenSeq = new AtomicInteger();
+
+        CoastGrid(CoastlineSegment[] segs,
+                double minLat, double maxLat,
+                double minLon, double maxLon,
+                double cellDeg, int nLat, int nLon,
+                int[][] cells, int[] big) {
+            this.segs    = segs;
+            this.minLat  = minLat;  this.maxLat = maxLat;
+            this.minLon  = minLon;  this.maxLon = maxLon;
+            this.cellDeg = cellDeg;
+            this.nLat    = nLat;    this.nLon   = nLon;
+            this.cells   = cells;   this.big    = big;
+            this.seen    = new int[segs.length];
+        }
+
+        int nextMark() {
+            int m = seenSeq.incrementAndGet();
+            if (m == Integer.MAX_VALUE) {
+                synchronized (this) {
+                    Arrays.fill(seen, 0);
+                    seenSeq.set(1);
+                    m = 1;
+                }
+            }
+            return m;
+        }
+    }
+
+    /** Mutable nearest-segment result for one tile query. */
+    private static final class Nearest {
+        double dist   = Double.MAX_VALUE;
+        double signed = 0;
+        boolean found = false;
+        // Conservative metres-per-degree-longitude lower-bound
+        // factor for this query (most poleward latitude in
+        // play), set by nearestCoastInTile before gathering.
+        double mPerDegLonLB = 111320.0;
+    }
+
+    private static int coastCellIdx(double v, double min,
+            double cellDeg, int n) {
+        int i = (int) Math.floor((v - min) / cellDeg);
+        return i < 0 ? 0 : (i >= n ? n - 1 : i);
+    }
+
+    private static CoastGrid buildCoastGrid(
+            CoastlineSegment[] segs) {
+        double mnLat = Double.MAX_VALUE,
+               mxLat = -Double.MAX_VALUE,
+               mnLon = Double.MAX_VALUE,
+               mxLon = -Double.MAX_VALUE;
+        for (CoastlineSegment s : segs) {
+            if (s.minLat < mnLat) mnLat = s.minLat;
+            if (s.maxLat > mxLat) mxLat = s.maxLat;
+            if (s.minLon < mnLon) mnLon = s.minLon;
+            if (s.maxLon > mxLon) mxLon = s.maxLon;
+        }
+        double spanLat = Math.max(0, mxLat - mnLat);
+        double spanLon = Math.max(0, mxLon - mnLon);
+        // Cap the grid at ~48x48 cells however large the
+        // stored geometry is; never finer than ~278 m.
+        double cell = Math.max(COAST_GRID_CELL_DEG,
+            Math.max(spanLat, spanLon) / 48.0);
+        int nLat = Math.max(1,
+            (int) Math.ceil(spanLat / cell));
+        int nLon = Math.max(1,
+            (int) Math.ceil(spanLon / cell));
+
+        List<List<Integer>> tmp = new ArrayList<>(nLat * nLon);
+        for (int i = 0; i < nLat * nLon; i++)
+            tmp.add(new ArrayList<>());
+        List<Integer> bigList = new ArrayList<>();
+        for (int i = 0; i < segs.length; i++) {
+            CoastlineSegment s = segs[i];
+            int la0 = coastCellIdx(s.minLat, mnLat, cell, nLat);
+            int la1 = coastCellIdx(s.maxLat, mnLat, cell, nLat);
+            int lo0 = coastCellIdx(s.minLon, mnLon, cell, nLon);
+            int lo1 = coastCellIdx(s.maxLon, mnLon, cell, nLon);
+            long cellCount = (long) (la1 - la0 + 1)
+                           * (lo1 - lo0 + 1);
+            if (cellCount > 1024) {
+                bigList.add(i);
+                continue;
+            }
+            for (int la = la0; la <= la1; la++)
+                for (int lo = lo0; lo <= lo1; lo++)
+                    tmp.get(la * nLon + lo).add(i);
+        }
+        int[][] cells = new int[nLat * nLon][];
+        for (int i = 0; i < cells.length; i++) {
+            List<Integer> l = tmp.get(i);
+            int[] a = new int[l.size()];
+            for (int j = 0; j < a.length; j++) a[j] = l.get(j);
+            cells[i] = a;
+        }
+        int[] big = new int[bigList.size()];
+        for (int i = 0; i < big.length; i++)
+            big[i] = bigList.get(i);
+        return new CoastGrid(segs, mnLat, mxLat, mnLon, mxLon,
+            cell, nLat, nLon, cells, big);
+    }
+
+    /** Lazily built (once per tile), then read-only. */
+    private static CoastGrid coastGrid(WaterTile tile) {
+        CoastGrid g = tile.coastGrid;
+        if (g != null) return g;
+        synchronized (tile) {
+            if (tile.coastGrid == null)
+                tile.coastGrid =
+                    buildCoastGrid(tile.coastline);
+            return tile.coastGrid;
+        }
+    }
+
+    private static void considerSeg(CoastGrid g, int idx,
+            int mark, double lat, double lon, Nearest out) {
+        if (g.seen[idx] == mark) return;
+        g.seen[idx] = mark;
+        CoastlineSegment s = g.segs[idx];
+        if (out.found) {
+            // Cheap rejection: the segment lies inside its
+            // bounding box, so if even the box is farther
+            // than the best distance so far, the segment
+            // cannot win — skip the exact (trig) distance.
+            double dLatDeg = lat < s.minLat ? s.minLat - lat
+                : (lat > s.maxLat ? lat - s.maxLat : 0);
+            double dLonDeg = lon < s.minLon ? s.minLon - lon
+                : (lon > s.maxLon ? lon - s.maxLon : 0);
+            if (dLatDeg > 0 || dLonDeg > 0) {
+                double mLat = dLatDeg * 111320.0;
+                double mLon = dLonDeg * out.mPerDegLonLB;
+                if (mLat * mLat + mLon * mLon
+                        >= out.dist * out.dist)
+                    return;
+            }
+        }
+        double signed = s.signedDistMeters(lat, lon);
+        double d = Math.abs(signed);
+        if (d < out.dist) {
+            out.dist   = d;
+            out.signed = signed;
+            out.found  = true;
+        }
+    }
+
+    /** Measure every not-yet-measured segment that could lie
+     *  within the box lat/lon +/- rDeg of the point. */
+    private static void gatherCoast(CoastGrid g,
+            double lat, double lon, double rDeg,
+            int mark, Nearest out) {
+        for (int idx : g.big)
+            considerSeg(g, idx, mark, lat, lon, out);
+        if (lat + rDeg < g.minLat || lat - rDeg > g.maxLat
+                || lon + rDeg < g.minLon
+                || lon - rDeg > g.maxLon)
+            return;
+        int la0 = coastCellIdx(lat - rDeg,
+            g.minLat, g.cellDeg, g.nLat);
+        int la1 = coastCellIdx(lat + rDeg,
+            g.minLat, g.cellDeg, g.nLat);
+        int lo0 = coastCellIdx(lon - rDeg,
+            g.minLon, g.cellDeg, g.nLon);
+        int lo1 = coastCellIdx(lon + rDeg,
+            g.minLon, g.cellDeg, g.nLon);
+        for (int la = la0; la <= la1; la++)
+            for (int lo = lo0; lo <= lo1; lo++)
+                for (int idx : g.cells[la * g.nLon + lo])
+                    considerSeg(g, idx, mark, lat, lon, out);
+    }
+
+    /** Exact nearest coastline segment of one tile — the same
+     *  segment the old full scan would have picked. Returns
+     *  null when this tile cannot beat limitDist (the caller's
+     *  best-so-far across tiles), which lets far tiles be
+     *  skipped with one bounding-box check. */
+    private static Nearest nearestCoastInTile(WaterTile tile,
+            double lat, double lon, double limitDist) {
+        CoastGrid g = coastGrid(tile);
+        if (g == null || g.segs.length == 0) return null;
+        // Most poleward latitude in play = smallest
+        // metres-per-degree-longitude = safe lower bounds.
+        double maxAbsLat = Math.max(Math.abs(lat),
+            Math.max(Math.abs(g.minLat), Math.abs(g.maxLat)));
+        double mPerDeg = 111320.0 * Math.min(1.0,
+            Math.cos(Math.toRadians(
+                Math.min(89.0, maxAbsLat))));
+        // Whole-tile rejection: if even this tile's coastline
+        // bounding box is farther than the caller's best, no
+        // segment in it can win.
+        double bbLatDeg = lat < g.minLat ? g.minLat - lat
+            : (lat > g.maxLat ? lat - g.maxLat : 0);
+        double bbLonDeg = lon < g.minLon ? g.minLon - lon
+            : (lon > g.maxLon ? lon - g.maxLon : 0);
+        if (bbLatDeg > 0 || bbLonDeg > 0) {
+            double a = bbLatDeg * 111320.0;
+            double b = bbLonDeg * mPerDeg;
+            if (a * a + b * b >= limitDist * limitDist)
+                return null;
+        }
+        Nearest out = new Nearest();
+        out.mPerDegLonLB = mPerDeg;
+        int mark = g.nextMark();
+        double rDeg = COAST_GRID_FIRST_DEG;
+        while (true) {
+            gatherCoast(g, lat, lon, rDeg, mark, out);
+            if (out.found && out.dist <= COASTLINE_BAND_M)
+                return out;   // on the line; cannot be beaten
+            if (out.found) {
+                // Nothing outside the box can be closer than
+                // the box half-size in metres.
+                if (out.dist < rDeg * mPerDeg) return out;
+            } else if (rDeg * mPerDeg >= limitDist) {
+                // Nothing in the box, and everything outside
+                // it is already farther than the caller's
+                // best — this tile cannot contribute.
+                return null;
+            }
+            boolean covers = lat - rDeg <= g.minLat
+                && lat + rDeg >= g.maxLat
+                && lon - rDeg <= g.minLon
+                && lon + rDeg >= g.maxLon;
+            if (covers) return out.found ? out : null;
+            rDeg *= 4.0;
+            if (rDeg > 8.0) return out.found ? out : null;
         }
     }
 
@@ -426,6 +755,9 @@ public class OsmWaterIndex {
         public final CoastlineSegment[] coastline;
         public final boolean valid;
         public final long fetchTimeMs;
+        // Lazily built coastline spatial index (CoastGrid);
+        // built once on first classification of this tile.
+        volatile CoastGrid coastGrid;
 
         public WaterTile(WaterFeature[] features,
                 CoastlineSegment[] coastline,
@@ -459,6 +791,21 @@ public class OsmWaterIndex {
     private final ConcurrentHashMap<Long,
         CompletableFuture<WaterTile>>
         pending = new ConcurrentHashMap<>();
+    // Tile key -> last failed fetch time (slow-start cure:
+    // anti-stampede memory, see FAIL_TTL_MS).
+    private final ConcurrentHashMap<Long, Long>
+        failedAt = new ConcurrentHashMap<>();
+
+    private void stampFailure(long key) {
+        if (failedAt.size() > 4096) failedAt.clear();
+        failedAt.put(key, System.currentTimeMillis());
+    }
+
+    private boolean recentlyFailed(long key) {
+        Long t = failedAt.get(key);
+        return t != null
+            && System.currentTimeMillis() - t < FAIL_TTL_MS;
+    }
     private final ExecutorService dlPool;
     private final AtomicInteger endpointIdx =
         new AtomicInteger(0);
@@ -535,28 +882,34 @@ public class OsmWaterIndex {
         boolean anyLoaded = false;
         boolean anyCoast  = false;
 
-        for (int dlat = -1; dlat <= 1; dlat++)
-            for (int dlon = -1; dlon <= 1; dlon++) {
+        // Centre tile first: it normally holds the nearest
+        // segment, and the best distance found there lets the
+        // remaining tiles be skipped by bounding box.
+        tiles:
+        for (int[] off : COAST_TILE_OFFS) {
                 long key = tileKey(
-                    lat + dlat * TILE_DEG,
-                    lon + dlon * TILE_DEG);
+                    lat + off[0] * TILE_DEG,
+                    lon + off[1] * TILE_DEG);
                 WaterTile tile = memCache.get(key);
                 if (tile == null || !tile.valid)
                     continue;
                 anyLoaded = true;
                 if (!tile.hasCoastline()) continue;
                 anyCoast = true;
-                for (CoastlineSegment seg :
-                        tile.coastline) {
-                    if (!seg.mightBeNear(lat, lon, 0.5))
-                        continue;
-                    double signed =
-                        seg.signedDistMeters(lat, lon);
-                    double dist = Math.abs(signed);
-                    if (dist < bestDist) {
-                        bestDist   = dist;
-                        bestSigned = signed;
-                    }
+                // Spatial index: measure only segments in
+                // the grid cells near this point (expanding
+                // until the nearest is proven) instead of
+                // scanning every segment of the tile. The
+                // nearest segment found is identical to the
+                // old full scan's.
+                Nearest n = nearestCoastInTile(
+                    tile, lat, lon, bestDist);
+                if (n != null && n.found
+                        && n.dist < bestDist) {
+                    bestDist   = n.dist;
+                    bestSigned = n.signed;
+                    if (bestDist <= COASTLINE_BAND_M)
+                        break tiles;
                 }
             }
 
@@ -573,6 +926,23 @@ public class OsmWaterIndex {
     public CoastSide classifyCoastlineMemOnly(
             double lat, double lon) {
         return classifyCoastline(lat, lon);
+    }
+
+    /** Coastline segments currently in memory around a point
+     *  (3x3 tiles). 0 can mean open ocean (no coast near) or
+     *  that no tile has loaded — callers combine this with
+     *  classifyCoastlineMemOnly (UNKNOWN = no data). */
+    public int coastSegCountAround(double lat, double lon) {
+        int n = 0;
+        for (int dlat = -1; dlat <= 1; dlat++)
+            for (int dlon = -1; dlon <= 1; dlon++) {
+                WaterTile t = memCache.get(tileKey(
+                        lat + dlat * TILE_DEG,
+                        lon + dlon * TILE_DEG));
+                if (t != null && t.valid && t.coastline != null)
+                    n += t.coastline.length;
+            }
+        return n;
     }
 
     // ── PUBLIC API ────────────────────────────────────────────
@@ -670,6 +1040,12 @@ public class OsmWaterIndex {
             }
         }
 
+        // Recent failure on record: fail fast. Without this,
+        // every coastal chunk paid the full wait (or launched
+        // its own fetch round) for a tile that just failed —
+        // the cold-start stall stampede.
+        if (recentlyFailed(key)) return false;
+
         // Not on disk — submit to thread pool
         CompletableFuture<WaterTile> future =
             pending.computeIfAbsent(key,
@@ -680,13 +1056,76 @@ public class OsmWaterIndex {
                 maxWaitMs, TimeUnit.MILLISECONDS);
             return r != null && r.valid;
         } catch (TimeoutException e) {
-            // Clean up — remove from pending so a
-            // future call can retry cleanly
-            pending.remove(key, future);
+            // Slow-start cure: do NOT drop the pending entry
+            // while the fetch is still running — the next
+            // chunk would launch a duplicate download of the
+            // same tile, and waiters would multiply fetches
+            // instead of sharing one. The fetch itself
+            // completes/removes the entry when done.
+            if (future.isDone())
+                pending.remove(key, future);
             return false;
         } catch (Exception e) {
             pending.remove(key, future);
             return false;
+        }
+    }
+
+    // ── SHARED BOUNDED WAIT ─────────────────────────────────
+    // Tile key -> absolute deadline (ms) of the shared wait
+    // window for that tile. The first waiter opens the window;
+    // later waiters for the SAME tile only wait out what is
+    // left of it instead of each parking for the full budget.
+    // After the window closes they fail fast while the shared
+    // fetch keeps running in the background (AsyncWaterManager
+    // requeues the chunk for authoritative water placement).
+    private final ConcurrentHashMap<Long, Long>
+        sharedWaitDeadline = new ConcurrentHashMap<>();
+
+    /**
+     * Like {@link #getTileBlocking} but the wait budget is
+     * shared per tile: total waiting for one tile is bounded by
+     * maxWaitMs from the first call, not maxWaitMs per caller.
+     * Used by the COAST WAIT in terrain generation, where many
+     * chunks queue on the same coastline tile.
+     */
+    public boolean getTileBlockingShared(double lat, double lon,
+            long maxWaitMs) {
+        if (!enabled || lat <= -85 || lat >= 85)
+            return false;
+        long key = tileKey(lat, lon);
+        WaterTile tile = memCache.get(key);
+        if (tile != null) {
+            sharedWaitDeadline.remove(key);
+            return tile.valid;
+        }
+        long nowMs = System.currentTimeMillis();
+        if (sharedWaitDeadline.size() > 4096)
+            sharedWaitDeadline.clear();
+        CompletableFuture<WaterTile> pf = pending.get(key);
+        boolean fetchRunning = pf != null && !pf.isDone();
+        Long dl = sharedWaitDeadline.get(key);
+        if (dl == null || (!fetchRunning && nowMs >= dl)) {
+            // No window yet, or the window closed with no fetch
+            // running: open a fresh one.
+            long fresh = nowMs + maxWaitMs;
+            if (dl == null) {
+                Long prev = sharedWaitDeadline.putIfAbsent(
+                    key, fresh);
+                dl = (prev != null) ? prev : fresh;
+            } else {
+                sharedWaitDeadline.put(key, fresh);
+                dl = fresh;
+            }
+        }
+        long eff = dl - nowMs;
+        if (eff <= 0) return false; // window spent, fetch running
+        try {
+            return getTileBlocking(lat, lon, eff);
+        } finally {
+            CompletableFuture<WaterTile> f2 = pending.get(key);
+            if (f2 == null || f2.isDone())
+                sharedWaitDeadline.remove(key);
         }
     }
 
@@ -795,6 +1234,8 @@ public class OsmWaterIndex {
                 if (diskOk) saveDisk(e.getKey(), json);
                 served++;
             }
+            if (!sub.valid) stampFailure(e.getKey());
+            else failedAt.remove(e.getKey());
             e.getValue().complete(sub);
             pending.remove(e.getKey(), e.getValue());
         }
@@ -845,77 +1286,184 @@ public class OsmWaterIndex {
             + ");out body geom;";
     }
 
-    /** Endpoint-rotating POST of a water query; null on total
-     *  failure (all endpoints down/paused). Mirrors fetchTile's
-     *  rotation but returns the raw JSON for batch splitting. */
+    /** Endpoint-hedged POST of a water query; null on total
+     *  failure (all endpoints down/paused). Returns raw JSON. */
     private String executeWaterQuery(String bbox,
             int timeoutSec) {
         if (System.currentTimeMillis() < pauseUntilMs)
             return null;
         String query = waterQueryFor(bbox, timeoutSec);
         totalQueries.incrementAndGet();
-        int startIdx =
-            endpointIdx.get() % OVERPASS_ENDPOINTS.length;
-        for (int attempt = 0;
-                attempt < OVERPASS_ENDPOINTS.length;
-                attempt++) {
-            int idx = (startIdx + attempt)
-                % OVERPASS_ENDPOINTS.length;
-            if (System.currentTimeMillis()
-                    < endpointPauseUntil[idx]) continue;
-            String ep = OVERPASS_ENDPOINTS[idx];
-            OverpassRateLimiter limiter =
-                endpointLimiters[idx];
-            HttpURLConnection conn = null;
-            boolean inFlight = false;
-            try {
-                limiter.acquire();
-                limiter.acquireInFlight();
-                inFlight = true;
-                conn = (HttpURLConnection)
-                    new URL(ep).openConnection();
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-                conn.setReadTimeout(
-                    Math.max(HTTP_TIMEOUT_MS,
-                        timeoutSec * 1000 + 5000));
-                conn.setRequestProperty("Content-Type",
-                    "application/x-www-form-urlencoded");
-                conn.setRequestProperty("User-Agent",
-                    "TerraPlusPlus/2.0 Minecraft");
-                conn.setRequestProperty(
-                    "Accept-Encoding", "gzip");
-                byte[] body = ("data="
-                    + URLEncoder.encode(query,
-                        StandardCharsets.UTF_8))
-                    .getBytes(StandardCharsets.UTF_8);
-                conn.getOutputStream().write(body);
-                conn.getOutputStream().flush();
-                int code = conn.getResponseCode();
-                if (code == 200) {
-                    String json = readResponse(conn);
-                    endpointIdx.set(idx);
-                    consecutiveFailures = 0;
-                    return json;
-                } else if (code == 429 || code == 504) {
-                    limiter.penalize(
-                        code == 429 ? 30_000L : 10_000L);
-                } else {
-                    LOGGER.warn("{} returned {} (batch)",
-                        epName(ep), code);
-                    limiter.penalize(8_000L);
+        String json = raceQuery(query, timeoutSec,
+            new AtomicBoolean(false));
+        if (json != null) consecutiveFailures = 0;
+        return json;
+    }
+
+    /**
+     * Hedged race of one Overpass query across the endpoints.
+     *
+     * The first non-paused endpoint launches immediately; if it
+     * has produced nothing after HEDGE_MS the same query launches
+     * on the next endpoint IN PARALLEL, and so on. First HTTP 200
+     * wins; losing connections are disconnected at once. An
+     * endpoint that fails fast never waits out the hedge — the
+     * next endpoint launches immediately.
+     *
+     * Replaces sequential endpoint rotation, whose worst case was
+     * every endpoint burning a full read timeout in series. Each
+     * attempt still takes its own endpoint's rate-limiter token
+     * and in-flight permit, so per-endpoint politeness is
+     * unchanged; the race only removes the serial waiting between
+     * endpoints. Attempts run on RACE_POOL, never on dlPool, so a
+     * race can never starve the fetch threads that launched it.
+     */
+    private String raceQuery(String query, int timeoutSec,
+            AtomicBoolean attemptedOut) {
+        if (System.currentTimeMillis() < pauseUntilMs)
+            return null;
+        long nowMs = System.currentTimeMillis();
+        List<Integer> cand = new ArrayList<>();
+        int startIdx = endpointIdx.get()
+            % OVERPASS_ENDPOINTS.length;
+        if (startIdx < 0)
+            startIdx += OVERPASS_ENDPOINTS.length;
+        for (int i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
+            int idx = (startIdx + i) % OVERPASS_ENDPOINTS.length;
+            if (nowMs < endpointPauseUntil[idx]) continue;
+            cand.add(idx);
+        }
+        if (cand.isEmpty()) return null;
+
+        ExecutorCompletionService<String> ecs =
+            new ExecutorCompletionService<>(RACE_POOL);
+        Set<HttpURLConnection> live =
+            ConcurrentHashMap.newKeySet();
+        List<Future<String>> futures = new ArrayList<>();
+        int launched = 0, completed = 0;
+        final int firstIdx = cand.get(0);
+        futures.add(ecs.submit(() -> attemptEndpoint(
+            firstIdx, query, timeoutSec, live, attemptedOut)));
+        launched++;
+        try {
+            while (completed < launched) {
+                Future<String> done = ecs.poll(
+                    HEDGE_MS, TimeUnit.MILLISECONDS);
+                if (done == null) {
+                    // Hedge interval elapsed with no answer:
+                    // launch the next endpoint in parallel.
+                    if (launched < cand.size()) {
+                        final int idx = cand.get(launched);
+                        futures.add(ecs.submit(() ->
+                            attemptEndpoint(idx, query,
+                                timeoutSec, live,
+                                attemptedOut)));
+                        launched++;
+                    }
+                    continue;
                 }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return null;
-            } catch (Exception e) {
-                LOGGER.debug("water batch {}: {}",
-                    epName(ep), e.getMessage());
-            } finally {
-                if (inFlight) limiter.releaseInFlight();
-                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
+                completed++;
+                String json = null;
+                try { json = done.get(); }
+                catch (Exception ignored) {}
+                if (json != null) {
+                    // Winner: cut the losers' connections now
+                    // instead of letting them run to timeout.
+                    for (HttpURLConnection c : live) {
+                        try { c.disconnect(); }
+                        catch (Exception ignored) {}
+                    }
+                    for (Future<String> f : futures)
+                        f.cancel(true);
+                    return json;
+                }
+                // Fast failure: never wait out the hedge.
+                if (launched == completed
+                        && launched < cand.size()) {
+                    final int idx = cand.get(launched);
+                    futures.add(ecs.submit(() ->
+                        attemptEndpoint(idx, query,
+                            timeoutSec, live, attemptedOut)));
+                    launched++;
+                }
             }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            for (Future<String> f : futures) f.cancel(true);
+        }
+        return null;
+    }
+
+    /** One endpoint attempt of a water query. Returns the raw
+     *  JSON on HTTP 200, null otherwise. Handles this endpoint's
+     *  rate limiter, 429/504 penalties and 4xx quarantine. The
+     *  live connection is registered in {@code live} so the race
+     *  winner can disconnect losers immediately. */
+    private String attemptEndpoint(int idx, String query,
+            int timeoutSec, Set<HttpURLConnection> live,
+            AtomicBoolean attemptedOut) {
+        String ep = OVERPASS_ENDPOINTS[idx];
+        OverpassRateLimiter limiter = endpointLimiters[idx];
+        HttpURLConnection conn = null;
+        boolean inFlight = false;
+        try {
+            attemptedOut.set(true);
+            limiter.acquire();
+            limiter.acquireInFlight();
+            inFlight = true;
+            conn = (HttpURLConnection)
+                new URL(ep).openConnection();
+            live.add(conn);
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+            conn.setReadTimeout(
+                Math.max(HTTP_TIMEOUT_MS,
+                    timeoutSec * 1000 + 5000));
+            conn.setRequestProperty("Content-Type",
+                "application/x-www-form-urlencoded");
+            conn.setRequestProperty("User-Agent",
+                "TerraPlusPlus/2.0 Minecraft");
+            conn.setRequestProperty(
+                "Accept-Encoding", "gzip");
+            byte[] body = ("data="
+                + URLEncoder.encode(query,
+                    StandardCharsets.UTF_8))
+                .getBytes(StandardCharsets.UTF_8);
+            conn.getOutputStream().write(body);
+            conn.getOutputStream().flush();
+            int code = conn.getResponseCode();
+            if (code == 200) {
+                String json = readResponse(conn);
+                endpointIdx.set(idx);
+                return json;
+            } else if (code == 429 || code == 504) {
+                limiter.penalize(
+                    code == 429 ? 30_000L : 10_000L);
+            } else if (code >= 400 && code < 500) {
+                endpointPauseUntil[idx] =
+                    System.currentTimeMillis()
+                        + ENDPOINT_4XX_PAUSE_MS;
+                LOGGER.warn("{} returned {}; pausing this "
+                    + "endpoint for {}s",
+                    epName(ep), code,
+                    ENDPOINT_4XX_PAUSE_MS / 1000);
+                limiter.penalize(8_000L);
+            } else {
+                LOGGER.warn("{} returned {}",
+                    epName(ep), code);
+                limiter.penalize(8_000L);
+            }
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            LOGGER.debug("water query {}: {}",
+                epName(ep), e.getMessage());
+        } finally {
+            if (conn != null) live.remove(conn);
+            if (inFlight) limiter.releaseInFlight();
+            net.buildtheearth.terraplusplus.util
+                .HttpKeepAlive.release(conn);
         }
         return null;
     }
@@ -978,6 +1526,8 @@ public class OsmWaterIndex {
             }
         }
 
+        if (recentlyFailed(key)) return null;
+
         CompletableFuture<WaterTile> future =
             pending.computeIfAbsent(key,
                 k -> submitFetch(k, lat, lon));
@@ -1002,7 +1552,18 @@ public class OsmWaterIndex {
         double tileLon =
             Math.floor(lon / TILE_DEG) * TILE_DEG;
         return CompletableFuture.supplyAsync(
-            () -> fetchTile(key, tileLat, tileLon),
+            () -> {
+                WaterTile t =
+                    fetchTile(key, tileLat, tileLon);
+                // Remember the outcome: failures are stamped
+                // so following chunks fail fast (FAIL_TTL_MS)
+                // instead of stampeding the endpoints.
+                if (t == null || !t.valid)
+                    stampFailure(key);
+                else
+                    failedAt.remove(key);
+                return t;
+            },
             dlPool);
     }
 
@@ -1180,109 +1741,210 @@ public class OsmWaterIndex {
 
         totalQueries.incrementAndGet();
 
-        int startIdx =
-            endpointIdx.get() % OVERPASS_ENDPOINTS.length;
-
-        boolean attemptedEndpoint = false;
-        for (int attempt = 0;
-                attempt < OVERPASS_ENDPOINTS.length;
-                attempt++) {
-            int idx = (startIdx + attempt)
-                % OVERPASS_ENDPOINTS.length;
-            if (System.currentTimeMillis() < endpointPauseUntil[idx])
-                continue;
-            attemptedEndpoint = true;
-            String ep = OVERPASS_ENDPOINTS[idx];
-            OverpassRateLimiter limiter =
-                endpointLimiters[idx];
-
-            HttpURLConnection conn = null;
-        boolean endpointInFlight = false;
-            try {
-                // Acquire token for THIS endpoint only.
-                // Other threads fetching from a different
-                // endpoint are not blocked here at all.
-                limiter.acquire();
-                limiter.acquireInFlight();
-                endpointInFlight = true;
-
-                conn = (HttpURLConnection)
-                    new URL(ep).openConnection();
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-                conn.setReadTimeout(HTTP_TIMEOUT_MS);
-                conn.setRequestProperty("Content-Type",
-                    "application/x-www-form-urlencoded");
-                conn.setRequestProperty("User-Agent",
-                    "TerraPlusPlus/2.0 Minecraft");
-                conn.setRequestProperty(
-                    "Accept-Encoding", "gzip");
-
-                byte[] body = ("data="
-                    + URLEncoder.encode(query,
-                        StandardCharsets.UTF_8))
-                    .getBytes(StandardCharsets.UTF_8);
-                conn.getOutputStream().write(body);
-                conn.getOutputStream().flush();
-
-                int code = conn.getResponseCode();
-                if (code == 200) {
-                    String json = readResponse(conn);
-                    WaterTile wt = parseResponse(json);
-                    endpointIdx.set(idx);
-                    consecutiveFailures = 0;
-                    pauseUntilMs = 0;
-                    pauseLogged.set(false);
-                    memCache.put(key, wt);
-                    pending.remove(key);
-                    evictIfNeeded();
-                    if (diskOk) saveDisk(key, json);
-                    LOGGER.info(
-                        "OSM [{},{}]: {} features "
-                        + "{} coast segs ({})",
-                        String.format("%.4f", minLat),
-                        String.format("%.4f", minLon),
-                        wt.features.length,
-                        wt.coastline.length,
-                        epName(ep));
-                    return wt;
-                } else if (code == 429
-                        || code == 504) {
-                    // Rate limited by server —
-                    // reset this endpoint's limiter
-                    // to back off before retrying
-                    limiter.penalize(code == 429 ? 30_000L : 10_000L);
-                    continue;
-                } else {
-                    if (code >= 400 && code < 500) {
-                        endpointPauseUntil[idx] = System.currentTimeMillis()
-                                + ENDPOINT_4XX_PAUSE_MS;
-                        LOGGER.warn("{} returned {}; pausing this endpoint for {}s",
-                                epName(ep), code, ENDPOINT_4XX_PAUSE_MS / 1000);
-                    } else {
-                        LOGGER.warn("{} returned {}", epName(ep), code);
-                    }
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                pending.remove(key);
-                return WaterTile.FAILED;
-            } catch (Exception e) {
-                LOGGER.debug("{} failed: {}",
-                    epName(ep), e.getMessage());
-            } finally {
-                net.buildtheearth.terraplusplus.util.HttpKeepAlive.release(conn);
-                if (endpointInFlight) limiter.releaseInFlight();
-            }
+        // Hedged endpoint race (see raceQuery): the first
+        // endpoint to answer wins, instead of endpoints tried
+        // one by one with a full read timeout each.
+        AtomicBoolean attemptedEndpoint =
+            new AtomicBoolean(false);
+        String json = raceQuery(query, 20, attemptedEndpoint);
+        if (json != null) {
+            WaterTile wt = parseResponse(json);
+            consecutiveFailures = 0;
+            pauseUntilMs = 0;
+            pauseLogged.set(false);
+            memCache.put(key, wt);
+            pending.remove(key);
+            evictIfNeeded();
+            if (diskOk) saveDisk(key, json);
+            LOGGER.info(
+                "OSM [{},{}]: {} features "
+                + "{} coast segs",
+                String.format("%.4f", minLat),
+                String.format("%.4f", minLon),
+                wt.features.length,
+                wt.coastline.length);
+            return wt;
         }
+
+        // ── COASTLINE FALLBACK: official OSM API ──────────────
+        // Overpass gave nothing this round. The sea must not
+        // depend on Overpass alone, so try the main OSM API for
+        // coastline segments before declaring the tile failed.
+        WaterTile apiTile =
+            fetchCoastlineViaOsmApi(key, minLat, minLon);
+        if (apiTile != null) return apiTile;
 
         // Only count a round that actually contacted at least one endpoint.
         // If all mirrors are in their own cooldown windows, retry later without
         // escalating to a source-wide outage.
-        if (attemptedEndpoint) consecutiveFailures++;
+        if (attemptedEndpoint.get()) consecutiveFailures++;
         pending.remove(key);
         return WaterTile.FAILED;
+    }
+
+    /**
+     * Coastline-only tile from the official OSM API
+     * ({@code /api/0.6/map.json}). The tile box is split into
+     * 2x2 sub-boxes to stay under the API's 50k-node cap; every
+     * sub-box must answer, otherwise the tile stays FAILED so a
+     * later retry can complete it. Returns null on any failure.
+     */
+    private WaterTile fetchCoastlineViaOsmApi(long key,
+            double minLat, double minLon) {
+        if (System.currentTimeMillis() < osmApiDownUntil)
+            return null;
+        double expand = TILE_DEG * 0.1;
+        double lat0 = minLat - expand;
+        double lon0 = minLon - expand;
+        double lat1 = minLat + TILE_DEG + expand;
+        double lon1 = minLon + TILE_DEG + expand;
+        double midLat = (lat0 + lat1) / 2.0;
+        double midLon = (lon0 + lon1) / 2.0;
+        double[][] boxes = {
+            {lat0, lon0, midLat, midLon},
+            {lat0, midLon, midLat, lon1},
+            {midLat, lon0, lat1, midLon},
+            {midLat, midLon, lat1, lon1}};
+        List<CoastlineSegment> segs = new ArrayList<>();
+        for (double[] b : boxes) {
+            if (!fetchCoastlineBox(b[0], b[1], b[2], b[3], segs)) {
+                if (osmApiFails.incrementAndGet() >= 3)
+                    osmApiDownUntil =
+                        System.currentTimeMillis() + 120_000L;
+                return null;
+            }
+        }
+        osmApiFails.set(0);
+        WaterTile wt = new WaterTile(
+            new WaterFeature[0],
+            segs.toArray(new CoastlineSegment[0]), true);
+        memCache.put(key, wt);
+        pending.remove(key);
+        evictIfNeeded();
+        if (diskOk) saveDisk(key, coastlineJson(segs));
+        LOGGER.info(
+            "OSM API coastline [{},{}]: {} coast segs "
+            + "(Overpass fallback door)",
+            String.format("%.4f", minLat),
+            String.format("%.4f", minLon),
+            segs.size());
+        return wt;
+    }
+
+    /** One map.json sub-box; appends coastline segments. */
+    private boolean fetchCoastlineBox(double minLat,
+            double minLon, double maxLat, double maxLon,
+            List<CoastlineSegment> out) {
+        // polite spacing across all threads (mirrors
+        // OsmStructureIndex's OSM API gate)
+        synchronized (OSM_API_GATE) {
+            long wait = osmApiLastCall + OSM_API_SPACING_MS
+                - System.currentTimeMillis();
+            if (wait > 0) {
+                try { Thread.sleep(wait); }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            osmApiLastCall = System.currentTimeMillis();
+        }
+        HttpURLConnection conn = null;
+        try {
+            // API order: left,bottom,right,top (lon,lat)
+            String url = OSM_API_URL + String.format(
+                java.util.Locale.ROOT,
+                "%.6f,%.6f,%.6f,%.6f",
+                minLon, minLat, maxLon, maxLat);
+            conn = (HttpURLConnection)
+                new URL(url).openConnection();
+            conn.setConnectTimeout(6000);
+            conn.setReadTimeout(25000);
+            conn.setRequestProperty("User-Agent",
+                "TerraPlusPlus/2.0 Minecraft");
+            conn.setRequestProperty(
+                "Accept-Encoding", "gzip");
+            if (conn.getResponseCode() != 200) return false;
+            String json = readResponse(conn);
+            JsonObject root =
+                JsonParser.parseString(json).getAsJsonObject();
+            JsonArray elements =
+                root.getAsJsonArray("elements");
+            if (elements == null) return true;
+            Map<Long, double[]> nodes = new HashMap<>();
+            for (JsonElement el : elements) {
+                JsonObject o = el.getAsJsonObject();
+                if ("node".equals(getStr(o, "type"))
+                        && o.has("id") && o.has("lat")
+                        && o.has("lon"))
+                    nodes.put(o.get("id").getAsLong(),
+                        new double[]{
+                            o.get("lat").getAsDouble(),
+                            o.get("lon").getAsDouble()});
+            }
+            for (JsonElement el : elements) {
+                JsonObject o = el.getAsJsonObject();
+                if (!"way".equals(getStr(o, "type"))) continue;
+                JsonObject tags = o.has("tags")
+                    ? o.getAsJsonObject("tags") : null;
+                if (tags == null || !"coastline".equals(
+                        getTag(tags, "natural"))) continue;
+                if (!o.has("nodes")) continue;
+                JsonArray refs = o.getAsJsonArray("nodes");
+                double[] prev = null;
+                for (JsonElement r : refs) {
+                    double[] p =
+                        nodes.get(r.getAsLong());
+                    if (p == null) { prev = null; continue; }
+                    if (prev != null)
+                        out.add(new CoastlineSegment(
+                            prev[0], prev[1], p[0], p[1]));
+                    prev = p;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            LOGGER.debug("OSM API coastline box failed: {}",
+                e.getMessage());
+            return false;
+        } finally {
+            net.buildtheearth.terraplusplus.util
+                .HttpKeepAlive.release(conn);
+        }
+    }
+
+    private static String getStr(JsonObject o, String k) {
+        return o.has(k) && o.get(k).isJsonPrimitive()
+            ? o.get(k).getAsString() : null;
+    }
+
+    /** Out-geom-shaped JSON for the disk cache, so a coastline
+     *  tile fetched via the API door reloads through the normal
+     *  Overpass parser ({@link #parseResponse}). */
+    private static String coastlineJson(
+            List<CoastlineSegment> segs) {
+        StringBuilder sb = new StringBuilder(segs.size() * 96);
+        sb.append("{\"elements\":[");
+        for (int i = 0; i < segs.size(); i++) {
+            CoastlineSegment s = segs.get(i);
+            if (i > 0) sb.append(',');
+            sb.append("{\"type\":\"way\",\"tags\":{\"natural\":")
+              .append("\"coastline\"},\"geometry\":[{\"lat\":")
+              .append(String.format(java.util.Locale.ROOT,
+                  "%.6f", s.aLat))
+              .append(",\"lon\":")
+              .append(String.format(java.util.Locale.ROOT,
+                  "%.6f", s.aLon))
+              .append("},{\"lat\":")
+              .append(String.format(java.util.Locale.ROOT,
+                  "%.6f", s.bLat))
+              .append(",\"lon\":")
+              .append(String.format(java.util.Locale.ROOT,
+                  "%.6f", s.bLon))
+              .append("}]}");
+        }
+        sb.append("]}");
+        return sb.toString();
     }
 
     private String readResponse(

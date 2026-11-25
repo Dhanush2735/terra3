@@ -1,0 +1,642 @@
+{
+ "tests": [
+  {
+   "name": "Hyderabad Charminar (city anchor)",
+   "kind": "anchor",
+   "truth": "game-proven 508 m",
+   "box": [
+    78.4697,
+    17.3567,
+    78.4797,
+    17.3667
+   ],
+   "terrarium": {
+    "status": "ok tiles=1 misses=0 px=14268",
+    "median": 507.8,
+    "min": 497.8,
+    "max": 519.0,
+    "p98-p2": 16.4,
+    "flat_out_pct(>10m from median)": 1.241,
+    "rough_median_m": 0.06,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=1"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N17_00_E078_00_DEM",
+    "median": 507.8,
+    "min": 497.0,
+    "max": 520.3,
+    "p98-p2": 17.1,
+    "std": 4.38
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=1 misses=0 px=3596",
+    "median": 507.5,
+    "min": 498.0,
+    "max": 519.5,
+    "p98-p2": 15.5,
+    "flat_out_pct(>10m from median)": 0.64,
+    "rough_median_m": 0.25,
+    "spike_pct(>60m)": 0.0
+   }
+  },
+  {
+   "name": "Everest (peak anchor)",
+   "kind": "peak",
+   "truth": "true 8848 m; game read 8728.9",
+   "box": [
+    86.915,
+    27.9781,
+    86.935,
+    27.9981
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=61512",
+    "median": 8105.0,
+    "min": 7057.8,
+    "max": 8749.2,
+    "p98-p2": 1351.9,
+    "flat_out_pct(>10m from median)": 97.698,
+    "rough_median_m": 0.5,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=4"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N27_00_E086_00_DEM",
+    "median": 8086.9,
+    "min": 7062.9,
+    "max": 8737.8,
+    "p98-p2": 1363.0,
+    "std": 326.09
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=4 misses=0 px=15444",
+    "median": 8096.5,
+    "min": 7066.5,
+    "max": 8735.5,
+    "p98-p2": 1347.5,
+    "flat_out_pct(>10m from median)": 97.546,
+    "rough_median_m": 0.75,
+    "spike_pct(>60m)": 0.0
+   }
+  },
+  {
+   "name": "Kilimanjaro (peak anchor)",
+   "kind": "peak",
+   "truth": "true 5895 m; game 5865.7",
+   "box": [
+    37.3433,
+    -3.0858,
+    37.3633,
+    -3.0658
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=54289",
+    "median": 5712.0,
+    "min": 4793.7,
+    "max": 5886.9,
+    "p98-p2": 776.0,
+    "flat_out_pct(>10m from median)": 91.339,
+    "rough_median_m": 0.28,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=4"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_S04_00_E037_00_DEM",
+    "median": 5710.3,
+    "min": 4809.2,
+    "max": 5886.8,
+    "p98-p2": 780.0,
+    "std": 202.89
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=4 misses=0 px=13456",
+    "median": 5712.0,
+    "min": 4827.0,
+    "max": 5884.5,
+    "p98-p2": 765.0,
+    "flat_out_pct(>10m from median)": 90.086,
+    "rough_median_m": 0.5,
+    "spike_pct(>60m)": 0.0
+   }
+  },
+  {
+   "name": "Dead Sea mid water (flat)",
+   "kind": "flat",
+   "truth": "one flat level ~-412..-439",
+   "box": [
+    35.515,
+    31.48,
+    35.555,
+    31.52
+   ],
+   "terrarium": {
+    "status": "ok tiles=9 misses=0 px=254436",
+    "median": -412.0,
+    "min": -5226.9,
+    "max": -367.1,
+    "p98-p2": 0.1,
+    "flat_out_pct(>10m from median)": 0.263,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.007
+   },
+   "mapterhorn": {
+    "status": "ok tiles=4 misses=0 px=254436",
+    "median": -432.0,
+    "min": -432.2,
+    "max": -371.0,
+    "p98-p2": 0.0,
+    "flat_out_pct(>10m from median)": 0.198,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N31_00_E035_00_DEM",
+    "median": -427.0,
+    "min": -427.0,
+    "max": -416.5,
+    "p98-p2": 0.0,
+    "std": 0.08
+   }
+  },
+  {
+   "name": "Caspian Sea water (flat)",
+   "kind": "flat",
+   "truth": "surface ~-29 m",
+   "box": [
+    50.45,
+    41.95,
+    50.55,
+    42.05
+   ],
+   "terrarium": {
+    "status": "ok tiles=40 misses=0 px=1826720",
+    "median": -29.0,
+    "min": -5535.3,
+    "max": -29.0,
+    "p98-p2": 0.0,
+    "flat_out_pct(>10m from median)": 0.064,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.064
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=12"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N42_00_E050_00_DEM",
+    "median": -28.0,
+    "min": -28.0,
+    "max": -28.0,
+    "p98-p2": 0.0,
+    "std": 0.0
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=6 misses=0 px=457072",
+    "median": -28.0,
+    "min": -28.0,
+    "max": -28.0,
+    "p98-p2": 0.0,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   }
+  },
+  {
+   "name": "Flevoland polder (flat, below sea)",
+   "kind": "flat",
+   "truth": "farmland ~-5 m",
+   "box": [
+    5.44,
+    52.4,
+    5.5,
+    52.46
+   ],
+   "terrarium": {
+    "status": "ok tiles=24 misses=0 px=801753",
+    "median": -4.9,
+    "min": -6.9,
+    "max": 7.5,
+    "p98-p2": 8.7,
+    "flat_out_pct(>10m from median)": 0.039,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=12 misses=0 px=801753",
+    "median": -4.0,
+    "min": -6.2,
+    "max": 3.8,
+    "p98-p2": 2.5,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N52_00_E005_00_DEM",
+    "median": -4.3,
+    "min": -14.9,
+    "max": 22.3,
+    "p98-p2": 14.3,
+    "std": 3.21
+   }
+  },
+  {
+   "name": "Death Valley (below-sea anchor)",
+   "kind": "anchor",
+   "truth": "true -86 m; game -80.8",
+   "box": [
+    -116.7777,
+    36.2198,
+    -116.7577,
+    36.2398
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=67337",
+    "median": -30.0,
+    "min": -88.7,
+    "max": 650.7,
+    "p98-p2": 558.7,
+    "flat_out_pct(>10m from median)": 95.358,
+    "rough_median_m": 0.13,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=2 misses=0 px=67337",
+    "median": -27.8,
+    "min": -84.2,
+    "max": 650.2,
+    "p98-p2": 558.8,
+    "flat_out_pct(>10m from median)": 95.634,
+    "rough_median_m": 0.12,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N36_00_W117_00_DEM",
+    "median": -34.1,
+    "min": -86.1,
+    "max": 655.5,
+    "p98-p2": 581.6,
+    "std": 170.08
+   }
+  },
+  {
+   "name": "Manhattan (city bumps)",
+   "kind": "city",
+   "truth": "dense towers; ground should be low+flat",
+   "box": [
+    -73.995,
+    40.75,
+    -73.975,
+    40.765
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=53590",
+    "median": 16.9,
+    "min": 5.6,
+    "max": 24.3,
+    "p98-p2": 14.9,
+    "flat_out_pct(>10m from median)": 1.09,
+    "rough_median_m": 0.01,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=1 misses=0 px=53590",
+    "median": 16.8,
+    "min": 0.5,
+    "max": 25.5,
+    "p98-p2": 15.5,
+    "flat_out_pct(>10m from median)": 0.369,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N40_00_W074_00_DEM",
+    "median": 61.4,
+    "min": 5.2,
+    "max": 186.3,
+    "p98-p2": 138.4,
+    "std": 35.63
+   }
+  },
+  {
+   "name": "Amsterdam old town (city bumps)",
+   "kind": "city",
+   "truth": "canals; NL ground model exists",
+   "box": [
+    4.895,
+    52.36,
+    4.915,
+    52.375
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=66638",
+    "median": 5.9,
+    "min": -2.0,
+    "max": 13.7,
+    "p98-p2": 9.6,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=1 misses=0 px=66638",
+    "median": 1.0,
+    "min": -4.2,
+    "max": 4.0,
+    "p98-p2": 2.2,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N52_00_E004_00_DEM",
+    "median": 6.3,
+    "min": -6.9,
+    "max": 25.4,
+    "p98-p2": 17.4,
+    "std": 4.66
+   }
+  },
+  {
+   "name": "Tokyo (city bumps)",
+   "kind": "city",
+   "truth": "JP national data exists",
+   "box": [
+    139.74,
+    35.675,
+    139.76,
+    35.69
+   ],
+   "terrarium": {
+    "status": "ok tiles=4 misses=0 px=50328",
+    "median": 24.1,
+    "min": -12.9,
+    "max": 88.0,
+    "p98-p2": 42.6,
+    "flat_out_pct(>10m from median)": 44.035,
+    "rough_median_m": 0.13,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=4 misses=0 px=50328",
+    "median": 19.0,
+    "min": -1.0,
+    "max": 36.2,
+    "p98-p2": 27.8,
+    "flat_out_pct(>10m from median)": 37.001,
+    "rough_median_m": 0.12,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N35_00_E139_00_DEM",
+    "median": 23.5,
+    "min": 2.7,
+    "max": 54.6,
+    "p98-p2": 38.4,
+    "std": 10.35
+   }
+  },
+  {
+   "name": "Grand Canyon (steep spikes)",
+   "kind": "steep",
+   "truth": "gorge; radar-shadow family",
+   "box": [
+    -112.13,
+    36.095,
+    -112.09,
+    36.12
+   ],
+   "terrarium": {
+    "status": "ok tiles=6 misses=0 px=168226",
+    "median": 1066.1,
+    "min": 726.3,
+    "max": 1646.2,
+    "p98-p2": 734.0,
+    "flat_out_pct(>10m from median)": 96.065,
+    "rough_median_m": 0.23,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=4 misses=0 px=168226",
+    "median": 1066.5,
+    "min": 727.0,
+    "max": 1646.2,
+    "p98-p2": 739.8,
+    "flat_out_pct(>10m from median)": 96.235,
+    "rough_median_m": 0.38,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N36_00_W113_00_DEM",
+    "median": 1064.1,
+    "min": 724.4,
+    "max": 1641.9,
+    "p98-p2": 736.9,
+    "std": 196.13
+   }
+  },
+  {
+   "name": "Zermatt Alps (steep spikes)",
+   "kind": "steep",
+   "truth": "high Alps gorge/valley",
+   "box": [
+    7.72,
+    45.97,
+    7.76,
+    46.0
+   ],
+   "terrarium": {
+    "status": "ok tiles=9 misses=0 px=234398",
+    "median": 2390.4,
+    "min": 1827.7,
+    "max": 2913.7,
+    "p98-p2": 989.2,
+    "flat_out_pct(>10m from median)": 95.888,
+    "rough_median_m": 0.06,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "ok tiles=4 misses=0 px=234398",
+    "median": 2377.8,
+    "min": 1804.0,
+    "max": 2929.8,
+    "p98-p2": 998.0,
+    "flat_out_pct(>10m from median)": 98.069,
+    "rough_median_m": 0.38,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N45_00_E007_00_DEM",
+    "median": 2377.0,
+    "min": 1820.4,
+    "max": 2938.5,
+    "p98-p2": 994.7,
+    "std": 269.64
+   }
+  },
+  {
+   "name": "Amazon canopy (bumps)",
+   "kind": "city",
+   "truth": "forest: surface books read tree tops",
+   "box": [
+    -60.02,
+    -3.12,
+    -59.98,
+    -3.08
+   ],
+   "terrarium": {
+    "status": "ok tiles=9 misses=0 px=217622",
+    "median": 46.5,
+    "min": 18.0,
+    "max": 89.7,
+    "p98-p2": 50.7,
+    "flat_out_pct(>10m from median)": 42.449,
+    "rough_median_m": 0.1,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=4"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_S04_00_W061_00_DEM",
+    "median": 47.7,
+    "min": 22.0,
+    "max": 89.7,
+    "p98-p2": 51.0,
+    "std": 13.68
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=1 misses=0 px=54522",
+    "median": 50.5,
+    "min": 23.5,
+    "max": 95.0,
+    "p98-p2": 50.5,
+    "flat_out_pct(>10m from median)": 41.671,
+    "rough_median_m": 0.25,
+    "spike_pct(>60m)": 0.0
+   }
+  },
+  {
+   "name": "Mariana Trench (ocean depth)",
+   "kind": "ocean",
+   "truth": "true ~-10900 m; game z8 -10389",
+   "box": [
+    142.54,
+    11.32,
+    142.64,
+    11.42
+   ],
+   "terrarium": {
+    "status": "ok tiles=30 misses=0 px=1384020",
+    "median": 0.0,
+    "min": 0.0,
+    "max": 0.0,
+    "p98-p2": 0.0,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=9"
+   },
+   "terrarium_z8_ocean": {
+    "status": "ok tiles=1 misses=0 px=324",
+    "median": -10389.7,
+    "min": -10830.7,
+    "max": -9503.2,
+    "p98-p2": 1281.9,
+    "flat_out_pct(>10m from median)": 97.222,
+    "rough_median_m": 2.81,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "NO ITEM (None)"
+   }
+  },
+  {
+   "name": "Bay of Bengal (ocean depth)",
+   "kind": "ocean",
+   "truth": "game -2730.6 m",
+   "box": [
+    86.95,
+    15.95,
+    87.05,
+    16.05
+   ],
+   "terrarium": {
+    "status": "ok tiles=30 misses=0 px=1413192",
+    "median": 0.0,
+    "min": 0.0,
+    "max": 0.0,
+    "p98-p2": 0.0,
+    "flat_out_pct(>10m from median)": 0.0,
+    "rough_median_m": 0.0,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=12"
+   },
+   "terrarium_z8_ocean": {
+    "status": "ok tiles=1 misses=0 px=342",
+    "median": -2729.2,
+    "min": -2745.2,
+    "max": -2705.8,
+    "p98-p2": 33.9,
+    "flat_out_pct(>10m from median)": 36.842,
+    "rough_median_m": 0.15,
+    "spike_pct(>60m)": 0.0
+   },
+   "copernicus": {
+    "status": "NO ITEM (None)"
+   }
+  },
+  {
+   "name": "Singapore (low island city)",
+   "kind": "anchor",
+   "truth": "low flat island ~5-15 m",
+   "box": [
+    103.8098,
+    1.3421,
+    103.8298,
+    1.3621
+   ],
+   "terrarium": {
+    "status": "ok tiles=2 misses=0 px=54289",
+    "median": 42.5,
+    "min": 10.7,
+    "max": 103.5,
+    "p98-p2": 55.3,
+    "flat_out_pct(>10m from median)": 58.809,
+    "rough_median_m": 0.12,
+    "spike_pct(>60m)": 0.0
+   },
+   "mapterhorn": {
+    "status": "NO TILES (mapterhorn) misses=1"
+   },
+   "copernicus": {
+    "status": "ok item=Copernicus_DSM_COG_10_N01_00_E103_00_DEM",
+    "median": 40.1,
+    "min": 12.5,
+    "max": 112.1,
+    "p98-p2": 61.4,
+    "std": 17.62
+   },
+   "mapterhorn_z12": {
+    "status": "ok tiles=1 misses=0 px=13572",
+    "median": 40.5,
+    "min": 13.0,
+    "max": 109.5,
+    "p98-p2": 61.0,
+    "flat_out_pct(>10m from median)": 60.5,
+    "rough_median_m": 0.25,
+    "spike_pct(>60m)": 0.0
+   }
+  }
+ ]
+}

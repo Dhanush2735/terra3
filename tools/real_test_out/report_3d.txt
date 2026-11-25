@@ -1,0 +1,3 @@
+WORLD CHECK region: PASS — r.0.0.mca: 1024 chunks parsed, 0 failed
+WORLD CHECK scene: PASS — 61888 blocks, x 0..150, y -64..-49, z 0..90
+WORLD CHECK render: PASS — 5 views written
