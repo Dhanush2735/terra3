@@ -1,0 +1,7 @@
+Hartmann, Jens; Moosdorf, Nils (2012): Global Lithological Map Database v1.0
+(gridded to 0.5° spatial resolution). PANGAEA, doi:10.1594/PANGAEA.788537.
+Data license: Creative Commons Attribution 3.0 Unported.
+https://creativecommons.org/licenses/by/3.0/
+Converted to gzip-compressed categorical bytes (720 by 360, north first).
+Original IDs 1–16 retained. NODATA -9999 encoded as 0.
+Terra3 profiles are interpretations; the original source only maps surface lithology.

@@ -1113,6 +1113,7 @@ public class StructureTickHandler {
                  SAND, ROCK,
                  TREE_ROW, TREE,
                  RUNWAY, APRON -> cfg.landuse;
+            case BIOME_AREA   -> false; // Terrain-only metadata, not a structure.
             case STREET_LAMP,
                  PYLON        -> cfg.streetLights;
         };

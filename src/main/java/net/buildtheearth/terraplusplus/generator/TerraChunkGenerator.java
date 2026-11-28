@@ -3204,8 +3204,10 @@ for (int lx = 0; lx < 16; lx++) {
         // caves are carved by hand here. See CAVES_PHASE1.md.
         try{carveKarstCaves(a,f);}
         catch(Exception ex){
-            LOGGER.debug("carveKarstCaves: {}",
-                ex.getMessage());}}
+            LOGGER.debug("carveKarstCaves: {}",ex.getMessage());}
+        if(g==GenerationStep.Carving.AIR)
+            decorateUnderground(f,b);
+    }
 
     // ── KARST CAVE CARVER (2026-11-20) ────────────────────
     // Deterministic 80 m grid of seeded "worm" tunnels with
@@ -3239,7 +3241,7 @@ for (int lx = 0; lx < 16; lx++) {
         return b==Blocks.STONE||b==Blocks.DEEPSLATE
             ||b==Blocks.GRANITE||b==Blocks.DIORITE
             ||b==Blocks.ANDESITE||b==Blocks.TUFF
-            ||b==Blocks.CALCITE||b==Blocks.DRIPSTONE_BLOCK
+            ||b==Blocks.CALCITE||b==Blocks.DRIPSTONE_BLOCK||b==Blocks.BASALT
             ||b==Blocks.SANDSTONE||b==Blocks.RED_SANDSTONE;}
 
     private void carveKarstCaves(WorldGenRegion region,
@@ -3263,15 +3265,6 @@ for (int lx = 0; lx < 16; lx++) {
                 .SHALLOW_WATER
             ||tt==TerraDensityFunctions.TerrainType
                 .BELOW_SEA_WATER)return;
-        boolean centreLand=
-            tt==TerraDensityFunctions.TerrainType.LAND
-            ||tt==TerraDensityFunctions.TerrainType
-                .COASTLINE;
-        int kScore=KarstData.score(
-            centre.latitude,centre.longitude);
-        boolean karst=centreLand
-            &&kScore>=KarstData.KARST_MIN_SCORE;
-
         // Per-column surface estimate + land mask.
         int[] surf=new int[256];
         boolean[] land=new boolean[256];
@@ -3297,26 +3290,28 @@ for (int lx = 0; lx < 16; lx++) {
                         .TerrainType.COASTLINE;}
 
         long carvedHere=0;
-        if(karst){
-        final int CELL=80;
-        int gx0=Math.floorDiv(minX,CELL)-1;
-        int gx1=Math.floorDiv(minX+15,CELL)+1;
-        int gz0=Math.floorDiv(minZ,CELL)-1;
-        int gz1=Math.floorDiv(minZ+15,CELL)+1;
+        final int CELL=80, REACH=362; // 220 steps at 1.6 blocks plus chamber radius.
+        int gx0=Math.floorDiv(minX-REACH,CELL);
+        int gx1=Math.floorDiv(minX+15+REACH,CELL);
+        int gz0=Math.floorDiv(minZ-REACH,CELL);
+        int gz1=Math.floorDiv(minZ+15+REACH,CELL);
         var pos=new net.minecraft.core.BlockPos.MutableBlockPos();
         for(int gx=gx0;gx<=gx1;gx++)
           for(int gz=gz0;gz<=gz1;gz++){
             var rng=new java.util.Random(
                 mixSeed(gx,gz,0xCA7E5L));
-            // Density gate: strong karst (100) always
-            // seeds, weak karst (20) one cell in five.
-            if(rng.nextInt(100)>=kScore)continue;
+            int roll=rng.nextInt(100);
             int sx=gx*CELL+rng.nextInt(CELL);
             int sz=gz*CELL+rng.nextInt(CELL);
+            if(sx<minX-REACH||sx>minX+15+REACH
+                ||sz<minZ-REACH||sz>minZ+15+REACH)continue;
+            var geo=dfr.toGeo(sx,sz);
+            if(geo==null||!Double.isFinite(geo[0])||!Double.isFinite(geo[1]))continue;
+            int score=KarstData.score(geo[1],geo[0]);
+            if(score<KarstData.KARST_MIN_SCORE||roll>=score)continue;
             var sc=dfr.classify(sx,sz);
-            if(sc==null||Double.isNaN(sc.latitude)
-                ||KarstData.score(sc.latitude,sc.longitude)
-                    <KarstData.KARST_MIN_SCORE)continue;
+            if(sc==null||(sc.type!=TerraDensityFunctions.TerrainType.LAND
+                &&sc.type!=TerraDensityFunctions.TerrainType.COASTLINE))continue;
             int surfStart=sc.surfaceY;
             double x=sx+0.5,z=sz+0.5;
             double y=Math.max(MY+320,
@@ -3354,11 +3349,105 @@ for (int lx = 0; lx < 16; lx++) {
             if(n%100==0)
                 LOGGER.info("CAVES carvedChunks={} "
                     +"carvedBlocks={}",n,CAVE_BLOCKS.get());}
-        }
         // Phase 2 (2026-11-20): real caves & underground
         // structures at their true locations, any geology.
+        if(UniverseTransforms.PRIME.equals(universeId))
+            carveJenolanPilot(ch,minX,minZ,surf,land);
         carveRealCaves(region,ch,minX,minZ,surf,land,
-            centre.latitude,centre.longitude);}
+            centre.latitude,centre.longitude);
+        carveMappedTunnelLegs(region,ch,minX,minZ,surf,land);
+    }
+
+    private void carveJenolanPilot(ChunkAccess ch,int minX,int minZ,int[] surf,boolean[] land){
+        if(JenolanSurvey.SAMPLES.isEmpty()||!JenolanSurvey.near(minX,minZ))return;
+        var entrance=getDf().classify((int)Math.floor(JenolanSurvey.X),(int)Math.floor(JenolanSurvey.Z));
+        if(entrance==null||!Double.isFinite(entrance.elevationMeters))return;
+        switch(entrance.type){
+            case INVALID,OCEAN,SHALLOW_WATER,BELOW_SEA_WATER,RIVER,LAKE -> {return;}
+            default -> {}
+        }
+        var pos=new BlockPos.MutableBlockPos();
+        for(var p:JenolanSurvey.SAMPLES){
+            double x=JenolanSurvey.X+p.x(),z=JenolanSurvey.Z+p.z();
+            double y=entrance.surfaceY+p.y();
+            for(int bx=Math.max(minX,(int)Math.floor(x-2.4));bx<=Math.min(minX+15,(int)Math.floor(x+2.4));bx++)
+                for(int bz=Math.max(minZ,(int)Math.floor(z-2.4));bz<=Math.min(minZ+15,(int)Math.floor(z+2.4));bz++){
+                    int ci=(bx-minX)*16+bz-minZ;
+                    if(!land[ci])continue;
+                    boolean mouth=JenolanSurvey.mouth(bx+0.5,bz+0.5,p);
+                    int low=Math.max(ch.getMinBuildHeight()+8,(int)Math.floor(y-2));
+                    int high=Math.min(ch.getMaxBuildHeight()-9,(int)Math.ceil(y+2));
+                    for(int by=low;by<=high;by++){
+                        if(!mouth&&by>surf[ci]-8)continue;
+                        double dx=(bx+0.5-x)/2.4,dz=(bz+0.5-z)/2.4,dy=(by+0.5-y)/2.0;
+                        if(dx*dx+dy*dy+dz*dz>1)continue;
+                        pos.set(bx,by,bz);
+                        var cur=ch.getBlockState(pos);
+                        if(cur.isAir()||!cur.getFluidState().isEmpty())continue;
+                        if(!(mouth?canCarveShaftBlock(cur):isCaveRock(cur)))continue;
+                        if(!mouth){
+                            pos.set(bx,by+7,bz);
+                            if(!isCaveRock(ch.getBlockState(pos)))continue;
+                            pos.set(bx,by,bz);
+                        }
+                        ch.setBlockState(pos,AIR,false);
+                    }
+                }
+        }
+    }
+
+    private void carveMappedTunnelLegs(WorldGenRegion region,ChunkAccess ch,
+            int minX,int minZ,int[] surf,boolean[] land){
+        var legs=MappedTunnelRoutes.forChunk(ch.getPos().x,ch.getPos().z);
+        if(legs.isEmpty())return;
+        var pos=new BlockPos.MutableBlockPos();
+        for(var leg:legs){
+            var a=leg.from(); var b=leg.to();
+            int steps=(int)Math.ceil(Math.hypot(Math.hypot(b.x()-a.x(),b.z()-a.z()),b.y()-a.y()));
+            for(int i=0;i<=steps;i++){
+                double t=(double)i/steps;
+                double x=a.x()+(b.x()-a.x())*t;
+                double floor=a.y()+(b.y()-a.y())*t;
+                double z=a.z()+(b.z()-a.z())*t;
+                boolean portal=Math.min(Math.hypot(x-leg.entrance().x(),z-leg.entrance().z()),
+                    Math.hypot(x-leg.exit().x(),z-leg.exit().z()))<=24;
+                carveTunnelSection(ch,minX,minZ,surf,land,x,floor,z,portal,pos);
+            }
+        }
+    }
+
+    // Keep the mapped roadbed intact. Only a short window around the two
+    // imported endpoints may break the surface; never carve water or structures.
+    private static void carveTunnelSection(ChunkAccess ch,int minX,int minZ,
+            int[] surf,boolean[] land,double x,double floor,double z,boolean portal,
+            BlockPos.MutableBlockPos pos){
+        int y0=(int)Math.floor(floor)+1;
+        if(y0<ch.getMinBuildHeight()+8||y0+4>=ch.getMaxBuildHeight()-8)return;
+        for(int bx=Math.max(minX,(int)Math.floor(x-3));bx<=Math.min(minX+15,(int)Math.floor(x+3));bx++)
+            for(int bz=Math.max(minZ,(int)Math.floor(z-3));bz<=Math.min(minZ+15,(int)Math.floor(z+3));bz++){
+                double dx=bx+0.5-x,dz=bz+0.5-z;
+                if(dx*dx+dz*dz>9.0)continue;
+                int ci=(bx-minX)*16+bz-minZ;
+                if(!land[ci])continue;
+                boolean mouth=portal&&Math.abs(surf[ci]-floor)<=24;
+                int top=y0+3;
+                if(!mouth&&top>surf[ci]-8)continue;
+                boolean clear=true;
+                for(int y=y0;y<=top;y++){
+                    pos.set(bx,y,bz);
+                    var state=ch.getBlockState(pos);
+                    if(!state.getFluidState().isEmpty()||(!state.isAir()
+                            && !(mouth?canCarveShaftBlock(state):isCaveRock(state)))){
+                        clear=false;break;
+                    }
+                }
+                if(!clear)continue;
+                for(int y=y0;y<=top;y++){
+                    pos.set(bx,y,bz);
+                    if(!ch.getBlockState(pos).isAir())ch.setBlockState(pos,AIR,false);
+                }
+            }
+    }
 
     // ── PHASE 2: REAL CAVES & STRUCTURES (2026-11-20) ────
     // Every known cave/mine/bunker point (CaveData) whose
@@ -3398,26 +3487,31 @@ for (int lx = 0; lx < 16; lx++) {
             if(CaveData.isSensitive(idx))continue;
             double[] bxz=dfr.fromGeo(
                 CaveData.lat(idx),CaveData.lon(idx));
-            if(bxz==null)continue;
+            if(bxz==null||!Double.isFinite(bxz[0])
+                ||!Double.isFinite(bxz[1]))continue;
             int ex=(int)Math.floor(bxz[0]);
             int ez=(int)Math.floor(bxz[1]);
-            int reach=(int)(stepsFor(idx)*1.6)+80;
+            // Bound by the longest possible path for each feature kind.
+            int reach=switch(CaveData.kind(idx)){
+                case CaveData.KIND_BUNKER -> 8;
+                case CaveData.KIND_MINE_SHAFT -> 274;
+                case CaveData.KIND_MINE_ADIT -> 355;
+                default -> (int)Math.ceil(stepsFor(idx)*1.6)+12;
+            };
+            if(CaveData.kind(idx)==CaveData.KIND_CAVE){
+                var survey=SurveyedCaves.at(CaveData.lat(idx),CaveData.lon(idx));
+                if(survey!=null)reach=Math.max(reach,survey.reach());
+            }
             if(ex<minX-reach||ex>minX+15+reach
                 ||ez<minZ-reach||ez>minZ+15+reach)continue;
             cand[nc++]=new int[]{idx,ex,ez};}
         if(nc==0)return;
-        // Entrances inside this chunk first, then nearest.
+        // Stable order across neighboring chunks. A nearest-N cap
+        // selects different paths across borders and cuts tunnels off.
         java.util.Arrays.sort(cand,0,nc,
-            java.util.Comparator.comparingInt(a->{
-                boolean in=a[1]>=minX&&a[1]<minX+16
-                    &&a[2]>=minZ&&a[2]<minZ+16;
-                int d=Math.max(Math.abs(a[1]-(minX+8)),
-                               Math.abs(a[2]-(minZ+8)));
-                return (in?0:1000000)+d;}));
-        var pos=new net.minecraft.core.BlockPos
-            .MutableBlockPos();
-        int sim=Math.min(nc,24);
-        for(int i=0;i<sim;i++){
+            java.util.Comparator.comparingInt(a->a[0]));
+        var pos=new net.minecraft.core.BlockPos.MutableBlockPos();
+        for(int i=0;i<nc;i++){
             int idx=cand[i][0],ex=cand[i][1],ez=cand[i][2];
             boolean inChunk=ex>=minX&&ex<minX+16
                 &&ez>=minZ&&ez<minZ+16;
@@ -3450,22 +3544,50 @@ for (int lx = 0; lx < 16; lx++) {
         var rng=new java.util.Random(
             mixSeed(ex,ez,idx*2654435761L));
         boolean built=false;
+        int plannedDepth=12;
+
+        var survey=kind==CaveData.KIND_CAVE
+                ?SurveyedCaves.at(CaveData.lat(idx),CaveData.lon(idx)):null;
+        if(survey!=null){
+            boolean fits=true;
+            for(var station:survey.stations())
+                if(surfY+station.y()<MY+12||surfY+station.y()>XY-12){fits=false;break;}
+            if(fits){
+                var points=survey.stations();
+                for(int i=1;i<points.size();i++){
+                    var a=points.get(i-1);var b=points.get(i);
+                    if(ex+Math.max(a.x(),b.x())+4<minX||ex+Math.min(a.x(),b.x())-4>minX+15
+                        ||ez+Math.max(a.z(),b.z())+4<minZ||ez+Math.min(a.z(),b.z())-4>minZ+15)continue;
+                    int count=Math.max(1,(int)Math.ceil(Math.hypot(Math.hypot(b.x()-a.x(),b.z()-a.z()),b.y()-a.y())));
+                    for(int j=0;j<=count;j++){
+                        double t=(double)j/count;
+                        carveBall(region,ch,minX,minZ,surf,land,
+                            ex+0.5+a.x()+(b.x()-a.x())*t,surfY+a.y()+(b.y()-a.y())*t,
+                            ez+0.5+a.z()+(b.z()-a.z())*t,2.4,pos);
+                    }
+                }
+                boolean opened=carveShaft(region,minX,minZ,surf,land,ex,ez,
+                    surfY+(int)Math.floor(points.get(0).y()),false,pos)>0;
+                if(opened&&inChunk)LOGGER.info("REALCAVE BLUEPRINT {} source={} stations={}",
+                    CaveData.name(idx),survey.source(),points.size());
+                return;
+            }
+        }
 
         if(kind==CaveData.KIND_BUNKER){
-            if(!inChunk)return;
             carveEllipsoid(region,ch,minX,minZ,surf,land,
-                ex+0.5,surfY-9,ez+0.5,6.0,2.5,6.0,pos);
-            built=carveShaft(region,minX,minZ,ex,ez,
-                surfY+12,surfY-7,pos)>0;
+                ex+0.5,surfY-12,ez+0.5,6.0,3.0,6.0,pos);
+            built=carveShaft(region,minX,minZ,surf,land,ex,ez,
+                surfY-12,true,pos)>0;
         }else if(kind==CaveData.KIND_MINE_SHAFT){
             int depth=CaveData.hasDepth(idx)
                 ?Math.max(20,Math.min(CaveData.depthM(idx),
                     surfY-(MY+160)))
                 :50+rng.nextInt(110);
             int bottomY=surfY-depth;
-            if(inChunk)
-                built=carveShaft(region,minX,minZ,ex,ez,
-                    surfY+12,bottomY,pos)>0;
+            plannedDepth=depth;
+            carveBall(region,ch,minX,minZ,surf,land,
+                ex+0.5,bottomY+2,ez+0.5,2.4,pos);
             // Two crossing galleries at the shaft bottom.
             double h0=rng.nextDouble()*Math.PI;
             for(int g=0;g<2;g++){
@@ -3478,7 +3600,7 @@ for (int lx = 0; lx < 16; lx++) {
                     z+=Math.sin(heading)*1.6;
                     carveBall(region,ch,minX,minZ,surf,land,
                         x,y,z,1.7,pos);}}
-            built=true;
+            built=carveShaft(region,minX,minZ,surf,land,ex,ez,bottomY,true,pos)>0;
         }else{
             // Cave (described or dot) and mine adit.
             boolean adit=kind==CaveData.KIND_MINE_ADIT;
@@ -3490,14 +3612,22 @@ for (int lx = 0; lx < 16; lx++) {
             double yTarget=Math.max(MY+140,
                 surfY-targetDepth);
             double x=ex+0.5,z=ez+0.5;
-            double y=adit?surfY-2:surfY-7;
+            double y=surfY-(adit?10:12);
             double heading=rng.nextDouble()*Math.PI*2.0;
             double pitch=adit?-0.02:-1.0;
             double baseRad=adit?1.7:2.1+rng.nextDouble()*1.1;
             int chamberEvery=110+rng.nextInt(120);
-            if(inChunk&&!adit)
-                built=carveShaft(region,minX,minZ,ex,ez,
-                    surfY+12,(int)y+4,pos)>0;
+            // With no surveyed portal orientation, use a short access
+            // opening into the buried passage instead of a blind adit.
+            int accessBottom=(int)Math.floor(y);
+            boolean surveyedDepth=!adit&&CaveData.hasDepth(idx);
+            double startY=y;
+            // The reported depth is a maximum, not a surveyed route.
+            // Reach it when the passage budget allows, without a final jump.
+            double plannedEndY=Math.min(startY,Math.max(yTarget,startY-steps*2.4));
+            double deepestY=y;
+            carveBall(region,ch,minX,minZ,surf,land,
+                x,y,z,Math.max(2.4,baseRad),pos);
             for(int s=0;s<steps;s++){
                 double want=Math.max(-2.3,Math.min(0.3,
                     (yTarget-y)/55.0));
@@ -3506,11 +3636,21 @@ for (int lx = 0; lx < 16; lx++) {
                 if(pitch>0.4)pitch=0.4;
                 if(pitch<-2.6)pitch=-2.6;
                 heading+=(rng.nextDouble()-0.5)*0.5;
+                double prevX=x,prevY=y,prevZ=z;
                 x+=Math.cos(heading)*1.6;
                 z+=Math.sin(heading)*1.6;
                 y+=pitch*1.6;
+                if(surveyedDepth)y=startY+(plannedEndY-startY)*(s+1.0)/steps;
                 if(y<MY+120)y=MY+120;
+                deepestY=Math.min(deepestY,y);
                 double rad=baseRad+Math.sin(s*0.3)*0.4;
+                // Sample steep spans at <1 block vertical spacing.
+                int slices=Math.max(1,(int)Math.ceil(Math.abs(y-prevY)/0.9));
+                for(int j=1;j<slices;j++){
+                    double t=(double)j/slices;
+                    carveBall(region,ch,minX,minZ,surf,land,
+                        prevX+(x-prevX)*t,prevY+(y-prevY)*t,
+                        prevZ+(z-prevZ)*t,rad,pos);}
                 carveBall(region,ch,minX,minZ,surf,land,
                     x,y,z,rad,pos);
                 if(!adit&&s>0&&s%chamberEvery==0)
@@ -3519,44 +3659,93 @@ for (int lx = 0; lx < 16; lx++) {
                         5.0+rng.nextDouble()*4.0,
                         3.0+rng.nextDouble()*2.0,
                         5.0+rng.nextDouble()*4.0,pos);}
-            built=true;}
+            plannedDepth=(int)Math.round(surfY-deepestY);
+            built=carveShaft(region,minX,minZ,surf,land,ex,ez,accessBottom,adit,pos)>0;
+        }
 
         if(built&&inChunk){
             long n=REALCAVE_BUILT.incrementAndGet();
             if(n<=25||n%250==0)
                 LOGGER.info("REALCAVE {} kind={} depth={} "
-                    +"len={} entrancesBuilt={}",
+                    +"len={} plannedDepth={} entranceX={} entranceZ={} entrancesBuilt={}",
                     CaveData.name(idx),kind,
                     CaveData.depthM(idx),
-                    CaveData.lengthM(idx),n);}}
+                    CaveData.lengthM(idx),plannedDepth,ex,ez,n);}}
 
-    /** Carves a 2x2 entrance shaft from the ground down to
-     *  bottomY. Refuses if the surface is water. Only writes
-     *  blocks inside this chunk. */
+    /** Carve the local columns of a 2x2 entrance, even when it spans chunks. */
     private long carveShaft(WorldGenRegion region,
-            int minX,int minZ,int ex,int ez,int topHint,
-            int bottomY,
+            int minX,int minZ,int[] surf,boolean[] land,int ex,int ez,int bottomY,boolean addLadder,
             net.minecraft.core.BlockPos.MutableBlockPos pos){
-        int top=-1;
-        for(int y=Math.min(XY-40,topHint);y>bottomY;y--){
-            pos.set(ex,y,ez);
-            var st=region.getBlockState(pos);
-            if(st.isAir())continue;
-            if(st.getBlock()==Blocks.WATER)return 0;
-            top=y;break;}
-        if(top<0)return 0;
+        // Choose an outer wall that shares the ladder column's chunk.
+        // At x mod 16 == 0 use the east wall; otherwise use the west wall.
+        boolean east=Math.floorMod(ex,16)==0;
+        int ladderX=east?ex+1:ex;
+        int wallX=east?ex+2:ex-1;
+        var facing=east?net.minecraft.core.Direction.WEST:net.minecraft.core.Direction.EAST;
+        BlockState ladder=Blocks.LADDER.defaultBlockState().setValue(LadderBlock.FACING,facing);
         long n=0;
-        for(int y=top;y>=bottomY;y--)
-            for(int dx=0;dx<=1;dx++)
-                for(int dz=0;dz<=1;dz++){
-                    int bx=ex+dx,bz=ez+dz;
-                    if(bx<minX||bx>minX+15
-                        ||bz<minZ||bz>minZ+15)continue;
+        for(int bx=Math.max(ex,minX);bx<=Math.min(ex+1,minX+15);bx++)
+            for(int bz=Math.max(ez,minZ);bz<=Math.min(ez+1,minZ+15);bz++){
+                int ci=(bx-minX)*16+(bz-minZ);
+                if(!land[ci])continue;
+                // The painted surface can sit above the projected Y.
+                // Find the actual cap in a bounded band; never remove a
+                // fluid or a block outside the natural-terrain allowlist.
+                int top=Math.min(XY-8,surf[ci]+12);
+                int bottom=Math.max(MY+8,bottomY);
+                while(top>=bottom){
+                    pos.set(bx,top,bz);
+                    if(!region.getBlockState(pos).isAir())break;
+                    top--;
+                }
+                if(top<bottom)continue;
+                // Preflight the entire column to avoid leaving a blind
+                // opening on top of fluid or a protected block.
+                boolean clear=true;
+                for(int y=top;y>=bottom;y--){
                     pos.set(bx,y,bz);
-                    if(region.getBlockState(pos).isAir())
-                        continue;
-                    region.setBlock(pos,AIR,2);n++;}
-        return n;}
+                    var state=region.getBlockState(pos);
+                    // Foliage at the mouth is not a protected structure.
+                    // Still refuse logs, fluid and any other non-natural block.
+                    boolean leafCap=y>=surf[ci]-4 && state.getFluidState().isEmpty()
+                        && state.is(net.minecraft.tags.BlockTags.LEAVES);
+                    if(!leafCap&&!canCarveShaftBlock(state)){
+                        clear=false;break;
+                    }
+                }
+                if(!clear)continue;
+                for(int y=top;y>=bottom;y--){
+                    pos.set(bx,y,bz);
+                    var state=region.getBlockState(pos);
+                    if(!state.isAir()){region.setBlock(pos,AIR,2);n++;}
+                    if(addLadder&&bx==ladderX&&bz==ez){
+                        pos.set(wallX,y,bz);
+                        var wall=region.getBlockState(pos);
+                        if(wall.isAir()&&land[(wallX-minX)*16+bz-minZ]
+                                &&y<=surf[(wallX-minX)*16+bz-minZ]){
+                            wall=Blocks.STONE_BRICKS.defaultBlockState();
+                            region.setBlock(pos,wall,2);
+                        }
+                        if(wall.isFaceSturdy(region,pos,facing)){
+                            pos.set(bx,y,bz);
+                            region.setBlock(pos,ladder,2);
+                        }
+                    }
+                }
+            }
+        return n;
+    }
+
+    private static boolean canCarveShaftBlock(BlockState state){
+        return state.getFluidState().isEmpty() && (state.isAir()
+            ||isCaveRock(state)||state.is(Blocks.GRASS_BLOCK)
+            ||state.is(Blocks.DIRT)||state.is(Blocks.COARSE_DIRT)
+            ||state.is(Blocks.ROOTED_DIRT)||state.is(Blocks.PODZOL)
+            ||state.is(Blocks.SAND)||state.is(Blocks.RED_SAND)
+            ||state.is(Blocks.GRAVEL)||state.is(Blocks.MUD)||state.is(Blocks.CLAY)
+            ||state.is(Blocks.MOSS_BLOCK)||state.is(Blocks.SNOW_BLOCK)
+            ||state.is(Blocks.SNOW));
+    }
 
     /** Carves one squashed sphere (tunnel cross-section or,
      *  with chamber=true, a room). Returns blocks carved in
@@ -4498,6 +4687,23 @@ for (int lx = 0; lx < 16; lx++) {
             &&lat>=-10.0&&lat<=25.0;}
 
     // ── TREE PLACEMENT ────────────────────────────────────────
+    private boolean nearMappedCaveMouth(int x,int z,double lat,double lon){
+        if(!realCavesEnabled()||!Double.isFinite(lat)||!Double.isFinite(lon))return false;
+        var df=getDf();
+        if(df==null||!df.isProjectionLoaded())return false;
+        double latRange=0.001;
+        double lonRange=latRange/Math.max(0.05,Math.cos(Math.toRadians(lat)));
+        for(int idx:CaveData.inBox(lat-latRange,lat+latRange,lon-lonRange,lon+lonRange)){
+            if(CaveData.isSensitive(idx))continue;
+            var projected=df.fromGeo(CaveData.lat(idx),CaveData.lon(idx));
+            if(projected==null||!Double.isFinite(projected[0])||!Double.isFinite(projected[1]))continue;
+            // Leave room around both columns, including crowns from neighboring chunks.
+            if(Math.abs(x-Math.floor(projected[0]))<=8
+                &&Math.abs(z-Math.floor(projected[1]))<=8)return true;
+        }
+        return false;
+    }
+
     private void placeTree(WorldGenLevel lvl,int bx,
             int sy,int bz,double lat,double lon,
             double temp,BlockState surf){
@@ -4510,6 +4716,7 @@ for (int lx = 0; lx < 16; lx++) {
         if(!lvl.getBlockState(
                 new BlockPos(bx,sy+1,bz)).isAir())
             return;
+        if(nearMappedCaveMouth(bx,bz,lat,lon))return;
         if(isSEAsiaBamboo(lat,lon)&&temp>=22.0)
             placeBamboo(lvl,bx,sy,bz,h);
         else if(temp<0.0)
@@ -5087,6 +5294,66 @@ for (int lx = 0; lx < 16; lx++) {
         return bp.LUSH_CAVES!=null?bp.LUSH_CAVES
             :bp.DRIPSTONE_CAVES;}
 
+    private List<OsmStructureIndex.OsmStructure> biomeAreas(
+            TerraDensityFunctions d, int x, int z) {
+        double minLat=90,maxLat=-90,minLon=180,maxLon=-180;
+        for(int dx:new int[]{0,15}) for(int dz:new int[]{0,15}) {
+            var g=d.toGeo(x+dx,z+dz);
+            if(g==null||!Double.isFinite(g[0])||!Double.isFinite(g[1]))
+                return List.of();
+            minLat=Math.min(minLat,g[1]); maxLat=Math.max(maxLat,g[1]);
+            minLon=Math.min(minLon,g[0]); maxLon=Math.max(maxLon,g[0]);
+        }
+        if(maxLon-minLon>180) return List.of();
+        return getStructureIndex().getStructuresForChunk(
+                minLat,maxLat,minLon,maxLon,getWorldConfig()).stream()
+                .filter(s->s.type==OsmStructureIndex.StructureType.BIOME_AREA).toList();
+    }
+
+    private static OsmStructureIndex.OsmStructure areaHintAt(
+            List<OsmStructureIndex.OsmStructure> areas,
+            double lat,double lon,boolean beachAllowed) {
+        OsmStructureIndex.OsmStructure best=null;
+        int priority=0;
+        for(var a:areas) {
+            int rank=switch(a.subType) {
+                case "glacier" -> 4;
+                case "mangrove" -> 3;
+                case "wetland" -> 2;
+                case "beach" -> beachAllowed?1:0;
+                default -> 0;
+            };
+            if(rank>0 && (rank>priority || (rank==priority && a.osmId<best.osmId))
+                    &&a.containsPoint(lat,lon)) {
+                best=a; priority=rank;
+            }
+        }
+        return best;
+    }
+
+    private BlockState mappedGround(List<OsmStructureIndex.OsmStructure> areas,
+            double lat,double lon,int x,int z) {
+        var area=areaHintAt(areas,lat,lon,true);
+        if(area!=null && "beach".equals(area.subType) && !isShoreCellPublic(x,z))
+            return null;
+        return biomeAreaSurface(area);
+    }
+
+    private static BlockState biomeAreaSurface(OsmStructureIndex.OsmStructure a) {
+        if(a==null)return null;
+        return switch(a.subType) {
+            case "glacier" -> Blocks.SNOW_BLOCK.defaultBlockState();
+            case "wetland", "mangrove" -> MUD;
+            case "beach" -> switch(a.surface==null?"":a.surface) {
+                case "pebblestone", "gravel", "shingle" -> GRAVEL;
+                case "rock", "stone", "bare_rock" -> STONE;
+                case "mud" -> MUD;
+                default -> SAND;
+            };
+            default -> null;
+        };
+    }
+
     private void assignBiomes(ChunkAccess ch){
         try{
             var bp=getTerraBiomes();
@@ -5154,6 +5421,7 @@ for (int lx = 0; lx < 16; lx++) {
             // landing mid-paint can no longer stripe the
             // biomes vertically.
             long biomeT0=System.currentTimeMillis();
+            var areas=biomeAreas(d,cmx,cmz);
             @SuppressWarnings("unchecked")
             Holder<Biome>[] qBiome=(Holder<Biome>[])
                 new Holder[16];
@@ -5186,6 +5454,27 @@ for (int lx = 0; lx < 16; lx++) {
                         bp.getBiomeForLocation(
                             la,lo,el,col.type,
                             wcClass,shore);
+                    if(col.type==TerraDensityFunctions.TerrainType.LAND
+                            ||col.type==TerraDensityFunctions.TerrainType.COASTLINE) {
+                        var area=areaHintAt(areas,la,lo,shore);
+                        if(area!=null) {
+                            Holder<Biome> mapped=switch(area.subType) {
+                                case "glacier" -> bp.SNOWY_SLOPES;
+                                case "mangrove" -> bp.MANGROVE_SWAMP;
+                                case "wetland" -> bp.SWAMP;
+                                case "beach" -> {
+                                    var surface=biomeAreaSurface(area);
+                                    yield surface==STONE||surface==GRAVEL
+                                            ?bp.STONY_SHORE:bp.BEACH;
+                                }
+                                default -> null;
+                            };
+                            if(mapped!=null && mapped!=bi) {
+                                LOGGER.debug("OSM BIOME OVERRIDE [{},{}]: {}",blockX,blockZ,area.subType);
+                                bi=mapped;
+                            }
+                        }
+                    }
                     if(bi==null)continue;
                     // Caves Phase 1 (2026-11-20): in
                     // karst regions, underground biome
@@ -5426,34 +5715,149 @@ for (int lx = 0; lx < 16; lx++) {
         if(pm<90)return GRASS;
         return DIRT;}
     // ── UNDERGROUND ───────────────────────────────────────────
-    private void ugLava(ChunkAccess c,
-            BlockPos.MutableBlockPos p,
-            int x,int z,int sy,int mb){
+    // Small, intentionally simulated deposits; no claim about a real ore vein or aquifer.
+    private void decorateUnderground(ChunkAccess c,long seed){
+        int x0=c.getPos().getMinBlockX(), z0=c.getPos().getMinBlockZ();
+        var df=getDf();
+        if(df==null||!df.isProjectionLoaded())return;
+        var col=df.classify(x0+8,z0+8);
+        if(col==null||col.type!=TerraDensityFunctions.TerrainType.LAND)return;
+        int id=UndergroundGeology.mappedClass(col.latitude,col.longitude);
+        var rng=new java.util.Random(mixSeed(x0,z0,seed^0x674EA011L));
+        var p=new BlockPos.MutableBlockPos();
+        for(int attempt=0;attempt<12;attempt++){
+            int x=x0+3+rng.nextInt(10),z=z0+3+rng.nextInt(10);
+            int top=Math.min(168,col.surfaceY-18);
+            int base=Math.max(c.getMinBuildHeight()+10,-170);
+            if(top<=base)break;
+            int y=base+rng.nextInt(top-base);
+            int roll=rng.nextInt(100),radius=roll<10?1:2;
+            for(int dx=-radius;dx<=radius;dx++) for(int dz=-radius;dz<=radius;dz++)
+                for(int dy=-1;dy<=1;dy++){
+                    if(dx*dx+dz*dz+2*dy*dy>radius*radius)continue;
+                    p.set(x+dx,y+dy,z+dz);
+                    var host=c.getBlockState(p);
+                    // Replace only common host blocks, never an open cave or a structure.
+                    boolean deep=host.is(Blocks.DEEPSLATE);
+                    if(!deep&&!host.is(Blocks.STONE)&&!host.is(Blocks.GRANITE)
+                            &&!host.is(Blocks.TUFF)&&!host.is(Blocks.BASALT))continue;
+                    var ore=y<-48&&roll<7?(deep?Blocks.DEEPSLATE_DIAMOND_ORE:Blocks.DIAMOND_ORE)
+                            :y<5&&roll<18?(deep?Blocks.DEEPSLATE_REDSTONE_ORE:Blocks.REDSTONE_ORE)
+                            :y<40&&roll<26?(deep?Blocks.DEEPSLATE_GOLD_ORE:Blocks.GOLD_ORE)
+                            :roll<(id==2||id==7?60:47)?(deep?Blocks.DEEPSLATE_COPPER_ORE:Blocks.COPPER_ORE)
+                            :roll<80?(deep?Blocks.DEEPSLATE_IRON_ORE:Blocks.IRON_ORE)
+                            :(deep?Blocks.DEEPSLATE_COAL_ORE:Blocks.COAL_ORE);
+                    c.setBlockState(p,ore.defaultBlockState(),false);
+                }
+        }
+        if(rng.nextInt(14)==0){
+            int y=col.surfaceY-35-rng.nextInt(35);
+            placeGroundwaterPool(c,p,x0+8,y,z0+8,mixSeed(x0,z0,seed^0x51A7E2L));
+        }
+        if((id==2||id==7||id==10||id==12)&&rng.nextInt(40)==0){
+            int y=Math.min(-100,col.surfaceY-120)-rng.nextInt(60);
+            placeSealedPocket(c,p,x0+8,y,z0+8,LAVA,Blocks.OBSIDIAN.defaultBlockState());
+        }
+    }
+
+    // A small pocket in existing rock: flat waterline, uneven banks and
+    // headroom. Only the wet boundary gets a clay seal, not the ceiling.
+    private static void placeGroundwaterPool(ChunkAccess c,BlockPos.MutableBlockPos p,
+            int x,int y,int z,long seed){
+        if(y-4<=c.getMinBuildHeight()||y+4>=c.getMaxBuildHeight())return;
+        final int width=13, height=9, mid=6, level=4, plane=width*width;
+        byte[] volume=new byte[height*plane]; // 1 water, 2 air, 3 adjacent rock, 4 wet seal
+        var shape=new java.util.Random(seed);
+        double theta=shape.nextDouble()*2*Math.PI;
+        double cs=Math.cos(theta),sn=Math.sin(theta);
+        double rx=3.2+shape.nextDouble()*1.4, rz=1.9+shape.nextDouble()*1.5;
+        double wobble=shape.nextDouble()*2*Math.PI;
+        for(int dy=-3;dy<=3;dy++)for(int dz=-5;dz<=5;dz++)for(int dx=-5;dx<=5;dx++){
+            double u=(dx*cs+dz*sn)/rx,v=(dz*cs-dx*sn)/rz;
+            double vertical=(dy-0.35)/(dy<=0?2.8:2.65);
+            double edge=1.0+0.17*Math.sin(1.1*dx+0.8*dz+wobble);
+            if(u*u+v*v+vertical*vertical<=edge)
+                volume[(dy+level)*plane+(dz+mid)*width+dx+mid]=(byte)(dy<=0?1:2);
+        }
+        int[] neighbors={1,-1,width,-width,plane,-plane};
+        for(int i=0;i<volume.length;i++){
+            if(volume[i]!=1&&volume[i]!=2)continue;
+            boolean wet=volume[i]==1;
+            for(int off:neighbors){
+                int j=i+off;
+                if(volume[j]==0 || (wet&&volume[j]==3))volume[j]=(byte)(wet?4:3);
+            }
+        }
+        // Reject the entire pool if it would join an existing passage,
+        // touch a protected block, or replace part of another feature.
+        for(int i=0;i<volume.length;i++){
+            if(volume[i]==0)continue;
+            p.set(x+i%width-mid,y+i/plane-level,z+(i%plane)/width-mid);
+            if(!isCaveRock(c.getBlockState(p)))return;
+        }
+        for(int i=0;i<volume.length;i++){
+            if(volume[i]==0||volume[i]==3)continue;
+            p.set(x+i%width-mid,y+i/plane-level,z+(i%plane)/width-mid);
+            c.setBlockState(p,volume[i]==1?WATER:volume[i]==2?AIR:CLAY,false);
+        }
+    }
+
+    private static void placeSealedPocket(ChunkAccess c,BlockPos.MutableBlockPos p,
+            int x,int y,int z,BlockState fluid,BlockState lining){
+        if(y-2<=c.getMinBuildHeight()||y+2>=c.getMaxBuildHeight())return;
+        // The whole pocket and its lining must already be solid, after cave carving.
+        for(int dx=-3;dx<=3;dx++)for(int dz=-3;dz<=3;dz++)for(int dy=-2;dy<=2;dy++){
+            p.set(x+dx,y+dy,z+dz);
+            if(!isCaveRock(c.getBlockState(p)))return;
+        }
+        for(int dx=-3;dx<=3;dx++)for(int dz=-3;dz<=3;dz++)for(int dy=-2;dy<=2;dy++){
+            p.set(x+dx,y+dy,z+dz);
+            c.setBlockState(p,Math.abs(dx)<=2&&Math.abs(dz)<=2&&Math.abs(dy)<=1?fluid:lining,false);
+        }
+    }
+
+    private void fillRegionalRock(ChunkAccess c,BlockPos.MutableBlockPos p,
+            int x,int z,int sy,int mb,boolean land){
+        double[] geo=null;
+        if(land){
+            var df=getDf();
+            if(df!=null&&df.isProjectionLoaded())geo=df.toGeo(x,z);
+        }
+        var profile=UndergroundGeology.profile(geo==null?Double.NaN:geo[1],
+                geo==null?Double.NaN:geo[0],x,z,land);
         p.set(x,mb,z);
         c.setBlockState(p,BEDROCK,false);
-        int lt=sy-LD,lb=lt-LT;
-        for(int y=mb+1;y<=sy-4;y++){
+        fillRockRun(c,p,x,z,mb+1,Math.min(sy-4,profile.middleFloor()-1),profile.deep());
+        fillRockRun(c,p,x,z,Math.max(mb+1,profile.middleFloor()),
+                Math.min(sy-4,profile.upperFloor()-1),profile.middle());
+        fillRockRun(c,p,x,z,Math.max(mb+1,profile.upperFloor()),sy-4,profile.upper());
+        if(land&&profile.source()==1){
+            // Unconsolidated GLiM class: a modest loose layer under the existing surface cap.
+            int thickness=6+(int)Math.round(3+3*Math.sin(x/240.0)*Math.cos(z/260.0));
+            for(int y=Math.max(mb+1,sy-7-thickness);y<=sy-8;y++){
+                p.set(x,y,z);
+                c.setBlockState(p,y<=sy-11?GRAVEL:CLAY,false);
+            }
+        }
+    }
+
+    private static void fillRockRun(ChunkAccess c,BlockPos.MutableBlockPos p,
+            int x,int z,int lo,int hi,UndergroundGeology.Rock rock){
+        if(lo>hi)return;
+        BlockState block=switch(rock){
+            case STONE -> STONE;
+            case DEEPSLATE -> DEEPSLATE;
+            case CALCITE -> Blocks.CALCITE.defaultBlockState();
+            case SANDSTONE -> SANDSTONE;
+            case TUFF -> TUFF;
+            case GRANITE -> Blocks.GRANITE.defaultBlockState();
+            case BASALT -> Blocks.BASALT.defaultBlockState();
+        };
+        for(int y=lo;y<=hi;y++){
             p.set(x,y,z);
-            if(y<=lb)c.setBlockState(p,LAVA,false);
-            else if(y<=lt){
-                int h=TerraDensityFunctions
-                    .blockHash(x+y,z);
-                c.setBlockState(p,
-                    h%4==0?LAVA:y<=0
-                        ?DEEPSLATE:STONE,false);}
-            else c.setBlockState(p,
-                y<=0?DEEPSLATE:STONE,false);}}
-    private void ug(ChunkAccess c,
-            BlockPos.MutableBlockPos p,
-            int x,int z,int sy,int mb){
-        p.set(x,mb,z);
-        c.setBlockState(p,BEDROCK,false);
-        for(int y=mb+1;y<=Math.min(0,sy-8);y++){
-            p.set(x,y,z);
-            c.setBlockState(p,DEEPSLATE,false);}
-        for(int y=Math.max(1,mb+1);y<=sy-4;y++){
-            p.set(x,y,z);
-            c.setBlockState(p,STONE,false);}}
+            c.setBlockState(p,block,false);
+        }
+    }
 
     // ── BSW / WATER BORDER ────────────────────────────────────
     private void smoothBSW(
@@ -5733,7 +6137,13 @@ for (int lx = 0; lx < 16; lx++) {
         return r;}
 
     // ── MAIN TERRAIN GENERATION ───────────────────────────────
+    private final java.util.concurrent.atomic.AtomicBoolean undergroundPresetLogged=
+        new java.util.concurrent.atomic.AtomicBoolean();
+
     private void generateTerrain(ChunkAccess ch){
+        if(undergroundPresetLogged.compareAndSet(false,true))
+            LOGGER.info("TERRA UNDERGROUND build=NW36-R3 realisticUnderground=true undergroundExtras=true realCaves={}",
+                realCavesEnabled());
         int cx=ch.getPos().getMinBlockX();
         int cz=ch.getPos().getMinBlockZ();
         int mb=ch.getMinBuildHeight();
@@ -6172,6 +6582,7 @@ for (int lx = 0; lx < 16; lx++) {
             }catch(Exception ignored){}}
 
         try{
+            var groundAreas=biomeAreas(d,cx,cz);
             for(int lx=0;lx<16;lx++)
                 for(int lz=0;lz<16;lz++){
                     int gx=lx+B,gz=lz+B;
@@ -6196,7 +6607,8 @@ for (int lx = 0; lx < 16; lx++) {
                     switch(cl.type){
                         case LAND->pLand(ch,p,bx,bz,
                             sf,cl.elevationMeters,mb,
-                            nw,lw,ws,sh,rk);
+                            nw,lw,ws,sh,rk,mappedGround(groundAreas,
+                                    cl.latitude,cl.longitude,bx,bz));
                         case RIVER->pRiver(ch,p,bx,bz,
                             cl,sf,osy[gx][gz],mb);
                         case LAKE->pLake(ch,p,bx,bz,
@@ -6211,7 +6623,7 @@ for (int lx = 0; lx < 16; lx++) {
                         case RIVER_BANK,LAKE_SHORE->
                             pLand(ch,p,bx,bz,sf,
                                 cl.elevationMeters,
-                                mb,nw,lw,ws,sh,rk);
+                                mb,nw,lw,ws,sh,rk,null);
                         case SHALLOW_WATER,OCEAN->
                             pUW(ch,p,bx,bz,sf,
                                 cl.elevationMeters,mb);
@@ -6219,7 +6631,8 @@ for (int lx = 0; lx < 16; lx++) {
                             pUW(ch,p,bx,bz,sf,-50,mb);
                         case COASTLINE->pLand(ch,p,bx,
                             bz,sf,cl.elevationMeters,
-                            mb,nw,lw,ws,sh,rk);}}}
+                            mb,nw,lw,ws,sh,rk,mappedGround(groundAreas,
+                                    cl.latitude,cl.longitude,bx,bz));}}}
         catch(Exception ex){
             LOGGER.error("Chunk [{},{}] FAILED: {}",
                 ch.getPos().x,ch.getPos().z,
@@ -6583,7 +6996,7 @@ for (int lx = 0; lx < 16; lx++) {
     private void pLand(ChunkAccess c,
             BlockPos.MutableBlockPos p,
             int x,int z,int sy,double el,int mb,
-            boolean nw,int lw,int ws,int shd,int rk){
+            boolean nw,int lw,int ws,int shd,int rk, BlockState mappedSurface){
         int bt=gbt(x,z);
         double rg=bt==2
             ?getDf().calculateRoughness(x,z):0;
@@ -6620,7 +7033,7 @@ for (int lx = 0; lx < 16; lx++) {
                     x,z,shoreTop==SAND?"sand"
                         :shoreTop==MUD?"mud":"stony gravel",
                     sy,ws,bt,shd);}
-        ugLava(c,p,x,z,sy,mb);
+        fillRegionalRock(c,p,x,z,sy,mb,true);
         if(nw&&sy-lw>4&&lw>MY+10){
             int ff=Math.max(mb+1,lw-2);
             int ft=Math.min(sy-8,lw+FMAW);
@@ -6649,14 +7062,14 @@ for (int lx = 0; lx < 16; lx++) {
         BlockState rockTop=bt==1?SANDSTONE
             :bt==7?Blocks.RED_SANDSTONE.defaultBlockState()
             :STONE;
-        var sb=shoreSub!=null?shoreSub
+        var sb=mappedSurface!=null?mappedSurface:shoreSub!=null?shoreSub
             :rocky?rockTop
             :TerraDensityFunctions
                 .getSubSurfaceBlock(el,bt,rg);
         for(int y=Math.max(mb+1,sy-3);y<sy;y++){
             p.set(x,y,z);
             c.setBlockState(p,sb,false);}
-        var sf=shoreTop!=null?shoreTop
+        var sf=mappedSurface!=null?mappedSurface:shoreTop!=null?shoreTop
             :rocky?rockTop
             :getSurfaceBlock(bt,el,rg,x,z);
         p.set(x,sy,z);c.setBlockState(p,sf,false);
@@ -6664,7 +7077,7 @@ for (int lx = 0; lx < 16; lx++) {
                 ||(el>4000&&bt!=1))){
             p.set(x,sy+1,z);
             c.setBlockState(p,SNOW,false);}
-        if(sy+1<=XY){
+        if(mappedSurface==null&&sy+1<=XY){
             int h=TerraDensityFunctions.blockHash(x,z);
             switch(bt){
                 case 1->{
@@ -6700,7 +7113,7 @@ for (int lx = 0; lx < 16; lx++) {
     private void pLand(ChunkAccess c,
             BlockPos.MutableBlockPos p,
             int x,int z,int sy,double el,int mb){
-        pLand(c,p,x,z,sy,el,mb,false,sy,sy,99,0);}
+        pLand(c,p,x,z,sy,el,mb,false,sy,sy,99,0,null);}
 
     private void pRiver(ChunkAccess c,
             BlockPos.MutableBlockPos p,
@@ -6709,7 +7122,7 @@ for (int lx = 0; lx < 16; lx++) {
             int sf,int ws,int mb){
         int fl=Math.max(mb+4,sf);
         if(fl>ws-2)fl=ws-2;if(fl<mb+4)fl=mb+4;
-        ug(c,p,x,z,fl,mb);
+        fillRegionalRock(c,p,x,z,fl,mb,false);
         for(int y=Math.max(mb+1,fl-5);y<=fl-3;y++){
             p.set(x,y,z);
             c.setBlockState(p,STONE,false);}
@@ -6733,7 +7146,7 @@ for (int lx = 0; lx < 16; lx++) {
         WaterBodyInfo wb=cl.waterBody;
         int fl=Math.max(mb+4,sf);
         if(fl>ws-2)fl=ws-2;if(fl<mb+4)fl=mb+4;
-        ug(c,p,x,z,fl,mb);
+        fillRegionalRock(c,p,x,z,fl,mb,false);
         for(int y=Math.max(mb+1,fl-5);y<=fl-4;y++){
             p.set(x,y,z);
             c.setBlockState(p,STONE,false);}
@@ -6762,7 +7175,7 @@ for (int lx = 0; lx < 16; lx++) {
             BlockPos.MutableBlockPos p,
             int x,int z,int fy,double el,int mb){
         double dp=Math.abs(el);
-        ug(c,p,x,z,fy,mb);
+        fillRegionalRock(c,p,x,z,fy,mb,false);
         for(int y=Math.max(mb+1,fy-3);y<=fy-1;y++){
             p.set(x,y,z);
             c.setBlockState(p,DIRT,false);}

@@ -923,3 +923,26 @@ chat. These files are how we make sure that never happens.
   jarJar, Juhu boundary chunk, plain /terracheck: expect scanUs
   31.9 -> ~1-3, paintGridMs 136.6 -> low tens or less, shore
   looks unchanged. Full-mod compile proof = owner Gradle build.
+
+## Biome handoff reimplementation on GitHub base `da17918`
+
+The NW56 archive was unavailable; the three tracked Java hashes differed before
+editing. This is a new implementation, not a byte-for-byte NW56 restoration.
+It adds the 250 mm desert-name gate, regional red sand, and uses strong OSM
+beach/wetland/mangrove/glacier polygons over the ESA baseline when cached. The
+mapped beach rule also checks sea proximity and respects mapped surface tags.
+Java 17 syntax parsing passed for all four changed source files. Verify the
+full Gradle build and test in fresh chunks before calling this proven in-game.
+First test: west Juhu beach to inland, then Sahara, Manaus, Sundarbans and Aletsch.
+
+### Mapped cave connectivity pass
+
+Fixed 2x2 entrances clipped at chunk edges, bunker rooms clipped at chunk
+edges, and access shafts stopping above the mapped passage. Mine shafts
+now have a landing cavern, adits without portal geometry have a short access
+opening, and steep mapped cave passages use intermediate carve steps.
+Mapped candidates no longer use a chunk-relative nearest-24 cutoff.
+Offline check: 4,489 shaft positions (including negative and boundary
+coordinates) reconstruct all four columns. No full build or in-game proof
+for this pass yet. Test Mammoth and Krubera plus a mapped mine and bunker
+in fresh chunks; note entrance visibility, route connectivity, and tick cost.

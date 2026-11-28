@@ -83,7 +83,7 @@ public class OsmStructureIndex {
         MEADOW, PARKING, FOOTWAY, CYCLEWAY, STREET_LAMP,
         BARRIER, HEDGE,
         // ── extended OSM coverage ──
-        SAND,      // natural=beach|sand
+        SAND,      // natural=sand
         ROCK,      // natural=bare_rock|scree|shingle, landuse=quarry
         TREE_ROW,  // natural=tree_row (linear)
         TREE,      // natural=tree (node)
@@ -93,6 +93,7 @@ public class OsmStructureIndex {
         RUNWAY,    // aeroway=runway|taxiway|helipad
         APRON,     // aeroway=apron (area)
         POOL,      // leisure=swimming_pool (area)
+        BIOME_AREA, // mapped beach/wetland/mangrove/glacier
         PLATFORM   // railway=platform (area or line)
     }
 
@@ -521,7 +522,7 @@ public class OsmStructureIndex {
                 return t;
             });
 
-        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("osm_structures_v4"); // v4: +man_made=bridge outlines
+        Path dir = net.buildtheearth.terraplusplus.util.TerraCachePaths.dir("osm_structures_v5"); // v5: include mapped biome areas
         boolean ok = false;
         try {
             Files.createDirectories(dir);
@@ -1022,7 +1023,7 @@ public class OsmStructureIndex {
                  MEADOW, PARKING,
                  SAND, ROCK, TREE_ROW,
                  TREE, RUNWAY,
-                 APRON          -> config.landuse;
+                 APRON, BIOME_AREA -> config.landuse;
             case STREET_LAMP,
                  PYLON          -> config.streetLights;
         };
@@ -1091,11 +1092,11 @@ public class OsmStructureIndex {
             + "|recreation_ground)$\"](" + bbox + ");"
             + "way[\"natural\"~\"^(wood|scrub|heath"
             + "|grassland|beach|sand|bare_rock"
-            + "|scree|shingle|tree_row)$\"]"
+            + "|scree|shingle|tree_row|wetland|glacier|mangrove)$\"]"
             + "(" + bbox + ");"
             + "relation[\"natural\"~\"^(wood|scrub"
             + "|heath|grassland|beach"
-            + "|sand)$\"](" + bbox + ");"
+            + "|sand|wetland|glacier|mangrove)$\"](" + bbox + ");"
             + "way[\"amenity\"~\"^(parking"
             + "|marketplace|grave_yard)$\"]"
             + "(" + bbox + ");"
@@ -2687,7 +2688,14 @@ public class OsmStructureIndex {
                         subType = natural;
                         isArea = true;
                     }
-                    case "beach", "sand" -> {
+                    case "wetland", "mangrove", "glacier", "beach" -> {
+                        // Area hints only; not structure-painter features.
+                        type = StructureType.BIOME_AREA;
+                        subType = "mangrove".equals(getTag(tags, "wetland"))
+                                ? "mangrove" : natural;
+                        isArea = true;
+                    }
+                    case "sand" -> {
                         type = StructureType.SAND;
                         subType = natural;
                         isArea = true;
@@ -2907,6 +2915,10 @@ public class OsmStructureIndex {
         }
 
         if (nodeList.isEmpty()) return null;
+        if ((type == StructureType.BIOME_AREA || "beach".equals(subType))
+                && "way".equals(getTag(obj, "type"))
+                && (nodeList.size() < 4 || !sameNode(nodeList.get(0),
+                        nodeList.get(nodeList.size() - 1)))) return null;
 
         // Closed man_made=bridge areas (761604461) are a deck
         // footprint, not a loop to walk. Collapse to the long-axis

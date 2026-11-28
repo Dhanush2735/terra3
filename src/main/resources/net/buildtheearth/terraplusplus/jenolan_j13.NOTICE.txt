@@ -1,0 +1,7 @@
+Jenolan Mammoth Cave J13 main entrance traverse, SUSS Cave Repository.
+Survey team: Ian Cooper, Greg Holmes, Ken Anderson (2000-12-02).
+https://suss.caves.org.au/cave/jenolan_mammoth/Mammoth/Entrance/entrance.svx
+https://suss.caves.org.au/cave/help.html (archive reuse statement for raw measurements).
+Adaptation: ordered main traverse J13 to MFC101 from public raw measurements only;
+MGA/GDA94 zone 56 to WGS84 to Terra3 BTE; relative elevation retained. No maps copied.
+Passage width, mouth clearance and terrain-relative elevation are modeled.

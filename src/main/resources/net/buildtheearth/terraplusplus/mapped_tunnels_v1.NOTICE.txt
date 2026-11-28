@@ -1,0 +1,9 @@
+Eisenhower Memorial Tunnel: westbound bore only.
+Horizontal route derived from OpenStreetMap way 17025436.
+© OpenStreetMap contributors — Open Database License 1.0.
+https://www.openstreetmap.org/way/17025436
+https://www.openstreetmap.org/copyright
+This route table is distributed under the ODbL independently of the mod code.
+Portal heights: Colorado Department of Transportation (east 11,013 ft, west 11,158 ft).
+https://www.codot.gov/travel/eisenhower-tunnel/description.html
+Interior elevations are interpolated, not surveyed. The road floor is used as the modeled centerline; this is a simple buried passage, not a finished road or portal layout.

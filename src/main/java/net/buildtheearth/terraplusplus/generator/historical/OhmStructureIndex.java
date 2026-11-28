@@ -453,6 +453,7 @@ public class OhmStructureIndex {
                  SAND, ROCK, TREE_ROW,
                  TREE, RUNWAY,
                  APRON          -> config.landuse;
+            case BIOME_AREA -> false;
             case STREET_LAMP,
                  PYLON          -> config.streetLights;
         };

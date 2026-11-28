@@ -54,6 +54,7 @@ public class TerraBiomeProvider {
     // ================================================================
 
     private static final double PRECIP_HYPER_ARID =   50.0;
+    private static final double PRECIP_DESERT_MAX = 250.0;
     private static final double PRECIP_ARID        =  150.0;
     private static final double PRECIP_SEMI_ARID   =  400.0;
     private static final double PRECIP_SUB_HUMID   =  800.0;
@@ -542,17 +543,7 @@ public class TerraBiomeProvider {
 
         // ── LAYER 3: WORLDCOVER PRIMARY ────────────────────────────
         double[]    data   = queryData(latitude, longitude);
-        double      precip = data[1];
-        double      temp   = data[2];
-        AridityZone ard    = getAridity(precip);
-
-        if (wcClass == WorldCoverClass.UNKNOWN) {
-            return classifyLandFallback((int) data[0], precip, temp,
-                    ard, tierElev, elevMeters, latitude, longitude);
-        }
-
-        return classifyByWorldCover(wcClass, temp, precip, ard,
-                tierElev, elevMeters, latitude, longitude);
+        return classifyAt(latitude, longitude, elevMeters, wcClass, data);
     }
 
     // ================================================================
@@ -1053,14 +1044,22 @@ public class TerraBiomeProvider {
     public Holder<Biome> classifyAt(double lat, double lon,
                                      double elevMeters,
                                      WorldCoverClass wcClass) {
-        double[]    d        = queryData(lat, lon);
+        return classifyAt(lat, lon, elevMeters, wcClass, queryData(lat, lon));
+    }
+
+    private Holder<Biome> classifyAt(double lat, double lon, double elevMeters,
+                                    WorldCoverClass wcClass, double[] d) {
         double      tierElev = Math.max(0, elevMeters);
         AridityZone ard      = getAridity(d[1]);
-        if (wcClass != WorldCoverClass.UNKNOWN)
-            return classifyByWorldCover(wcClass, d[2], d[1], ard,
-                    tierElev, elevMeters, lat, lon);
-        return classifyLandFallback((int) d[0], d[1], d[2], ard,
-                tierElev, elevMeters, lat, lon);
+        Holder<Biome> result = wcClass != WorldCoverClass.UNKNOWN
+                ? classifyByWorldCover(wcClass, d[2], d[1], ard, tierElev, elevMeters, lat, lon)
+                : classifyLandFallback((int) d[0], d[1], d[2], ard, tierElev, elevMeters, lat, lon);
+        if (!isDesert(result) || d[1] < PRECIP_DESERT_MAX) return result;
+        if (wcClass == WorldCoverClass.BARE)
+            return safe(STONY_PEAKS, WINDSWEPT_HILLS, PLAINS);
+        if (d[2] >= 22.0 && d[1] >= 1000.0) return safe(JUNGLE, FOREST, PLAINS);
+        if (d[2] >= 20.0) return safe(SAVANNA, PLAINS);
+        return safe(PLAINS, FOREST);
     }
 
     public Holder<Biome> classifyAt(double lat, double lon, double elevMeters) {
@@ -1112,6 +1111,14 @@ public class TerraBiomeProvider {
         return getBiomeForLocation(latitude, longitude, elevMeters, terrainType, wcClass);
     }
 
+    // Approximate regional envelopes; the dry bare-ground gate still applies.
+    private static boolean isRedSandRegion(double lat, double lon) {
+        return (lat >= -30 && lat <= -17 && lon >= 118 && lon <= 145)
+            || (lat >= -29 && lat <= -17 && lon >= 12 && lon <= 17)
+            || (lat >= -29 && lat <= -19 && lon >= 18 && lon <= 26)
+            || (lat >= 16 && lat <= 24 && lon >= 45 && lon <= 57);
+    }
+
     public int getBiomeTypeCode(double lat, double lon,
                                  double elevMeters,
                                  WorldCoverClass wcClass) {
@@ -1145,7 +1152,7 @@ public class TerraBiomeProvider {
                 if (temp >= 12.0) {
                     // Red-sand country = arid plateau sands;
                     // low hot desert (Sahara) stays yellow.
-                    if (precip < 400.0 && elevMeters >= 250.0)
+                    if (precip < 400.0 && isRedSandRegion(lat, lon))
                         return 7;
                     return 1;
                 }
